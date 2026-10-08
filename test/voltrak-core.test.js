@@ -39,6 +39,23 @@ test('parseAlert prefers the labelled CA over an earlier address', () => {
   assert.equal(a.fresh, 300);
 });
 
+// A real VolTrak alert, as alertText() reads it from Discord (emoji are <img>, so they are absent from the text).
+const REAL_ALERT = ['apeonsamsung ($samsung)', 'CA', '467xn5zKySHTWNohRyuu3rsf9TyxAYCdNyjEq9u3wCwt', 'CA', '467xn5zKySHTWNohRyuu3rsf9TyxAYCdNyjEq9u3wCwt',
+  'MC', '$12.94K', 'Age', '5m', 'Bonding Curve', ' Not Migrated', 'Volume (5M)', 'N/A — still on bonding curve, check pump.fun for real-time volume',
+  'Top Holder', '#1 holder: 4.2%', 'Top 3 Clusters', 'Cluster 1 : 30.53%Warning Extremely High', 'Wallet Analytics',
+  ' Total Holders: 215 Experienced Traders: 4 Bots/High-Risk: 85 Fresh Wallets: 72 Sniper Wallets: 0',
+  'Disclaimer', 'Automated volume alert only. Not financial advice or an endorsement. DYOR. Trade at your own risk.'].join('\n');
+
+test('parseAlert reads a real VolTrak alert', () => {
+  const a = VTCore.parseAlert(REAL_ALERT);
+  assert.equal(a.mint, '467xn5zKySHTWNohRyuu3rsf9TyxAYCdNyjEq9u3wCwt');
+  assert.deepEqual([a.name, a.symbol, a.callMc, a.ageSeconds, a.migrated, a.volume5m], ['apeonsamsung', 'samsung', 12940, 300, false, null]);
+  assert.deepEqual([a.topHolder, a.clusters, a.holders, a.experienced, a.bots, a.fresh, a.snipers], [4.2, [30.53], 215, 4, 85, 72, 0]);
+  const r = VTCore.assess(a, null, Date.now(), '');
+  assert.ok(r.reasons.includes('33% fresh-wallet and 40% bot/high-risk labels of 215 holders at call; categories can overlap'));
+  assert.ok(r.flags.some(x => /cluster/.test(x)) && !r.flags.some(x => /top holder/.test(x)));
+});
+
 test('parseAlert falls back to the first address and keeps single-unit ages', () => {
   const a = VTCore.parseAlert('Coin ($C)\nContract\n' + MINT + '\nAge\n12m');
   assert.equal(a.mint, MINT);

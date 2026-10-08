@@ -115,7 +115,7 @@ const VTCore = (() => {
     if (call?.conflict) risks.push('Alert has conflicting migration/volume fields');
     if (call?.clusters?.length && Math.max(...call.clusters) >= 20) flags.push('Reported largest cluster ≥20% (review flag, not a proven cutoff)');
     if (call?.topHolder >= 5) flags.push('Reported top holder ≥5% (review flag)');
-    if (call?.fresh != null && call.holders > 0) reasons.push(Math.round(call.fresh/call.holders*100) + '% fresh-wallet labels at call; categories can overlap');
+    if (call?.holders > 0 && (call.fresh != null || call.bots != null)) reasons.push([call.fresh != null && Math.round(call.fresh/call.holders*100) + '% fresh-wallet', call.bots != null && Math.round(call.bots/call.holders*100) + '% bot/high-risk'].filter(Boolean).join(' and ') + ' labels of ' + call.holders + ' holders at call; categories can overlap');
     if (!call?.clusters?.length) missing.push('Call-time wallet clusters missing');
     const f = flow && now - flow.at <= 30000 && flow.at <= now + 1000 ? flow : null;
     if (!f) missing.push('1m trade flow unavailable', 'Unique trading wallets unavailable');
