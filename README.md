@@ -42,6 +42,13 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 `voltrak-steroids.user.js` is a Tampermonkey userscript for Discord and GMGN. It reads new VolTrak calls in Discord and loads them in one GMGN "receiver" tab. There it shows free DEX Screener snapshots and 1m trade flow from GeckoTerminal. It is for analysis only: it never submits trades.
 
+## 3.3.0 changes
+
+- **Backtest (Calls tab):** first scroll back through the VolTrak channel, which saves every alert you pass. Then press **Score calls**: the script pulls 2h of 1-minute GeckoTerminal candles per call, about 7s each. The candles are cached, so changing the target, stop or costs re-scores instantly.
+- **Backtest report:** win rate with its 95% range, average result per trade after costs, median peak and timing. It also breaks results down by every alert field (cluster, bots, fresh wallets, top holder, MC, age, holders, experienced traders, snipers). A bucket is only marked as standing out when it has at least 15 calls and its whole range sits clear of the overall win rate. You can download the results as CSV.
+- **Market tab:** pump.fun launches, graduations, bonding-curve volume, active traders and average traders per token over the last 1/5/10/30 minutes. The data comes from PumpPortal's public data socket (one connection, from the receiving GMGN tab), and the Discord tab mirrors it.
+- **New layout:** Live / Market / Calls / Settings tabs, readings as labelled tiles (green for buys, red for sells), a colored state badge, and a dot showing whether data is live. Collapsing the panel leaves the state and buy share in the header.
+
 ## 3.2.0 changes
 
 - **GMGN live feed:** the script now reads GMGN's own page connection (`ws.gmgn.ai`), using `token_activity` for each trade and `token_stat` for GMGN's 1m/5m rollups. It's read-only: it never sends on GMGN's connection or changes a message, and it keeps only messages for the token on screen. The gauge uses GMGN's 1m buy/sell volume, and new tokens work before DEX Screener has indexed them.

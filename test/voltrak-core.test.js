@@ -228,6 +228,87 @@ test('assess: thin GMGN 1m falls back to GMGN 5m, which flags a weak sample', ()
   assert.equal(a.state, 'CAUTION');
 });
 
+// Backtest: 1m candles around an alert at T (aligned to a minute + 20s).
+const T = Date.parse('2026-10-07T12:00:20Z'), M0 = Date.parse('2026-10-07T12:00:00Z');
+const k = (minute, o, h, l, c, v = 10) => [(M0 + minute * 60000) / 1000, o, h, l, c, v];
+
+test('candles sorts GeckoTerminal rows and drops broken ones; mergeCandles keeps the busier pool per minute', () => {
+  const cs = VTCore.candles([k(2, 1, 1, 1, 1), k(0, 1, 1, 1, 1), [null, 1, 1, 1, 1, 1], k(1, 0, 1, 1, 1)]);
+  assert.deepEqual(cs.map(x => x.t), [M0, M0 + 120000]);
+  const merged = VTCore.mergeCandles([VTCore.candles([k(0, 1, 1, 1, 1, 5), k(1, 2, 2, 2, 2, 50)]), VTCore.candles([k(1, 3, 3, 3, 3, 80), k(2, 4, 4, 4, 4, 1)])]);
+  assert.deepEqual(merged.map(x => x.c), [1, 3, 4]);
+});
+
+test('scoreCall: entry at the alert minute close, target hit first is a win', () => {
+  const cs = VTCore.candles([k(0, 1, 5, 0.1, 1), k(1, 1, 1.5, 0.9, 1.4), k(3, 1.4, 2.2, 1.3, 2.1), k(70, 2, 2, 0.4, 0.5)]);
+  const s = VTCore.scoreCall(cs, T, {tp: 100, sl: -50});
+  assert.equal(s.entry, 1);
+  assert.deepEqual([s.outcome, s.ret, s.outcomeMin.toFixed(2)], ['win', 100, '2.67']);
+  assert.ok(Math.abs(s.peakPct - 120) < 1e-9); // the alert minute's own high (5) is ignored
+  assert.ok(Math.abs(s.r5 - 110) < 1e-9);
+  assert.ok(Math.abs(s.r60 - 110) < 1e-9);
+  assert.ok(Math.abs(s.rEnd + 50) < 1e-9);
+});
+
+test('scoreCall: stop and target in one candle count as a loss; a gap fills at the open', () => {
+  const both = VTCore.scoreCall(VTCore.candles([k(0, 1, 1, 1, 1), k(1, 1, 3, 0.4, 2)]), T, {tp: 100, sl: -50});
+  assert.deepEqual([both.outcome, both.ret], ['loss', -50]);
+  const gap = VTCore.scoreCall(VTCore.candles([k(0, 1, 1, 1, 1), k(1, 0.2, 0.25, 0.1, 0.1)]), T, {tp: 100, sl: -50});
+  assert.equal(gap.outcome, 'loss');
+  assert.ok(Math.abs(gap.ret + 80) < 1e-9);
+});
+
+test('scoreCall: neither hit is open at the horizon; no trades near the alert is unscored', () => {
+  const open = VTCore.scoreCall(VTCore.candles([k(0, 1, 1, 1, 1), k(10, 1, 1.3, 0.8, 1.2)]), T, {tp: 100, sl: -50, horizon: 120});
+  assert.deepEqual([open.outcome, Math.round(open.ret)], ['open', 20]);
+  assert.equal(VTCore.scoreCall(VTCore.candles([k(9, 1, 1, 1, 1)]), T).status, 'no-trades');
+  const next = VTCore.scoreCall(VTCore.candles([k(2, 2, 2, 2, 2)]), T);
+  assert.equal(next.entry, 2); // no candle in the alert minute: next traded minute's open
+});
+
+test('wilson and backtestReport: buckets, ranges and "stands out" need enough calls', () => {
+  const [lo, hi] = VTCore.wilson(5, 10);
+  assert.ok(lo > 23 && lo < 24 && hi > 76 && hi < 77);
+  const score = outcome => ({outcome, ret: outcome === 'win' ? 100 : -50, peakPct: outcome === 'win' ? 150 : 10, peakMin: outcome === 'win' ? 4 : 30, r5: 0, r15: 0, r60: 0});
+  // 20 calls with a big cluster: all losses. 20 with a small cluster: 18 wins.
+  const items = [...Array(20)].map(() => ({call: {clusters: [35], holders: 100, bots: 50}, score: score('loss')}))
+    .concat([...Array(20)].map((_, i) => ({call: {clusters: [5], holders: 100, bots: 10}, score: score(i < 18 ? 'win' : 'loss')})));
+  const rep = VTCore.backtestReport(items, 3);
+  assert.equal(rep.all.n, 40);
+  assert.equal(rep.all.winRate, 45);
+  assert.equal(rep.all.ev, (18 * 100 + 22 * -50) / 40 - 3);
+  const cluster = rep.features.find(f => f.name === 'Largest cluster').rows;
+  assert.deepEqual(cluster.map(r => [r.label, r.n, r.standsOut]), [['<10%', 20, 'above'], ['≥30%', 20, 'below']]);
+  const bots = rep.features.find(f => f.name === 'Bot/high-risk share').rows;
+  assert.deepEqual(bots.map(r => r.label), ['<20%', '≥40%']);
+  assert.equal(rep.features.find(f => f.name === 'Sniper wallets').rows[0].label, 'unknown');
+  assert.equal(rep.timing.peakWithin5, 45);
+  const small = VTCore.backtestReport(items.slice(0, 5).concat(items.slice(20, 25)), 0);
+  assert.ok(small.features[0].rows.every(r => r.few && !r.standsOut));
+});
+
+test('ppEvent classifies PumpPortal messages; marketTape rolls 1/5/10/30m windows', () => {
+  assert.deepEqual(VTCore.ppEvent('{"txType":"buy","solAmount":"1.5","traderPublicKey":"w1","mint":"m1"}'), {kind: 'trade', side: 'buy', sol: 1.5, wallet: 'w1', mint: 'm1'});
+  assert.equal(VTCore.ppEvent({txType: 'create', mint: 'm'}).kind, 'create');
+  assert.equal(VTCore.ppEvent({txType: 'migrate', mint: 'm'}).kind, 'migrate');
+  assert.equal(VTCore.ppEvent({mint: 'm', pool: 'pump-amm', message: 'migration'}).kind, 'migrate');
+  assert.equal(VTCore.ppEvent('{"message":"Successfully subscribed"}').kind, 'other');
+  assert.equal(VTCore.ppEvent('nope').kind, 'other');
+  const tape = VTCore.marketTape(), now = NOW;
+  tape.add({kind: 'trade', sol: 2, wallet: 'a', mint: 'x'}, now - 20 * 60000);
+  tape.add({kind: 'trade', sol: 1, wallet: 'b', mint: 'y'}, now - 3 * 60000);
+  tape.add({kind: 'trade', sol: 1, wallet: 'b', mint: 'y'}, now - 30000);
+  tape.add({kind: 'trade', sol: 1, wallet: 'c', mint: 'y'}, now - 10000);
+  tape.add({kind: 'migrate'}, now - 8 * 60000);
+  tape.add({kind: 'create'}, now - 5000);
+  const w = tape.windows(now, now - 12 * 60000, 150);
+  assert.deepEqual([w[1].trades, w[1].traders, w[1].tokens, w[1].creates, w[1].usd, w[1].complete], [2, 2, 1, 1, 300, true]);
+  assert.deepEqual([w[5].trades, w[5].traders, w[10].migrations, w[10].complete], [3, 2, 1, true]);
+  assert.deepEqual([w[30].trades, w[30].sol, w[30].traders, w[30].tokens, w[30].complete], [4, 5, 3, 2, false]);
+  tape.prune(now + 25 * 60000);
+  assert.equal(tape.windows(now + 25 * 60000, 0, null)[30].trades, 3);
+});
+
 test('initials and handoff keep their behaviour', () => {
   assert.equal(VTCore.initials(1, 0, 4, 0, 0).pct, 25);
   assert.equal(VTCore.initials(1, 1, 4).already, true);
