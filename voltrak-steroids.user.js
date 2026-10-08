@@ -260,7 +260,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.1.0';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.2.0';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -509,7 +509,7 @@ function start() {
         const next=VTCore.mintFromURL(location.href);
         if(next!==lastMint){lastMint=next;current=next;snapshot=null;flow=null;gtPools={};fetchError='';flowError='';lastResponse=0;lastFlow=0;if(live.mint!==next)resetLive(next);}
         if(Date.now()-lastBeat>=5000){lastBeat=Date.now();isReceiver=await ownReceiver();}
-        status=isReceiver?'Receiving calls · open token every 3s · '+(get('autoload',true)?'auto-load on':'auto-load off'):'Display only · another GMGN tab receives calls';
+        status=(isReceiver?'Receiving calls · ':'Display only (another GMGN tab receives calls) · ')+(liveFresh()?'GMGN live feed':'fallback polling')+(isReceiver?' · auto-load '+(get('autoload',true)?'on':'off'):'');
         if(isReceiver)receiveLatest();
         poll();pollFlow();render();
       }finally{ticking=false;}
