@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         VolTrak Steroids
 // @namespace    voltrak-alert
-// @version      3.1.0
-// @description  VolTrak context + GMGN handoff + free DEX snapshots and 1m trade flow. Analysis only; never submits trades.
+// @version      3.2.0
+// @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only) with DEX fallbacks. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
 // @grant        GM_getValue
@@ -14,10 +14,11 @@
 // @grant        GM_setClipboard
 // @grant        GM_notification
 // @grant        GM_openInTab
+// @grant        unsafeWindow
 // @connect      api.dexscreener.com
 // @connect      api.geckoterminal.com
 // @noframes
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 /* CORE START — pure functions, also used by offline regression tests. */
@@ -92,7 +93,18 @@ const VTCore = (() => {
     const list = base.length ? base : rows;
     return (list.find(p => p.attributes.address === preferred) || list[0])?.attributes.address || null;
   }
-  // GeckoTerminal pool trades (latest ≤300 in 24h) → 1m/5m buy/sell counts, USD and unique wallets.
+  // Trades [{at, side, usd, wallet}] → 1m/5m buy/sell counts, USD and unique wallets. complete(ms) says whether
+  // the source can be missing trades in that window.
+  function windows(trades, now, complete) {
+    const window = ms => {
+      const w = trades.filter(t => now - t.at <= ms && t.at <= now + 5000), buys = w.filter(t => t.side === 'buy'), sells = w.filter(t => t.side === 'sell');
+      const usd = list => list.reduce((s, t) => s + t.usd, 0);
+      return {buys: buys.length, sells: sells.length, buyUsd: usd(buys), sellUsd: usd(sells),
+        wallets: new Set(w.map(t => t.wallet).filter(Boolean)).size, complete: complete(ms)};
+    };
+    return {at: now, trades: trades.length, lastTradeAt: trades.length ? Math.max(...trades.map(t => t.at)) : null, m1: window(60000), m5: window(300000)};
+  }
+  // GeckoTerminal pool trades (latest ≤300 in 24h).
   function tradeFlow(rows, mint, now) {
     const trades = [];
     for (const row of Array.isArray(rows) ? rows : []) {
@@ -101,15 +113,38 @@ const VTCore = (() => {
       if (Number.isFinite(at) && side) trades.push({at, side, usd: number(a.volume_in_usd) || 0, wallet: a.tx_from_address || null});
     }
     const oldest = trades.reduce((m, t) => Math.min(m, t.at), Infinity);
-    const window = ms => {
-      const w = trades.filter(t => now - t.at <= ms && t.at <= now + 5000), buys = w.filter(t => t.side === 'buy'), sells = w.filter(t => t.side === 'sell');
-      const usd = list => list.reduce((s, t) => s + t.usd, 0);
-      return {buys: buys.length, sells: sells.length, buyUsd: usd(buys), sellUsd: usd(sells),
-        wallets: new Set(w.map(t => t.wallet).filter(Boolean)).size, complete: trades.length < TRADE_CAP || oldest <= now - ms};
-    };
-    return {at: now, trades: trades.length, lastTradeAt: trades.length ? Math.max(...trades.map(t => t.at)) : null, m1: window(60000), m5: window(300000)};
+    return windows(trades, now, ms => trades.length < TRADE_CAP || oldest <= now - ms);
   }
-  function assess(call, s, now, error, flow) {
+  // GMGN page websocket frame → {channel, items}. Items may be flat or carry their payload in `d`.
+  function gmgnFrame(raw) {
+    let msg;
+    try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (_) { return null; }
+    if (!msg || typeof msg.channel !== 'string') return null;
+    const data = Array.isArray(msg.data) ? msg.data : msg.data && typeof msg.data === 'object' ? [msg.data] : [];
+    return {channel: msg.channel, items: data.filter(x => x && typeof x === 'object').map(x => x.d && typeof x.d === 'object' && !Array.isArray(x.d) ? {...x, ...x.d} : x)};
+  }
+  const addrOf = x => x?.a || x?.address || x?.token_address || null;
+  const millis = v => { const n = number(v); return n == null ? null : n < 1e12 ? n * 1000 : n; };
+  // token_activity item → trade, or null for anything that is not a buy or sell.
+  function gmgnTrade(x) {
+    const side = {buy: 'buy', b: 'buy', sell: 'sell', s: 'sell'}[String(x?.e).toLowerCase()], at = millis(x?.t) ?? millis(x?.ts);
+    if (!side || at == null) return null;
+    return {at, side, usd: number(x.au) || 0, sol: number(x.qa), amount: number(x.ba), price: number(x.pu), wallet: x.m || null, hash: x.h || null, mint: addrOf(x), ex: x.ex || null};
+  }
+  // token_stat item → GMGN's own rolling windows (b/s = buy/sell count, bv/sv = buy/sell volume, v = volume, p = price then).
+  function gmgnStat(x, at) {
+    const w = k => ({buys: number(x['b' + k]), sells: number(x['s' + k]), buyUsd: number(x['bv' + k]), sellUsd: number(x['sv' + k]), volume: number(x['v' + k]), priceAgo: number(x['p' + k])});
+    return {at, mint: addrOf(x), price: number(x.p) ?? number(x.pu) ?? number(x.price), m1: w('1m'), m5: w('5m'), h1: w('1h')};
+  }
+  // Live GMGN view for assess(): trades seen since the first live message (`since`) plus GMGN's token_stat rollup.
+  function liveView(trades, stat, at, now, since) {
+    if (!at) return null;
+    const last = trades.reduce((a, b) => !a || b.at >= a.at ? b : a, null), price = stat?.price ?? last?.price ?? null;
+    // pump.fun tokens have a fixed 1B supply, so market cap = price × 1e9.
+    const marketCap = price > 0 && /pump/i.test(last?.ex || '') ? price * 1e9 : null;
+    return {at, stat, flow: trades.length ? windows(trades, now, ms => since <= now - ms) : null, price, marketCap, last};
+  }
+  function assess(call, s, now, error, flow, live) {
     // risks block the state (CAUTION); flags are call-time review notes shown next to the live state.
     const reasons = [], risks = [], flags = [], missing = [];
     if (call?.conflict) risks.push('Alert has conflicting migration/volume fields');
@@ -117,34 +152,52 @@ const VTCore = (() => {
     if (call?.topHolder >= 5) flags.push('Reported top holder ≥5% (review flag)');
     if (call?.holders > 0 && (call.fresh != null || call.bots != null)) reasons.push([call.fresh != null && Math.round(call.fresh/call.holders*100) + '% fresh-wallet', call.bots != null && Math.round(call.bots/call.holders*100) + '% bot/high-risk'].filter(Boolean).join(' and ') + ' labels of ' + call.holders + ' holders at call; categories can overlap');
     if (!call?.clusters?.length) missing.push('Call-time wallet clusters missing');
-    const f = flow && now - flow.at <= 30000 && flow.at <= now + 1000 ? flow : null;
-    if (!f) missing.push('1m trade flow unavailable', 'Unique trading wallets unavailable');
-    if (!s || error || now - s.at > 30000 || s.at > now + 1000) {
+    const fresh = (x, ms) => !!x && now - x.at <= ms && x.at <= now + 1000;
+    const L = fresh(live, 15000) ? live : null, st = L && fresh(L.stat, 15000) ? L.stat : null, lf = L?.flow || null;
+    const f = fresh(flow, 30000) ? flow : null, dex = !error && fresh(s, 30000) ? s : null;
+    if (!st && !lf && !f) missing.push('1m trade flow unavailable');
+    if (!lf && !f) missing.push('Unique trading wallets unavailable');
+    if (!dex && !st && !lf) {
       return {state:'UNKNOWN', side:'NO CURRENT SNAPSHOT', share:null, basis:null, risks, flags, missing,
-        reasons:[error || (s ? 'Snapshot fetch is stale' : 'No indexed pool data yet'), ...reasons]};
+        reasons:[error || (s ? 'Snapshot fetch is stale' : 'No live or indexed data yet'), ...reasons]};
     }
-    const b=s.buys5m, sell=s.sells5m, m1=f?.m1;
-    let share = null, basis = null;
-    if (m1 && m1.buys+m1.sells >= 10 && m1.buyUsd+m1.sellUsd > 0) { share = 100*m1.buyUsd/(m1.buyUsd+m1.sellUsd); basis = '1m $ volume'; }
-    else if (b != null && sell != null && b >= 0 && sell >= 0 && b+sell > 0) { share = 100*b/(b+sell); basis = '5m swap count'; }
+    if (error) missing.push(error);
+    // Gauge source, best first: GMGN's own 1m rollup, live trades, GeckoTerminal 1m, GMGN 5m, DEX Screener 5m counts.
+    const usdShare = (w, min) => w && (w.buys || 0) + (w.sells || 0) >= min && (w.buyUsd || 0) + (w.sellUsd || 0) > 0 ? 100 * (w.buyUsd || 0) / ((w.buyUsd || 0) + (w.sellUsd || 0)) : null;
+    const dexWindow = dex && {buys: dex.buys5m, sells: dex.sells5m};
+    const pick = [
+      [st ? usdShare(st.m1, 10) : null, 'GMGN 1m $ volume', 1, st?.m1],
+      [lf?.m1.complete ? usdShare(lf.m1, 10) : null, 'live 1m trades ($)', 1, lf?.m1],
+      [f ? usdShare(f.m1, 10) : null, 'GeckoTerminal 1m $ volume', 1, f?.m1],
+      [st ? usdShare(st.m5, 1) : null, 'GMGN 5m $ volume', 5, st?.m5],
+      [dex && dex.buys5m >= 0 && dex.sells5m >= 0 && dex.buys5m + dex.sells5m > 0 ? 100 * dex.buys5m / (dex.buys5m + dex.sells5m) : null, 'DEX Screener 5m swap count', 5, dexWindow],
+    ].find(o => o[0] != null);
+    const share = pick ? pick[0] : null, basis = pick ? pick[1] : null;
     const side = share === null ? 'UNKNOWN' : share >= 60 ? 'BUY SIDE' : share <= 40 ? 'SELL SIDE' : 'MIXED';
     if (share != null) reasons.push(Math.round(share) + '% of ' + basis + ' is buys; not a win probability');
-    if (basis === '5m swap count' && b+sell < 20) risks.push('Fewer than 20 swaps in this window; weak sample');
-    if (f) {
-      reasons.push('1m trades: ' + m1.buys + ' buys / ' + m1.sells + ' sells from ' + m1.wallets + ' wallets' + (m1.complete ? '' : ' (partial: feed returns latest 300)'));
-      if (f.lastTradeAt) reasons.push('Last indexed trade ' + Math.max(0, Math.round((now-f.lastTradeAt)/1000)) + 's ago');
-    }
-    if (s.pairCreatedAt && now-s.pairCreatedAt < 300000) reasons.push('Pool younger than 5m: this window is partial');
-    if (s.priceChange5m != null) reasons.push('5m price change ' + (s.priceChange5m>=0?'+':'') + s.priceChange5m.toFixed(1) + '%');
-    if (call?.callMc > 0 && s.marketCap > 0) {
-      const move = (s.marketCap/call.callMc-1)*100;
-      reasons.push((move>=0?'+':'')+move.toFixed(1)+'% market-cap change since alert (provider definitions may differ)');
+    if (pick?.[2] === 5 && (pick[3].buys || 0) + (pick[3].sells || 0) < 20) risks.push('Fewer than 20 swaps in the 5m window; weak sample');
+    const price = L?.price ?? dex?.price ?? null, change = ago => price > 0 && ago > 0 ? (price/ago - 1) * 100 : null, pct = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+    const m1Change = change(st?.m1.priceAgo), m5Change = change(st?.m5.priceAgo) ?? dex?.priceChange5m ?? null;
+    const momentum = pick?.[2] === 1 && m1Change != null ? m1Change : m5Change;
+    if (m1Change != null) reasons.push('1m price change ' + pct(m1Change));
+    if (m5Change != null) reasons.push('5m price change ' + pct(m5Change));
+    if (lf) reasons.push('Live trades: ' + lf.m1.buys + ' buys / ' + lf.m1.sells + ' sells from ' + lf.m1.wallets + ' wallets in 1m' + (lf.m1.complete ? '' : ' (listening under 1m)'));
+    else if (f) reasons.push('1m trades: ' + f.m1.buys + ' buys / ' + f.m1.sells + ' sells from ' + f.m1.wallets + ' wallets' + (f.m1.complete ? '' : ' (partial: feed returns latest 300)'));
+    const lastAt = lf?.lastTradeAt ?? f?.lastTradeAt;
+    if (lastAt) reasons.push('Last trade ' + Math.max(0, Math.round((now-lastAt)/1000)) + 's ago');
+    const mc = L?.marketCap ?? dex?.marketCap;
+    if (call?.callMc > 0 && mc > 0) {
+      const move = (mc/call.callMc-1)*100;
+      reasons.push(pct(move) + ' market-cap change since alert (' + (L?.marketCap ? 'live price × 1B supply' : 'provider definitions may differ') + ')');
       if (move > 30) flags.push('More than 30% above call MC: review entry timing');
     }
-    if (s.liquidity == null) missing.push('Indexed liquidity missing');
-    else if (s.liquidity <= 0) risks.push('No positive indexed liquidity');
-    reasons.push((s.pools > 1 ? 'DEX flow summed over ' + s.pools + ' indexed pools' : 'Single indexed pool') + '; upstream update delay is unknown');
-    const state = risks.length ? 'CAUTION' : share === null ? 'UNKNOWN' : side === 'SELL SIDE' && s.priceChange5m < 0 ? 'FADE / REVIEW EXIT' : side === 'BUY SIDE' && s.priceChange5m > 0 ? 'WATCH BUY SETUP' : 'WAIT';
+    if (dex) {
+      if (dex.pairCreatedAt && now-dex.pairCreatedAt < 300000 && basis?.startsWith('DEX')) reasons.push('Pool younger than 5m: this window is partial');
+      if (dex.liquidity == null) missing.push('Indexed liquidity missing');
+      else if (dex.liquidity <= 0) risks.push('No positive indexed liquidity');
+    } else missing.push('No DEX Screener pool yet: liquidity unknown');
+    reasons.push(L ? 'Live from GMGN\'s own page feed' : (dex?.pools > 1 ? 'DEX flow summed over ' + dex.pools + ' indexed pools' : 'Single indexed pool') + '; upstream update delay is unknown');
+    const state = risks.length ? 'CAUTION' : share === null ? 'UNKNOWN' : side === 'SELL SIDE' && momentum < 0 ? 'FADE / REVIEW EXIT' : side === 'BUY SIDE' && momentum > 0 ? 'WATCH BUY SETUP' : 'WAIT';
     return {state,side,share,basis,reasons,risks,flags,missing};
   }
   function initials(cost, proceeds, bag, feePct=0, fixed=0) {
@@ -161,11 +214,39 @@ const VTCore = (() => {
     if (call.messageAt > now+5000 || now-call.messageAt > maxAge || call.historical) return 'old';
     return current === call.mint ? 'already-open' : 'navigate';
   }
-  return {MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,tradeFlow,assess,initials,handoff};
+  return {MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,initials,handoff};
 })();
 /* CORE END */
 
-(function () {
+// GMGN live feed: a read-only listener on the websocket GMGN's page opens itself (ws.gmgn.ai). It never sends on
+// that socket and never changes a message; it only reads token_activity and token_stat frames.
+const VTLive = (() => {
+  const listeners = new Set(), pending = [], seen = new WeakSet();
+  let attachedAt = 0;
+  const emit = frame => { if (!listeners.size) { if (pending.push(frame) > 200) pending.shift(); return; } for (const fn of listeners) try { fn(frame); } catch (_) {} };
+  const watch = ws => {
+    if (!ws || seen.has(ws) || !/(^|\.)gmgn\.ai(:|\/|$)/.test(String(ws.url).replace(/^wss?:\/\//, ''))) return;
+    seen.add(ws); attachedAt = attachedAt || Date.now();
+    ws.addEventListener('message', e => {
+      if (typeof e.data !== 'string' || !/"(token_activity|token_stat)"/.test(e.data)) return;
+      const frame = VTCore.gmgnFrame(e.data);
+      if (frame) emit(frame);
+    });
+  };
+  if (location.hostname === 'gmgn.ai') {
+    try {
+      const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window, WS = page.WebSocket;
+      // Sockets created from now on (we run at document-start, before GMGN's app code).
+      page.WebSocket = new Proxy(WS, {construct(target, args, newTarget) { const ws = Reflect.construct(target, args, newTarget); try { watch(ws); } catch (_) {} return ws; }});
+      // A socket opened before this ran is picked up the next time GMGN sends on it (e.g. a subscribe on token change).
+      const send = WS.prototype.send;
+      WS.prototype.send = function (...args) { try { watch(this); } catch (_) {} return send.apply(this, args); };
+    } catch (_) {}
+  }
+  return {on(fn) { listeners.add(fn); pending.splice(0).forEach(emit); }, attachedAt: () => attachedAt};
+})();
+
+function start() {
   'use strict';
   if (window.top !== window.self) return;
   if (document.getElementById('vts-root')) return;
@@ -205,6 +286,14 @@ const VTCore = (() => {
   let status='Starting', current=VTCore.mintFromURL(location.href), fetchError='', polling=false;
   let snapshot=null, lastMint=current, lastResponse=0, lastTracked=0, dexPause=0, isReceiver=false;
   let flow=null, flowError='', flowing=false, lastFlow=0, flowPause=0, gtPools={};
+  // GMGN live state for the token on screen: trades seen (deduped by tx), GMGN's token_stat rollup, first/last message time.
+  let live=null;
+  const resetLive=mint=>{live={mint,since:Date.now(),first:0,at:0,stat:null,trades:[],keys:new Set(),prunedAt:Date.now()};};resetLive(current);
+  const tradeKey=t=>t.hash?t.hash+':'+t.side+':'+t.wallet+':'+t.amount:null;
+  const liveFresh=()=>!!live&&live.mint===current&&Date.now()-live.at<20000;
+  const liveNow=()=>live&&live.mint===current?VTCore.liveView(live.trades,live.stat,live.at,Date.now(),live.first||Infinity):null;
+  let renderQueued=false;
+  const soon=()=>{if(renderQueued)return;renderQueued=true;setTimeout(()=>{renderQueued=false;render();},250);};
   try{if(typeof GM_listValues==='function'&&!get('cleaned',false)){for(const k of GM_listValues())if(k.startsWith(PREFIX+'mint-alert.'))GM_deleteValue(k);set('cleaned',true);}}catch(_){}
   const root=document.createElement('section'); root.id='vts-root';
   root.innerHTML=`<style>
@@ -213,20 +302,20 @@ const VTCore = (() => {
   #vts-root .vts-body{padding:12px;max-height:70vh;overflow:auto}#vts-root h3{font-size:16px;margin:0 0 4px}#vts-root p{margin:6px 0}#vts-root .muted{color:#a7b4c4;font-size:11px}#vts-root .row{display:flex;justify-content:space-between;gap:8px;margin:5px 0}
   #vts-root button,#vts-root input,#vts-root select{font:inherit;border:1px solid #40516a;border-radius:6px;background:#1a2737;color:#edf3fc;padding:6px;max-width:100%}#vts-root button{cursor:pointer}#vts-root button:hover{background:#263b54}#vts-root input[type=checkbox]{width:auto}#vts-root input{width:100%}#vts-root .buttons{display:flex;gap:5px;flex-wrap:wrap;margin:8px 0}
   #vts-root .gauge{height:10px;position:relative;background:linear-gradient(90deg,#bf625f,#707d8f,#54ad91);border-radius:7px;margin:10px 0 4px}#vts-root .needle{height:18px;width:3px;background:white;position:absolute;top:-4px}#vts-root .warning{color:#f3c982}#vts-root ul{padding-left:16px;margin:8px 0}#vts-root details{border-top:1px solid #293444;margin-top:12px;padding-top:9px}#vts-root summary{cursor:pointer}#vts-root .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}#vts-root label{display:block;font-size:11px}#vts-root a{color:#8dc1ff}#vts-root .state{font-size:14px;font-weight:750;color:#e8d495}#vts-root code{word-break:break-all;font-size:10px}
-  </style><header><span style="flex:1">VolTrak Steroids <small>3.1</small></span><button data-vts="collapse" title="Collapse">−</button></header><div class="vts-body">
+  </style><header><span style="flex:1">VolTrak Steroids <small>3.2</small></span><button data-vts="collapse" title="Collapse">−</button></header><div class="vts-body">
   <div class="muted" data-vts="status"></div>
   <div data-vts="discord"><p>VolTrak calls → one GMGN receiver.</p><div data-vts="receiver"></div><p class="muted">Initial visible messages are saved for review. Only new, verified calls can move GMGN.</p></div>
   <div data-vts="gmgn"><div class="buttons"><button data-vts="claim">Use this GMGN tab</button><label><input data-vts="autoload" type="checkbox"> Load new calls</label></div>
   <h3 data-vts="token">Open a Solana token</h3><code data-vts="mint"></code><p class="muted" data-vts="feed"></p><div class="state" data-vts="state">UNKNOWN</div>
   <div class="gauge"><span class="needle" data-vts="needle" hidden></span></div><div class="row"><span>Sell side</span><b data-vts="share">—</b><span>Buy side</span></div>
-  <p class="muted" data-vts="basis">Gauge = buy share of 1m $ volume when the trade feed has ≥10 trades, else of 5m swap COUNT. Experimental context, not a buy/sell order or a probability.</p>
+  <p class="muted" data-vts="basis">Gauge = buy share of GMGN's 1m $ volume when live, else the best available fallback. Experimental context, not a buy/sell order or a probability.</p>
   <div data-vts="metrics"></div><ul data-vts="reasons"></ul><ul class="warning" data-vts="risks"></ul><p class="muted" data-vts="missing"></p>
   <div class="buttons"><button data-vts="refresh">Refresh snapshot</button><button data-vts="copy">Copy CA</button></div>
   <details><summary>Recover initials</summary><p>GMGN already offers <b>Sell inits</b> in its Instant Trade tools. Use GMGN to review and submit the sale.</p><p class="muted">Optional calculator: enter all amounts in the same currency. Bag value should be your estimated gross executable sale value. Quotes and fees can change.</p>
   <div class="grid"><label>Total buy cost<input data-vts="cost" type="number" min="0" step="any"></label><label>Net proceeds received<input data-vts="proceeds" type="number" min="0" step="any" value="0"></label><label>Remaining bag value<input data-vts="bag" type="number" min="0" step="any"></label><label>Sale fee/slippage allowance %<input data-vts="fee" type="number" min="0" max="99" step="any" value="0"></label><label>Fixed sale cost<input data-vts="fixed" type="number" min="0" step="any" value="0"></label></div>
   <div class="buttons"><button data-vts="initials">Calculate only</button></div><p data-vts="initials-result"></p><p class="muted">No order is filled or submitted by this script. Alt+I opens this calculator.</p></details></div>
   <details><summary>Calls and recording</summary><select data-vts="call-list" style="width:100%"></select><div class="buttons"><button data-vts="open">Open selected on GMGN</button><button data-vts="export">Export observations</button></div><p class="muted">Records call-time context and fetched snapshots while the receiving GMGN tab is running. Rolling 5m snapshots cannot reconstruct 1m trades. Export regularly.</p><label>Paste a complete VolTrak alert or a contract<input data-vts="paste" placeholder="Contract or alert text"></label><button data-vts="import">Add for review</button></details>
-  <details><summary>Data and controls</summary><p>DEX Screener snapshots: the open token every 3s while its tab is visible; recent calls every 10s in the receiving tab. Swap counts and volume are summed over all indexed pools. Provider delay unknown. No private keys or trading endpoints.</p><p>1m flow and unique wallets come from GeckoTerminal's latest-300-trades feed for the main pool (about 10 requests/min). Market-wide graduation counts are not available.</p><label><input type="checkbox" data-vts="trades"> 1m trade feed (GeckoTerminal)</label><label><input type="checkbox" data-vts="sound"> Voice on Discord only</label><p class="muted">Alt+V hides/shows this panel. Drag the header. Disable the old VolTrak script before using this replacement.</p></details>
+  <details><summary>Data and controls</summary><p>Live: GMGN's own page feed (token_activity trades and token_stat 1m/5m rollups), read-only, the same data GMGN shows. Nothing is sent on GMGN's connection.</p><p>Fallbacks when the live feed is quiet: DEX Screener snapshots (open token every 3s, recent calls every 10s in the receiving tab) and GeckoTerminal's latest-300-trades feed. No private keys or trading endpoints.</p><label><input type="checkbox" data-vts="trades"> GeckoTerminal fallback trade feed</label><label><input type="checkbox" data-vts="sound"> Voice on Discord only</label><p class="muted">Alt+V hides/shows this panel. Drag the header. Disable the old VolTrak script before using this replacement.</p></details>
   </div>`;
   document.body.appendChild(root);
   const $=key=>root.querySelector('[data-vts="'+key+'"]');
@@ -253,13 +342,17 @@ const VTCore = (() => {
     const all=calls().slice().sort((a,b)=>b.messageAt-a.messageAt), signature=all.map(c=>c.id).join('|');
     if(signature!==listSignature){const v=$('call-list').value;$('call-list').replaceChildren(...all.slice(0,100).map(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name+' · '+new Date(c.messageAt).toLocaleTimeString()+(c.historical?' · history':'');return o;}));if(all.some(c=>c.id===v))$('call-list').value=v;listSignature=signature;}
     if(DISCORD){$('receiver').textContent=receiverAlive(receiver())?'GMGN receiver connected':'Open GMGN and choose “Use this GMGN tab”.';return;}
-    const c=all.find(x=>x.mint===current)||null, f=freshFlow(), a=VTCore.assess(c,snapshot,Date.now(),fetchError,f);
+    const now=Date.now(), c=all.find(x=>x.mint===current)||null, f=freshFlow(), L=liveNow(), a=VTCore.assess(c,snapshot,now,fetchError,f,L);
+    const Lf=L&&now-L.at<=15000?L:null, st=Lf?.stat&&now-Lf.stat.at<=15000?Lf.stat:null, lf=Lf?.flow||null;
     $('token').textContent=c?.name|| (current?'Token context':'Open a Solana token');$('mint').textContent=current||'';
-    $('feed').textContent=(snapshot?'DEX snapshot '+ago(snapshot.at):'Waiting for an indexed DEX pool')+(get('trades',true)?' · '+(flowError||(f?'trades fetched '+ago(f.at):'trade feed starting')):'')+' · upstream delay unknown';
+    $('feed').textContent=(Lf?'GMGN live · last update '+ago(Lf.at):VTLive.attachedAt()?'GMGN live: waiting for this token':'GMGN live: not connected (fallbacks below)')+' · '+(snapshot?'DEX '+ago(snapshot.at):'DEX: no pool yet')+(get('trades',true)&&!Lf?' · '+(flowError||(f?'GeckoTerminal '+ago(f.at):'GeckoTerminal starting')):'');
     $('state').textContent=a.state+(a.flags.length?' · '+a.flags.length+' flag'+(a.flags.length>1?'s':''):'');$('share').textContent=a.share==null?'—':Math.round(a.share)+'% buys';$('needle').hidden=a.share==null;if(a.share!=null)$('needle').style.left=Math.max(0,Math.min(100,a.share))+'%';
     $('basis').textContent='Gauge = buy share of '+(a.basis||'1m $ volume (≥10 trades) or 5m swap count')+'. Experimental context, not a buy/sell order or a probability.';
-    const rows=[['1m buys / sells',f?f.m1.buys+' / '+f.m1.sells:'—'],['1m buy $ / sell $',f?usd(f.m1.buyUsd)+' / '+usd(f.m1.sellUsd):'—'],['Wallets 1m / 5m',f?f.m1.wallets+' / '+f.m5.wallets+(f.m5.complete?'':'+'):'—'],['Last indexed trade',f?ago(f.lastTradeAt):'—'],
-      ['5m buys / sells',(snapshot?.buys5m??'—')+' / '+(snapshot?.sells5m??'—')],['5m / 1h swap volume',usd(snapshot?.volume5m)+' / '+usd(snapshot?.volume1h)],['Indexed liquidity',usd(snapshot?.liquidity)],['Market cap / call MC',usd(snapshot?.marketCap)+' / '+usd(c?.callMc)],['Main pool',snapshot?(snapshot.dex||'DEX')+' · '+snapshot.pair?.slice(0,6)+(snapshot.pools>1?' (+'+(snapshot.pools-1)+')':''):'—'],['Alert migration status',c?.migrated==null?'unknown':c.migrated?'Migrated (at call)':'Bonding curve (at call)'],['Largest reported cluster',c?.clusters?.length?Math.max(...c.clusters)+'%':'—']];
+    const w1=st?.m1||lf?.m1||f?.m1, wallets=lf||f, part=w=>w.complete?'':'+', last=Lf?.last;
+    const rows=[['1m buys / sells',w1?(w1.buys??'—')+' / '+(w1.sells??'—'):'—'],['1m buy $ / sell $',w1?usd(w1.buyUsd)+' / '+usd(w1.sellUsd):'—'],
+      ['5m buys / sells',st?(st.m5.buys??'—')+' / '+(st.m5.sells??'—'):(snapshot?.buys5m??'—')+' / '+(snapshot?.sells5m??'—')],['5m / 1h volume',st?usd(st.m5.volume)+' / '+usd(st.h1.volume):usd(snapshot?.volume5m)+' / '+usd(snapshot?.volume1h)],
+      ['Wallets 1m / 5m',wallets?wallets.m1.wallets+part(wallets.m1)+' / '+wallets.m5.wallets+part(wallets.m5):'—'],['Last trade',last?last.side+' '+usd(last.usd)+' · '+ago(last.at):f?ago(f.lastTradeAt):'—'],
+      ['Indexed liquidity',usd(snapshot?.liquidity)],['Market cap / call MC',usd(Lf?.marketCap??snapshot?.marketCap)+' / '+usd(c?.callMc)],['Main pool',snapshot?(snapshot.dex||'DEX')+' · '+snapshot.pair?.slice(0,6)+(snapshot.pools>1?' (+'+(snapshot.pools-1)+')':''):'—'],['Alert migration status',c?.migrated==null?'unknown':c.migrated?'Migrated (at call)':'Bonding curve (at call)'],['Largest reported cluster',c?.clusters?.length?Math.max(...c.clusters)+'%':'—']];
     $('metrics').replaceChildren(...rows.map(([k,v])=>{const d=document.createElement('div');d.className='row';const l=document.createElement('span'),r=document.createElement('b');l.textContent=k;r.textContent=v;d.append(l,r);return d;}));
     listText($('reasons'),a.reasons);listText($('risks'),[...a.risks,...a.flags]);$('missing').textContent=a.missing.join(' · ');
   }
@@ -273,6 +366,15 @@ const VTCore = (() => {
     try{const u=new SpeechSynthesisUtterance('VolTrak. '+call.name+'. Check Steroids.');u.rate=1.05;speechSynthesis.speak(u);}catch(_){}
   }
   function http(url){return new Promise(resolve=>GM_xmlhttpRequest({method:'GET',url,headers:{Accept:'application/json'},timeout:8000,onload:r=>{let data=null;if(r.status===200)try{data=JSON.parse(r.responseText);}catch(_){}resolve({status:r.status,data});},onerror:()=>resolve({status:0,data:null}),ontimeout:()=>resolve({status:0,data:null})}));}
+  // Switch tokens inside GMGN's page (its Next.js router) instead of a full reload; reload if the router is missing or stalls.
+  let kick=()=>{};
+  function openToken(mint){
+    const url=VTCore.gmgnURL(mint), from=location.href;
+    let router=null;try{router=(typeof unsafeWindow!=='undefined'?unsafeWindow:window).next?.router;}catch(_){}
+    if(typeof router?.push!=='function'){location.assign(url);return;}
+    try{Promise.resolve(router.push(new URL(url).pathname)).then(()=>kick(),()=>location.assign(url));}catch(_){location.assign(url);return;}
+    setTimeout(()=>{if(location.href===from)location.assign(url);},4000);
+  }
   async function ownReceiver(force=false){
     return locked('receiver',()=>{const r=receiver();if(force||!receiverAlive(r)||r.id===TAB){set('receiver',{id:TAB,at:Date.now()});return true;}return false;});
   }
@@ -290,7 +392,7 @@ const VTCore = (() => {
         // Durable receipt BEFORE navigation: startup replay cannot reload this call again.
         receipts[call.id]=Date.now();set('receipts',Object.fromEntries(Object.entries(receipts).sort((a,b)=>b[1]-a[1]).slice(0,1000)));
         notice('Received '+call.name+' once');
-        if(action==='navigate')location.assign(VTCore.gmgnURL(call.mint));
+        if(action==='navigate')openToken(call.mint);
       });
     }finally{receiving=false;}
   }
@@ -299,7 +401,7 @@ const VTCore = (() => {
     const now=Date.now(), visible=!document.hidden;
     if(!force&&now<dexPause)return;
     // Open token: every 3s while visible. Receiver also records recent calls every 10s. Hidden display-only tabs stay quiet.
-    const dueTracked=isReceiver&&(force||now-lastTracked>=TRACK_MS), dueCurrent=force||(visible&&now-lastResponse>=CURRENT_MS);
+    const dueTracked=isReceiver&&(force||now-lastTracked>=TRACK_MS), dueCurrent=force||(visible&&now-lastResponse>=(liveFresh()?TRACK_MS:CURRENT_MS));
     if(!dueTracked&&!dueCurrent)return;
     polling=true;
     const mintAtStart=current;
@@ -317,6 +419,8 @@ const VTCore = (() => {
         if(!s||!dueTracked)continue;
         const f=mint===current?freshFlow():null;
         if(f)s.trades1m={buys:f.m1.buys,sells:f.m1.sells,buyUsd:f.m1.buyUsd,sellUsd:f.m1.sellUsd,wallets:f.m1.wallets,complete:f.m1.complete};
+        const L=mint===current?liveNow():null;
+        if(L?.stat&&at-L.stat.at<=15000){s.gmgn1m={...L.stat.m1};s.gmgn5m={...L.stat.m5};}
         set(key,[...samples.filter(x=>at-x.at<2*3600000),s].slice(-720));
       }
       if(dueTracked){
@@ -328,7 +432,7 @@ const VTCore = (() => {
     }finally{polling=false;}
   }
   async function pollFlow(force=false){
-    if(!GMGN||flowing||!current||!get('trades',true))return;
+    if(!GMGN||flowing||!current||!get('trades',true)||liveFresh())return;
     const now=Date.now(), mint=current, dexPair=snapshot?.pair;
     if(!force&&(now<flowPause||now-lastFlow<FLOW_MS||(document.hidden&&!isReceiver)))return;
     if(!dexPair)return;
@@ -362,7 +466,7 @@ const VTCore = (() => {
     const r=VTCore.initials(...raw.map(Number));
     $('initials-result').textContent=r.error|| (r.already?'Initial cost already recovered.':r.covered?'Estimated sale: '+r.pct.toFixed(2)+'% of remaining tokens to recover '+r.need.toFixed(6)+' before any unmodelled costs.':'Even 100% would not recover initials; estimated shortfall '+r.shortfall.toFixed(6)+'.');
   };
-  $('open').onclick=()=>{const c=calls().find(c=>c.id===$('call-list').value);if(!c)return;if(GMGN){if(VTCore.mintFromURL(location.href)!==c.mint)location.assign(VTCore.gmgnURL(c.mint));}else GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true});};
+  $('open').onclick=()=>{const c=calls().find(c=>c.id===$('call-list').value);if(!c)return;if(GMGN){if(VTCore.mintFromURL(location.href)!==c.mint)openToken(c.mint);}else GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true});};
   $('import').onclick=async()=>{
     const input=$('paste').value.trim(), parsed=VTCore.parseAlert(input);
     const c=parsed||(VTCore.MINT.test(input)?{mint:input,name:input.slice(0,8),clusters:[]}:null);
@@ -371,7 +475,7 @@ const VTCore = (() => {
   };
   $('export').onclick=()=>{
     const all=calls(), mints=get('recordedMints',[]), payload={version:VERSION,exportedAt:new Date().toISOString(),calls:all,
-      coverage:{feed:'DEX Screener rolling snapshots summed over indexed pools; trades1m from GeckoTerminal for the open token only',tradeByTrade:false,upstreamTimestamps:false,marketWide:false,retention:'500 calls; 100 observed mints; at most 2h/720 observations per mint (10s cadence); only while receiver runs'},
+      coverage:{feed:'DEX Screener rolling snapshots summed over indexed pools; gmgn1m/gmgn5m from GMGN\'s page feed and trades1m from GeckoTerminal, open token only',tradeByTrade:false,upstreamTimestamps:false,marketWide:false,retention:'500 calls; 100 observed mints; at most 2h/720 observations per mint (10s cadence); only while receiver runs'},
       samples:Object.fromEntries(mints.map(m=>[m,get('samples.'+m,[])]))};
     const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='voltrak-steroids-'+Date.now()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   };
@@ -379,6 +483,23 @@ const VTCore = (() => {
   GM_addValueChangeListener(PREFIX+'manual',()=>{callsCache=null;render();});
   if(GMGN){
     GM_addValueChangeListener(PREFIX+'latest',()=>receiveLatest());
+    VTLive.on(frame=>{
+      const now=Date.now(), pageMint=VTCore.mintFromURL(location.href);
+      if(!pageMint)return;
+      if(live.mint!==pageMint)resetLive(pageMint);
+      let changed=false;
+      for(const x of frame.items){
+        // Only the token on screen. Rows without an address are trusted once the page has been on its token for 3s.
+        const a=VTCore.addrOf(x);if(a?a!==pageMint:now-live.since<3000)continue;
+        if(frame.channel==='token_stat'){live.stat=VTCore.gmgnStat(x,now);changed=true;continue;}
+        const t=VTCore.gmgnTrade(x), key=t&&tradeKey(t);if(!t||key&&live.keys.has(key))continue;
+        if(key)live.keys.add(key);live.trades.push(t);changed=true;
+      }
+      if(!changed)return;
+      live.at=now;live.first=live.first||now;
+      if(now-live.prunedAt>10000){live.prunedAt=now;live.trades=live.trades.filter(t=>now-t.at<=360000).slice(-3000);live.keys=new Set(live.trades.map(tradeKey).filter(Boolean));}
+      soon();
+    });
     // Mark the role as leaving: this tab's next page takes it back at once; if the tab closed, another can take it after 20s.
     addEventListener('pagehide',()=>{const r=receiver();if(r?.id===TAB)set('receiver',{...r,leaving:Date.now()});});
     let ticking=false, lastBeat=0;
@@ -386,7 +507,7 @@ const VTCore = (() => {
       if(ticking)return;ticking=true;
       try{
         const next=VTCore.mintFromURL(location.href);
-        if(next!==lastMint){lastMint=next;current=next;snapshot=null;flow=null;gtPools={};fetchError='';flowError='';lastResponse=0;lastFlow=0;}
+        if(next!==lastMint){lastMint=next;current=next;snapshot=null;flow=null;gtPools={};fetchError='';flowError='';lastResponse=0;lastFlow=0;if(live.mint!==next)resetLive(next);}
         if(Date.now()-lastBeat>=5000){lastBeat=Date.now();isReceiver=await ownReceiver();}
         status=isReceiver?'Receiving calls · open token every 3s · '+(get('autoload',true)?'auto-load on':'auto-load off'):'Display only · another GMGN tab receives calls';
         if(isReceiver)receiveLatest();
@@ -394,7 +515,7 @@ const VTCore = (() => {
       }finally{ticking=false;}
     }
     // Short delay lets a duplicated tab learn it needs a fresh ID before it can act as the receiver.
-    setTimeout(tick,300);every(1000,tick);
+    kick=()=>tick();setTimeout(tick,300);every(1000,tick);
   }
   if(DISCORD){
     let initial=true,lastChannel='',timer=null,scanning=false,others=new Set();
@@ -446,4 +567,6 @@ const VTCore = (() => {
     mo.observe(document.body,{childList:true,subtree:true});setTimeout(scan,2000);every(5000,scan);
   }
   render();
-})();
+}
+// The panel waits for the DOM; the GMGN listener above is already in place from document-start.
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {once: true}); else start();

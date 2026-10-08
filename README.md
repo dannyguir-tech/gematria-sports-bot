@@ -42,6 +42,14 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 `voltrak-steroids.user.js` is a Tampermonkey userscript for Discord and GMGN. It reads new VolTrak calls in Discord and loads them in one GMGN "receiver" tab. There it shows free DEX Screener snapshots and 1m trade flow from GeckoTerminal. It is for analysis only: it never submits trades.
 
+## 3.2.0 changes
+
+- **GMGN live feed:** the script now reads GMGN's own page connection (`ws.gmgn.ai`), using `token_activity` for each trade and `token_stat` for GMGN's 1m/5m rollups. It's read-only: it never sends on GMGN's connection or changes a message, and it keeps only messages for the token on screen. The gauge uses GMGN's 1m buy/sell volume, and new tokens work before DEX Screener has indexed them.
+- **Fallbacks:** DEX Screener and GeckoTerminal are now only used when the live feed is quiet. While it's flowing, GeckoTerminal pauses and DEX Screener slows to every 10s.
+- **Instant token switch:** a new call opens inside the GMGN page through its own router, without a full reload. If the router isn't available, it falls back to a reload.
+- **Panel:** shows the last trade (side, size, age) and live market cap (price × 1B supply for pump.fun tokens).
+- **Timing:** the script now runs at `document-start`, so it attaches before GMGN opens its connection.
+
 ## 3.1.0 changes
 
 - **Faster after a call loads:** the GMGN receiver keeps its role across its own reload. In v3.0.0 it became display-only for about 20s and fetched nothing.

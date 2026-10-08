@@ -147,7 +147,7 @@ test('assess: call-time flags no longer hide the live state', () => {
   const s = VTCore.normalize(pool('a', 'pumpswap', 40000, 30, 10), NOW - 1000);
   const a = VTCore.assess(call, s, NOW, '');
   assert.equal(a.state, 'WATCH BUY SETUP');
-  assert.equal(a.basis, '5m swap count');
+  assert.equal(a.basis, 'DEX Screener 5m swap count');
   assert.equal(a.risks.length, 0);
   assert.ok(a.flags.some(x => /cluster/.test(x)) && a.flags.some(x => /top holder/.test(x)));
 });
@@ -166,11 +166,66 @@ test('assess: fresh 1m trade flow drives the gauge in USD', () => {
   const rows = [...Array(4)].map((_, i) => trade(i * 5, 'buy', 10, 'b' + i)).concat([...Array(8)].map((_, i) => trade(i * 5, 'sell', 50, 's' + i)));
   const flow = VTCore.tradeFlow(rows, MINT, NOW);
   const a = VTCore.assess(null, s, NOW, '', flow);
-  assert.equal(a.basis, '1m $ volume');
+  assert.equal(a.basis, 'GeckoTerminal 1m $ volume');
   assert.equal(Math.round(a.share), 9);
   assert.equal(a.state, 'FADE / REVIEW EXIT');
   assert.ok(!a.missing.includes('1m trade flow unavailable'));
   assert.ok(VTCore.assess(null, s, NOW + 40000, '', flow).missing.includes('1m trade flow unavailable'));
+});
+
+// GMGN page websocket frames, shaped like the token_activity / token_stat messages GMGN sends.
+const activity = (secondsAgo, e, au, m, extra = {}) => ({a: MINT, e, m, au: String(au), qa: '0.1', ba: '1000', pu: '0.0000131', t: Math.round((NOW - secondsAgo * 1000) / 1000), h: 'tx' + m + secondsAgo, ex: 'pump', ...extra});
+const STAT = {a: MINT, p: '0.0000131', p1m: '0.0000125', p5m: '0.0000140', b1m: 31, s1m: 9, bv1m: '1500', sv1m: '300', v1m: '1800', b5m: 120, s5m: 80, bv5m: '6000', sv5m: '4000', v5m: '10000'};
+
+test('gmgnFrame accepts flat items and items wrapped in d', () => {
+  const flat = VTCore.gmgnFrame(JSON.stringify({channel: 'token_activity', data: [activity(1, 'buy', 10, 'w1')]}));
+  assert.equal(flat.channel, 'token_activity');
+  assert.equal(VTCore.gmgnTrade(flat.items[0]).side, 'buy');
+  const wrapped = VTCore.gmgnFrame({channel: 'token_activity', data: [{t: 'activity', ts: 1, d: activity(2, 'sell', 5, 'w2')}]});
+  const trade = VTCore.gmgnTrade(wrapped.items[0]);
+  assert.deepEqual([trade.side, trade.usd, trade.wallet, trade.mint, trade.at], ['sell', 5, 'w2', MINT, Math.round((NOW - 2000) / 1000) * 1000]);
+  assert.equal(VTCore.gmgnFrame('not json'), null);
+  assert.equal(VTCore.gmgnFrame('{"data":[]}'), null);
+  assert.equal(VTCore.gmgnTrade({e: 'add', t: 1}), null);
+});
+
+test('gmgnStat reads GMGN rolling windows', () => {
+  const st = VTCore.gmgnStat(STAT, NOW);
+  assert.deepEqual([st.mint, st.price, st.m1.buys, st.m1.sells, st.m1.buyUsd, st.m1.sellUsd, st.m1.priceAgo], [MINT, 0.0000131, 31, 9, 1500, 300, 0.0000125]);
+  assert.deepEqual([st.m5.buys, st.m5.sells, st.m5.volume, st.h1.buys], [120, 80, 10000, null]);
+});
+
+test('liveView: windows are complete only after listening that long; pump MC = price × 1B', () => {
+  const trades = [activity(5, 'buy', 10, 'w1'), activity(30, 'sell', 4, 'w2')].map(VTCore.gmgnTrade);
+  const early = VTCore.liveView(trades, null, NOW, NOW, NOW - 40000);
+  assert.equal(early.flow.m1.complete, false);
+  assert.equal(early.last.wallet, 'w1');
+  assert.ok(Math.abs(early.marketCap - 13100) < 1e-6);
+  const settled = VTCore.liveView(trades, null, NOW, NOW, NOW - 61000);
+  assert.deepEqual([settled.flow.m1.complete, settled.flow.m5.complete, settled.flow.m1.wallets], [true, false, 2]);
+  assert.equal(VTCore.liveView([], null, 0, NOW, NOW), null);
+});
+
+test('assess: GMGN token_stat drives the gauge without any DEX snapshot', () => {
+  const live = VTCore.liveView([activity(2, 'buy', 50, 'w1')].map(VTCore.gmgnTrade), VTCore.gmgnStat(STAT, NOW - 1000), NOW - 1000, NOW, NOW - 5000);
+  const call = VTCore.parseAlert(REAL_ALERT);
+  const a = VTCore.assess(call, null, NOW, '', null, live);
+  assert.equal(a.basis, 'GMGN 1m $ volume');
+  assert.equal(Math.round(a.share), 83);
+  assert.equal(a.state, 'WATCH BUY SETUP');
+  assert.ok(a.reasons.includes('1m price change +4.8%'));
+  assert.ok(a.reasons.some(r => r.startsWith('+1.2% market-cap change since alert (live price × 1B supply)')));
+  assert.ok(a.missing.includes('No DEX Screener pool yet: liquidity unknown'));
+  assert.ok(!a.missing.includes('1m trade flow unavailable'));
+  // Stale live data falls back to UNKNOWN when nothing else is fresh.
+  assert.equal(VTCore.assess(call, null, NOW + 20000, '', null, live).state, 'UNKNOWN');
+});
+
+test('assess: thin GMGN 1m falls back to GMGN 5m, which flags a weak sample', () => {
+  const stat = VTCore.gmgnStat({...STAT, b1m: 2, s1m: 1, b5m: 12, s5m: 4}, NOW);
+  const a = VTCore.assess(null, null, NOW, '', null, VTCore.liveView([], stat, NOW, NOW, NOW));
+  assert.equal(a.basis, 'GMGN 5m $ volume');
+  assert.equal(a.state, 'CAUTION');
 });
 
 test('initials and handoff keep their behaviour', () => {
