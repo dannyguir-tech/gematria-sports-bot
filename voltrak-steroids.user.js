@@ -401,7 +401,9 @@ const VTCore = (() => {
       const i = keys.findIndex(k => k.pubkey === owner);
       let sol = i >= 0 && meta.preBalances && meta.postBalances ? (meta.postBalances[i] - meta.preBalances[i] + (i === 0 ? meta.fee || 0 : 0)) / 1e9 : 0;
       sol += (wPost.get(owner) || 0) - (wPre.get(owner) || 0);
-      rows.push({at, side: d > 0 ? 'buy' : 'sell', amount: Math.abs(d), sol: Math.abs(sol), usd: Math.abs(sol) * price, wallet: owner, hash, ex});
+      // Almost no SOL moved for this signer (e.g. a route paid in USDC): size unknown, priced by the caller.
+      const known = Math.abs(sol) >= 0.001;
+      rows.push({at, side: d > 0 ? 'buy' : 'sell', amount: Math.abs(d), sol: known ? Math.abs(sol) : null, usd: known ? Math.abs(sol) * price : null, wallet: owner, hash, ex});
     }
     return rows;
   }
@@ -1668,13 +1670,12 @@ function start() {
   async function txWindow(mint,from,to,maxPages=40){
     const txs=[];let token=null,pages=0;
     do{
-      // Solana now has version-1 transactions; the RPC refuses to return them unless asked. If it names a newer
-      // version in its error, retry once with that and remember it.
-      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:get('rpcTxVersion',1),filters:{blockTime:{gte:from,lte:to},status:'succeeded'}};
+      // Version 1 (SIMD-0385, live since Sep 2026) is the newest format the parser is known to read; without it the
+      // RPC refuses any page that contains one. A newer version is reported as an error, never accepted blindly.
+      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:1,filters:{blockTime:{gte:from,lte:to},status:'succeeded'}};
       if(token)opt.paginationToken=token;
       let r=await rpcCall('getTransactionsForAddress',[mint,opt]);
-      const want=+(String(r.error||'').match(/maxSupportedTransactionVersion\W+(\d+)/)?.[1]);
-      if(Number.isFinite(want)&&want>opt.maxSupportedTransactionVersion&&want<10){set('rpcTxVersion',want);opt.maxSupportedTransactionVersion=want;r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
+      if(/maxSupportedTransactionVersion/.test(r.error||''))r.error='Solana has a newer transaction format than this script reads ('+r.error.slice(0,60)+'…): tell Claude';
       if(r.status===429){await sleep(2500);r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
       if(r.error)return {txs,pages,error:r.error,truncated:true};
       const res=r.data?.result, list=Array.isArray(res)?res:Array.isArray(res?.data)?res.data:Array.isArray(res?.transactions)?res.transactions:[];

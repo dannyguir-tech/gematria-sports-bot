@@ -447,3 +447,14 @@ test('botFlow: a small buy followed by dumping a much larger bag is not a flat r
   const r = VTCore.botFlow([tr(100, 'buy', 20, 'H', {amount: 1000}), tr(106, 'sell', 400, 'H', {amount: 20000})], B0, B0 + 300000);
   assert.deepEqual([r.byRule.fastTrip, r.botUsd], [0, 0]);
 });
+
+test('txTrades: a version-1 item (transactionConfig, no header) parses; a buy paid in USDC gets an unknown size', () => {
+  const v1 = ptx({keys: [{pubkey: 'Buyer1', signer: true, writable: true, source: 'transaction'}, {pubkey: 'Curve', signer: false, writable: true, source: 'transaction'}, {pubkey: PUMPP, signer: false, writable: false, source: 'transaction'}],
+    pre: [2e9, 50e9, 1], post: [1.5e9 - 25000, 50.5e9, 1], fee: 25000, preTok: [tb(3, 'Curve', MINTX, 800e12)], postTok: [tb(3, 'Curve', MINTX, 799e12), tb(4, 'Buyer1', MINTX, 1e12)]});
+  v1.version = 1; v1.transaction.message.transactionConfig = {priorityFee: 20000, computeUnitLimit: 120000, loadedAccountsDataSizeLimit: null, heapSize: null};
+  const [row] = VTCore.txTrades(v1, MINTX, 200);
+  assert.ok(Math.abs(row.sol - 0.5) < 1e-9);
+  const usdc = ptx({keys: [{pubkey: 'U', signer: true}, {pubkey: PUMPP}], pre: [1e9, 1], post: [1e9 - 5000, 1], preTok: [tb(2, 'Curve', MINTX, 9e12)], postTok: [tb(2, 'Curve', MINTX, 8e12), tb(3, 'U', MINTX, 1e12)]});
+  const [r2] = VTCore.txTrades(usdc, MINTX, 200);
+  assert.deepEqual([r2.side, r2.sol, r2.usd], ['buy', null, null]);
+});
