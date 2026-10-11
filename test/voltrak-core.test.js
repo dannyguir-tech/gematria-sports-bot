@@ -430,3 +430,20 @@ test('scoreCall: early exit sells at the 5-min close when not up; cautious fills
   assert.ok(Math.abs(VTCore.breakeven(100, -50, 3) - 35.33) < 0.01);
   assert.ok(Math.abs(plain.troughMin - (5 * 60000 - 20000) / 60000) < 1e-9);
 });
+
+test('txTrades: one wallet buying and selling inside one transaction shows both legs (from parsed transfers)', () => {
+  const keys = [{pubkey: 'W', signer: true}, {pubkey: 'CurveATA'}, {pubkey: 'W_ATA'}, {pubkey: PUMPP}];
+  const xfer = (src, dst, raw) => ({parsed: {type: 'transferChecked', info: {source: src, destination: dst, mint: MINTX, tokenAmount: {amount: String(raw)}}}});
+  const tx = {blockTime: 1791720000, transaction: {signatures: ['selfwash'], message: {accountKeys: keys, instructions: []}},
+    meta: {err: null, fee: 5000, preBalances: [2e9, 0, 0, 1], postBalances: [2e9 - 9000, 0, 0, 1],
+      preTokenBalances: [tb(1, 'Curve', MINTX, 800e12), tb(2, 'W', MINTX, 0)], postTokenBalances: [tb(1, 'Curve', MINTX, 800e12), tb(2, 'W', MINTX, 0)],
+      innerInstructions: [{index: 0, instructions: [xfer('CurveATA', 'W_ATA', 3e12), xfer('W_ATA', 'CurveATA', 3e12)]}]}};
+  const rows = VTCore.txTrades(tx, MINTX, 200);
+  assert.deepEqual(rows.map(r => [r.side, r.wallet, r.amount, r.usd]), [['buy', 'W', 3e6, null], ['sell', 'W', 3e6, null]]);
+  assert.equal(VTCore.botFlow(rows.map(r => ({...r, usd: 30})), 0, 2e12).byRule.txWash, 2);
+});
+
+test('botFlow: a small buy followed by dumping a much larger bag is not a flat round trip', () => {
+  const r = VTCore.botFlow([tr(100, 'buy', 20, 'H', {amount: 1000}), tr(106, 'sell', 400, 'H', {amount: 20000})], B0, B0 + 300000);
+  assert.deepEqual([r.byRule.fastTrip, r.botUsd], [0, 0]);
+});

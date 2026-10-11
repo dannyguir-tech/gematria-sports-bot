@@ -6,7 +6,6 @@
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
 // @match        https://photon-sol.tinyastro.io/*
-// @match        https://*.tinyastro.io/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -207,7 +206,7 @@ const VTCore = (() => {
     } else missing.push('No DEX Screener pool yet: liquidity unknown');
     reasons.push(L ? 'Live from GMGN\'s own page feed' : (dex?.pools > 1 ? 'DEX flow summed over ' + dex.pools + ' indexed pools' : 'Single indexed pool') + '; upstream update delay is unknown');
     const state = risks.length ? 'CAUTION' : share === null ? 'UNKNOWN' : side === 'SELL SIDE' && momentum < 0 ? 'FADE / REVIEW EXIT' : side === 'BUY SIDE' && momentum > 0 ? 'WATCH BUY SETUP' : 'WAIT';
-    return {state,side,share,basis,reasons,risks,flags,missing,momentum,momentumWindow:momentum==null?null:momentum===m1Change?'1m':'5m'};
+    return {state,side,share,basis,window:pick?.[3]||null,reasons,risks,flags,missing,momentum,momentumWindow:momentum==null?null:momentum===m1Change?'1m':'5m'};
   }
   // ---- Backtest: score past calls from 1m candles ----
   // GeckoTerminal ohlcv_list rows [start s, open, high, low, close, volume] → ascending candles. Minutes without swaps are absent.
@@ -338,7 +337,7 @@ const VTCore = (() => {
           if (tokens(b) ? tok >= o.tokFrac * tokens(b) : usd >= (1 - o.flatTol) * b.usd) break;
         }
         // Flat = sold back at about the buy's price per token (or, without token amounts, about the same USD).
-        const back = tokens(b) ? tok >= o.tokFrac * tokens(b) : legs.length > 0;
+        const back = tokens(b) ? tok >= o.tokFrac * tokens(b) && tok <= (2 - o.tokFrac) * tokens(b) : legs.length > 0;
         const flat = tokens(b) && tok > 0 ? Math.abs((usd / tok) / (b.usd / tokens(b)) - 1) <= o.flatTol : Math.abs(usd - b.usd) <= o.flatTol * b.usd;
         if (!back || !flat) continue;
         legs.forEach(s => used.add(s));
@@ -379,8 +378,24 @@ const VTCore = (() => {
     const bal = (list, m) => { const o = new Map(); for (const b of list || []) if (b?.mint === m && b.owner) o.set(b.owner, (o.get(b.owner) || 0) + Number(b.uiTokenAmount?.amount || 0) / 10 ** (b.uiTokenAmount?.decimals ?? 6)); return o; };
     const pre = bal(meta.preTokenBalances, mint), post = bal(meta.postTokenBalances, mint), wPre = bal(meta.preTokenBalances, WSOL), wPost = bal(meta.postTokenBalances, WSOL);
     const at = (number(tx.blockTime) ?? 0) * 1000, hash = tx.transaction?.signatures?.[0] || null, price = solUsd > 0 ? solUsd : 150, rows = [];
+    // A wallet that buys and sells inside one transaction nets to zero in the balances; the parsed token transfers show
+    // both legs. Those legs get usd/sol null (the caller prices them from the window's other trades).
+    const acct = new Map(), dec = new Map();
+    for (const b of [...(meta.preTokenBalances || []), ...(meta.postTokenBalances || [])]) { const k = keys[b?.accountIndex]?.pubkey; if (k && b.mint) { acct.set(k, {mint: b.mint, owner: b.owner}); dec.set(b.mint, b.uiTokenAmount?.decimals ?? 6); } }
+    const moved = new Map(), ins = [...(msg.instructions || []), ...(meta.innerInstructions || []).flatMap(x => x?.instructions || [])];
+    for (const ix of ins) {
+      const t = ix?.parsed?.type, info = ix?.parsed?.info;
+      if (!info || (t !== 'transfer' && t !== 'transferChecked')) continue;
+      const src = acct.get(info.source), dst = acct.get(info.destination);
+      if ((info.mint || src?.mint || dst?.mint) !== mint) continue;
+      const amt = Number(info.tokenAmount?.amount ?? info.amount ?? 0) / 10 ** (dec.get(mint) ?? 6);
+      for (const [who, side] of [[src?.owner, 'out'], [dst?.owner, 'in']]) if (who && signers.has(who)) { const m = moved.get(who) || {in: 0, out: 0}; m[side] += amt; moved.set(who, m); }
+    }
+    for (const [owner, m] of moved) if (m.in > 0 && m.out > 0 && Math.abs(m.in - m.out) <= 0.05 * Math.max(m.in, m.out))
+      rows.push({at, side: 'buy', amount: m.in, sol: null, usd: null, wallet: owner, hash, ex}, {at, side: 'sell', amount: m.out, sol: null, usd: null, wallet: owner, hash, ex});
+    const washed = new Set(rows.map(r => r.wallet));
     for (const owner of new Set([...pre.keys(), ...post.keys()])) {
-      if (!signers.has(owner)) continue;
+      if (!signers.has(owner) || washed.has(owner)) continue;
       const d = (post.get(owner) || 0) - (pre.get(owner) || 0);
       if (!d) continue;
       const i = keys.findIndex(k => k.pubkey === owner);
@@ -500,58 +515,70 @@ const VTLive = (() => {
 // own page receives (websocket messages and API responses) to find where its volume-bot info lives. Nothing is sent
 // anywhere; "Copy Photon report" puts a trimmed, redacted summary on the clipboard for the user to share.
 const PhotonProbe = (() => {
-  if (!/(^|\.)tinyastro\.io$/.test(location.hostname)) return null;
-  const SECRET = /^(access_?token|refresh_?token|id_?token|auth\w*|session\w*|\w*secret\w*|api_?key|cookie|e?mail|password|jwt|private\w*|seed\w*|mnemonic|otp|code)$/i;
-  const INTEREST = /bot|wash|volume|trade|swap|maker|tag|holder|sniper|bundl|insider|dev/i;
+  if (location.hostname !== 'photon-sol.tinyastro.io') return null;
+  // Redaction: secret-looking keys anywhere in a name, JWTs inside strings, and every Solana address (the user's wallet
+  // included) become placeholders. Account-related messages and paths are skipped entirely.
+  const SECRET = /token|secret|passw|pwd|auth|session|^sid$|cookie|csrf|xsrf|api[-_]?key|private|seed|mnemonic|otp|^code$|signature|^pk$|^sk$|mail|phone|balance/i;
+  const ACCOUNT = /wallet|balance|portfolio|position|order|user|account|profile|referr|settings|login/i;
+  const INTEREST = /\b(bots?|volume[_ -]?bots?|wash\w*|maker\w*|snipers?|bundle\w*|insiders?|holders?|trades?|swaps?|tags?)\b|bot_|_bot|bot[A-Z]/;
+  const ADDR = /[1-9A-HJ-NP-Za-km-z]{32,44}/g, clean = t => String(t).replace(ADDR, '<addr>').replace(/\b[0-9a-f]{24,}\b/gi, '<id>');
   const rep = {since: Date.now(), sockets: {}, http: {}, events: {}, keys: {}, samples: {}, domLines: []};
   const redact = (v, depth = 0) => {
-    if (typeof v === 'string') return /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(v) ? '[redacted]' : v.length > 200 ? v.slice(0, 200) + '…' : v;
-    if (!v || typeof v !== 'object' || depth > 6) return v;
+    if (typeof v === 'string') { const t = clean(v.replace(/eyJ[\w-]+\.[\w-]+\.[\w-]*/g, '[jwt]')); return t.length > 200 ? t.slice(0, 200) + '…' : t; }
+    if (!v || typeof v !== 'object') return v;
+    if (depth > 6) return '[deep]';
     if (Array.isArray(v)) return v.slice(0, 4).map(x => redact(x, depth + 1));
-    const o = {}; for (const [k, x] of Object.entries(v).slice(0, 60)) o[k] = SECRET.test(k) ? '[redacted]' : redact(x, depth + 1); return o;
+    const o = {}; for (const [k, x] of Object.entries(v).slice(0, 60)) o[clean(k)] = SECRET.test(k) ? '[redacted]' : redact(x, depth + 1); return o;
   };
   const record = (source, raw) => {
     let msg = raw;
     if (typeof raw === 'string') { const i = raw.search(/[[{]/); if (i < 0) return; try { msg = JSON.parse(raw.slice(i)); } catch (_) { return; } }
     if (!msg || typeof msg !== 'object') return;
     const first = Array.isArray(msg) ? msg.find(x => x && typeof x === 'object') : msg;
-    const name = source + ':' + String(first?.type ?? first?.event ?? first?.channel ?? first?.e ?? first?.op ?? (Array.isArray(msg) && typeof msg[0] === 'string' ? msg[0] : '?')).slice(0, 40);
+    const name = clean(source + ':' + String(first?.type ?? first?.event ?? first?.channel ?? first?.e ?? first?.op ?? (Array.isArray(msg) && typeof msg[0] === 'string' ? msg[0] : '?')).slice(0, 40));
     if (!(name in rep.events) && Object.keys(rep.events).length >= 80) return;
     rep.events[name] = (rep.events[name] || 0) + 1;
+    // Account-shaped messages (by their name or top-level fields) are only counted, never sampled.
+    if (ACCOUNT.test(name) || ACCOUNT.test(Object.keys(first || {}).join(' '))) return;
+    // After the first 200 messages of a kind, only count them: the shape is known and the page should not pay for parsing.
+    if (rep.events[name] > 200) return;
     const keys = rep.keys[name] || (rep.keys[name] = []);
-    const walk = (o, pre, d) => { if (!o || typeof o !== 'object' || d > 2) return; for (const [k, v] of Object.entries(Array.isArray(o) ? (o[0] ?? {}) : o).slice(0, 60)) { const path = pre + k; if (!keys.includes(path) && keys.length < 120) keys.push(path); walk(v, path + '.', d + 1); } };
+    const walk = (o, pre, d) => { if (!o || typeof o !== 'object' || d > 2 || keys.length >= 120) return; for (const [k, v] of Object.entries(Array.isArray(o) ? (o[0] ?? {}) : o).slice(0, 60)) { const path = pre + clean(k); if (!keys.includes(path)) keys.push(path); walk(v, path + '.', d + 1); } };
     walk(first, '', 0);
-    const text = JSON.stringify(msg);
     const samples = rep.samples[name] || (rep.samples[name] = []);
-    if (samples.length < 3 && INTEREST.test(text)) samples.push(JSON.stringify(redact(msg)).slice(0, 1500));
+    if (samples.length < 3) { const text = JSON.stringify(msg); if (INTEREST.test(text)) samples.push(JSON.stringify(redact(msg)).slice(0, 1500)); }
   };
   try {
     const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window, WS = page.WebSocket;
     page.WebSocket = new Proxy(WS, {construct(target, args, newTarget) {
       const ws = Reflect.construct(target, args, newTarget);
-      try { const u = String(args[0]).replace(/\?.*$/, ''); rep.sockets[u] = (rep.sockets[u] || 0); ws.addEventListener('message', e => { rep.sockets[u]++; if (typeof e.data === 'string') try { record('ws', e.data); } catch (_) {} }); } catch (_) {}
+      try { const u = clean(String(args[0]).replace(/\?.*$/, '')); rep.sockets[u] = (rep.sockets[u] || 0); ws.addEventListener('message', e => { rep.sockets[u]++; if (typeof e.data === 'string') try { record('ws', e.data); } catch (_) {} }); } catch (_) {}
       return ws;
     }});
     const f = page.fetch;
     page.fetch = function (...args) {
       const p = f.apply(this, args);
       try {
-        const url = String(args[0]?.url || args[0]), path = url.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
-        if (INTEREST.test(path)) p.then(r => { rep.http[path] = (rep.http[path] || 0) + 1; return r.clone().text(); }).then(t => record('http ' + path.slice(0, 60), t)).catch(() => {});
+        const url = String(args[0]?.url || args[0]), path = clean(url.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, ''));
+        // Only data-looking paths, never account ones, and only until 3 samples exist for that path.
+        if (INTEREST.test(path) && !ACCOUNT.test(path) && !((rep.samples['http ' + path.slice(0, 60) + ':?'] || []).length >= 3))
+          p.then(r => { rep.http[path] = (rep.http[path] || 0) + 1; const ct = r.headers?.get?.('content-type') || ''; if (/event-stream/.test(ct) || !/json|text/.test(ct)) return null; return r.clone().text(); })
+            .then(t => { if (t && t.length < 500000) record('http ' + path.slice(0, 60), t); }).catch(() => {});
       } catch (_) {}
       return p;
     };
   } catch (_) {}
   const report = () => {
-    const lines = (document.body?.innerText || '').split('\n').map(x => x.trim()).filter(x => x && x.length < 120 && /volume\s*bot|bot\s*vol|wash|bots?\b/i.test(x));
-    return JSON.stringify({...rep, page: location.pathname.replace(/[1-9A-HJ-NP-Za-km-z]{32,44}/g, '<addr>'), domLines: [...new Set(lines)].slice(0, 30), copiedAt: new Date().toISOString()}, null, 1);
+    const lines = (document.body?.innerText || '').split('\n').map(x => x.trim()).filter(x => x && x.length < 120 && /volume\s*bot|bot\s*vol|wash|\bbots?\b/i.test(x)).map(clean);
+    return JSON.stringify({...rep, page: clean(location.pathname), domLines: [...new Set(lines)].slice(0, 30), copiedAt: new Date().toISOString()}, null, 1);
   };
   const ui = () => {
     if (window.top !== window.self || document.getElementById('vts-probe')) return;
     const b = document.createElement('button'); b.id = 'vts-probe';
     b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;font:600 12px system-ui,sans-serif;padding:8px 12px;border-radius:9px;border:1px solid #33445a;background:#0f151c;color:#e8eef6;cursor:pointer;box-shadow:0 6px 20px #0008';
     const label = () => { const n = Object.values(rep.events).reduce((a, x) => a + x, 0); b.textContent = 'VolTrak: copy Photon report (' + n + ' messages)'; };
-    b.onclick = () => { GM_setClipboard(report(), 'text'); b.textContent = 'Copied: paste it to Claude (check it first)'; setTimeout(label, 4000); };
+    // Only a real click by the user copies (the page's own scripts cannot trigger it).
+    b.onclick = e => { if (!e.isTrusted) return; GM_setClipboard(report(), 'text'); b.textContent = 'Copied: check it, then paste it to Claude'; setTimeout(label, 4000); };
     document.body.appendChild(b); label(); setInterval(() => { if (!/^Copied/.test(b.textContent)) label(); }, 3000);
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ui, {once: true}); else ui();
@@ -1090,8 +1117,8 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
   <p class="note">Live: GMGN’s own page feed (token_activity, token_stat), read-only; nothing is sent on GMGN’s connection. Fallbacks: DEX Screener snapshots and GeckoTerminal trades when the live feed is quiet.</p>
   <p class="note">Market: PumpPortal’s public data socket (one connection, receiving GMGN tab only): launches and graduations. Volume bots: computed from GMGN’s live trades for the coin on screen.</p>
   <div class="sect"><span class="lbl">Helius · optional</span></div>
-  <label class="field"><span class="lbl">Helius API key (or a full RPC URL)</span><span class="inline"><input data-vts="rpc-key" type="password" placeholder="free key from helius.dev" autocomplete="off" spellcheck="false"><button data-vts="rpc-save">Save</button></span></label>
-  <div class="buttons"><button data-vts="rpc-test">Test key</button></div>
+  <label class="field"><span class="lbl">Helius API key (or a full RPC URL)</span><span class="inline"><input data-vts="rpc-key" type="password" placeholder="free key from helius.dev" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore><button data-vts="rpc-save">Save</button></span></label>
+  <div class="buttons two"><button data-vts="rpc-test">Test key</button><button data-vts="rpc-remove">Remove key</button></div>
   <p class="note" data-vts="rpc-status">Lets the backtest add volume-bot readings to past calls (Calls → Backtest). Free plan: 1M credits a month; one past call uses about 10–300. The key stays in this browser.</p>
   <div class="sect"><span class="lbl">Data check</span></div>
   <p class="note" data-vts="census">GMGN feed: not seen yet in this tab.</p>
@@ -1206,8 +1233,12 @@ function start() {
   $('market-on').onchange=()=>{set('marketOn',$('market-on').checked);marketDisconnect();render();};
   $('census-copy').onclick=()=>{GM_setClipboard(JSON.stringify({version:VERSION,site:location.hostname,...VTLive.census()},null,1),'text');notice('GMGN feed report copied: paste it to Claude');render();};
   $('rpc-key').value=get('rpcKey','')?'••••'+String(get('rpcKey','')).slice(-4):'';
+  const maskKey=()=>{const k=String(get('rpcKey','')||'');$('rpc-key').value=k?'••••'+k.slice(-4):'';};
   $('rpc-key').onfocus=()=>{if(/^••••/.test($('rpc-key').value))$('rpc-key').value='';};
-  $('rpc-save').onclick=()=>{const v=$('rpc-key').value.trim();if(/^••••/.test(v))return;set('rpcKey',v);$('rpc-key').value=v?'••••'+v.slice(-4):'';$('rpc-status').textContent=v?'Key saved. Press Test key.':'Key removed.';};
+  $('rpc-key').onblur=()=>{if(!$('rpc-key').value.trim())maskKey();};
+  // Save never deletes: an empty or masked field keeps the saved key. "Remove key" is the only way to delete it.
+  $('rpc-save').onclick=()=>{const v=$('rpc-key').value.trim();if(!v||/^••••/.test(v)){maskKey();$('rpc-status').textContent='Type or paste a key first.';return;}set('rpcKey',v);maskKey();$('rpc-status').textContent='Key saved. Press Test key.';};
+  $('rpc-remove').onclick=()=>{set('rpcKey','');maskKey();$('rpc-status').textContent='Key removed from this browser.';};
   $('rpc-test').onclick=()=>testKey();
   $('hb-run').onclick=()=>runBackfill();
   $('mint-copy').onclick=()=>{if(current){GM_setClipboard(current,'text');notice('Contract copied');render();}};
@@ -1253,8 +1284,9 @@ function start() {
   function flash(){for(const e of [root.querySelector('.band'),root.querySelector('.m-state')]){if(!e)continue;e.classList.remove('flash');void e.offsetWidth;e.classList.add('flash');setTimeout(()=>e.classList.remove('flash'),1200);}}
   // Late-check grade → chip/pill class and text.
   const LATE_UI={ABOVE:['buy','ABOVE'],BELOW:['wait','BELOW'],DOWN30:['fade','DOWN'],NOTRADES:['dead','NO TRADES'],NOPRICE:['dead','NO PRICE']};
-  const lateCode=g=>VTCore.LATE_LEGACY[g]||g, lateView=L=>LATE_UI[lateCode(L.grade)]||['dead',String(L.grade)];
-  const lateQuiet=L=>['NOTRADES','NOPRICE'].includes(lateCode(L.grade));
+  // Entries saved by 3.5 (no rule:2) are re-graded from their stored change/traded, since the old grade also used cluster.
+  const lateCode=L=>L.rule===2?L.grade:('change' in L||'traded' in L)?VTCore.lateGrade(L.change??null,L.traded!==false):VTCore.LATE_LEGACY[L.grade]||L.grade;
+  const lateView=L=>LATE_UI[lateCode(L)]||['dead',String(L.grade)], lateQuiet=L=>['NOTRADES','NOPRICE'].includes(lateCode(L));
   // Setup card. Filters from the first 22 calls (cluster, age, MC) failed on 73 newer calls, so nothing is graded:
   // the card shows how all scored calls did against the break-even win rate (from the last report opened).
   function renderGrade(){
@@ -1265,8 +1297,13 @@ function start() {
     $('grade-note').textContent=b?.n?Math.round(b.winRate)+'% won · need '+Math.round(b.be)+'%':'open a backtest report';
     cell.title=b?.n?'Your backtest ('+b.n+' calls, +'+b.tp+'%/'+b.sl+'%, '+b.cost+'% costs): '+Math.round(b.winRate)+'% won, average '+(b.ev>=0?'+':'')+b.ev.toFixed(1)+'% per trade; break-even needs '+b.be.toFixed(0)+'%. Filters from the first 22 calls failed on 73 newer calls, so no setup is graded.':'No setup is graded: the filters from the first 22 calls failed on 73 newer calls.';
   }
+  let botCache={key:'',vb:null};
   function renderBots(now){
-    const cell=$('vol-bots'), on=live&&live.mint===current&&live.trades.length>0&&now-live.at<60000, vb=on?VTCore.botFlow(live.trades,now-300000,now):null;
+    const cell=$('vol-bots'), on=live&&live.mint===current&&live.trades.length>0&&now-live.at<60000;
+    // botFlow pairs trades per wallet; with thousands of trades, recompute at most every 3s and only when it is on screen.
+    const key=on?live.mint+'|'+live.trades.length+'|'+Math.floor(now/3000):'';
+    if(on&&key!==botCache.key&&!root.hidden&&!root.classList.contains('vts-collapsed')&&root.dataset.tab==='live'&&!document.hidden)botCache={key,vb:VTCore.botFlow(live.trades,now-300000,now)};
+    const vb=on&&botCache.key.startsWith(live.mint+'|')?botCache.vb:null;
     if(!vb||!vb.n||vb.botShare==null){
       cell.className='cell bots na';$('bots-pct').textContent='—';$('bots-level').textContent='No data';$('bots-level').className='tag';$('bots-bar').style.setProperty('--p','0%');
       $('bots-org').textContent=on?'no trades in the last 5m':'needs GMGN live trades';cell.title='Volume bots need GMGN’s live trade feed for the coin on screen.';return null;
@@ -1329,14 +1366,14 @@ function start() {
     const side=$('side');side.hidden=share==null;side.textContent=share>=60?'▲ Buy side':share<=40?'▼ Sell side':'≈ Mixed';side.className='side'+(share>=60?' pos':share<=40?' neg':'');
     const mv=$('move');mv.className='big r'+(move==null?' na':move>=0?' pos up':' neg down')+(move!=null&&Math.abs(move)>=1000?' long':'');mv.replaceChildren(...(move==null?['—']:[signed(move),node('small','','%')]));
     $('mc-line').replaceChildren(...(mc>0&&c?.callMc>0?[node('b','',usd(mc)),' from '+usd(c.callMc)]:mc>0?['MC ',node('b','',usd(mc))]:['no call MC']));
-    drawSpark($('share-spark'),shareHist,{lo:0,hi:100,ref:50,cls:share>=60?'pos':share<=40?'neg':'mix',cap:shareHist.length>=3?'60s':Lf?'60s · filling':'60s · needs live trades'});
+    drawSpark($('share-spark'),shareHist,{lo:0,hi:100,ref:50,cls:share==null?'mix':share>=60?'pos':share<=40?'neg':'mix',cap:shareHist.length>=3?'60s':Lf?'60s · filling':'60s · needs live trades'});
     drawSpark($('mc-spark'),mcHist,{ref:c?.callMc>0?c.callMc:null,cls:move==null?'mix':move>=0?'pos':'neg',peak:v=>c?.callMc>0?'peak '+signed((v/c.callMc-1)*100)+'%':''});
     // Meter: 20 cells, one per 5% of buy share.
     const meter=$('meter');meter.classList.toggle('empty',share==null);[...meter.children].forEach((e,i)=>e.classList.toggle('on',share!=null&&i<Math.round(share/5)));
     if(share==null)meter.removeAttribute('aria-valuenow');else meter.setAttribute('aria-valuenow',String(Math.round(share)));
-    const w1=st?.m1||lf?.m1||f?.m1, dexOnly=a.basis?.startsWith('DEX');
-    $('split-buy').textContent=dexOnly&&snapshot?'▲ '+snapshot.buys5m+' buys':w1?'▲ '+(w1.buys??'—')+' buys · '+usd(w1.buyUsd):'';
-    $('split-sell').textContent=dexOnly&&snapshot?snapshot.sells5m+' sells ▼':w1?usd(w1.sellUsd)+' · '+(w1.sells??'—')+' sells ▼':'';
+    const has=w=>w&&(w.buys!=null||w.sells!=null), w1=[st?.m1,lf?.m1,f?.m1].find(has)||null, dexOnly=a.basis?.startsWith('DEX'), sw=a.window&&!dexOnly?a.window:w1;
+    $('split-buy').textContent=dexOnly&&snapshot?'▲ '+snapshot.buys5m+' buys':sw?'▲ '+(sw.buys??'—')+' buys · '+usd(sw.buyUsd):'';
+    $('split-sell').textContent=dexOnly&&snapshot?snapshot.sells5m+' sells ▼':sw?usd(sw.sellUsd)+' · '+(sw.sells??'—')+' sells ▼':'';
     $('basis').textContent=a.basis||'no data yet';$('basis').title=a.basis?'Buy share basis: '+a.basis:'';
     renderGrade();
     const vb=renderBots(now);
@@ -1360,7 +1397,7 @@ function start() {
     $('late-chips').replaceChildren(...chips);
     $('risks').replaceChildren(...a.risks.map(t=>node('li','risk',t)),...a.flags.map(t=>node('li','',t)));
     // Flow table: 1m and 5m from the best live source.
-    const m5=st?.m5||lf?.m5||null, cells=[];
+    const m5=[st?.m5,lf?.m5].find(has)||null, cells=[];
     const add=(cls,t,plus)=>{const e=node('span',cls,t);if(plus)e.append(node('sup','','+'));cells.push(e);};
     const shr=w=>w&&(w.buyUsd||0)+(w.sellUsd||0)>0?100*(w.buyUsd||0)/((w.buyUsd||0)+(w.sellUsd||0)):null;
     const bar=(v,plus)=>{const e=node('span');if(v==null){e.textContent='—';}else{const i=node('i','rb');i.style.setProperty('--p',v.toFixed(0)+'%');e.append(i,Math.round(v)+'%');if(plus)e.append(node('sup','','+'));}cells.push(e);};
@@ -1416,7 +1453,7 @@ function start() {
       ws.send(JSON.stringify({method:'subscribeNewToken'}));ws.send(JSON.stringify({method:'subscribeMigration'}));});
     ws.addEventListener('message',e=>{if(pp!==ws)return;ppMsgs++;const ev=VTCore.ppEvent(e.data);if(ev.kind==='trade')ppTrades++;else if(ev.kind==='other'&&typeof e.data==='string')ppLast=e.data.slice(0,80);tape.add(ev,Date.now());});
     ws.addEventListener('error',()=>{if(pp===ws)ppStatus=opened?'connection error':'blocked by this page or offline';});
-    ws.addEventListener('close',e=>{if(pp!==ws)return;pp=null;ppClose=e.code;ppTries=Math.min(ppTries+1,5);ppNext=Date.now()+2000*2**ppTries;ppStatus=opened?'reconnecting':'blocked by this page or offline';});
+    ws.addEventListener('close',e=>{if(pp!==ws)return;pp=null;ppSince=0;ppClose=e.code;ppTries=Math.min(ppTries+1,5);ppNext=Date.now()+2000*2**ppTries;ppStatus=opened?'reconnecting':'blocked by this page or offline';});
   }
   function marketDisconnect(){const ws=pp;pp=null;ppStatus='off';ppSince=0;ppNext=0;if(ws)try{ws.close();}catch(_){}}
   async function refreshSol(){
@@ -1625,7 +1662,7 @@ function start() {
       if(token)opt.paginationToken=token;
       let r=await rpcCall('getTransactionsForAddress',[mint,opt]);
       if(r.status===429){await sleep(2500);r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
-      if(r.error)return {txs,pages,error:r.error};
+      if(r.error)return {txs,pages,error:r.error,truncated:true};
       const res=r.data?.result, list=Array.isArray(res)?res:Array.isArray(res?.data)?res.data:Array.isArray(res?.transactions)?res.transactions:[];
       // Items are {transaction, meta, blockTime}; some providers nest them one level deeper.
       txs.push(...list.map(x=>x?.meta?x:x?.transaction?.meta?{...x.transaction,blockTime:x.transaction.blockTime??x.blockTime}:x));
@@ -1637,6 +1674,9 @@ function start() {
     const t=Math.floor(c.messageAt/1000), w=await txWindow(c.mint,t-300,t+180);
     if(w.error&&!w.txs.length)return {err:w.error};
     const rows=w.txs.flatMap(tx=>VTCore.txTrades(tx,c.mint,solUsd));
+    // Legs of in-transaction round trips have no SOL size: price them at the window's median price per token.
+    const per=rows.filter(r=>r.usd>0&&r.amount>0).map(r=>r.usd/r.amount).sort((a,b)=>a-b), med=per.length?per[per.length>>1]:null;
+    for(const r of rows)if(r.usd==null){r.usd=med!=null?r.amount*med:0;r.sol=solUsd>0?r.usd/solUsd:null;}
     const pre=VTCore.botFlow(rows,c.messageAt-300000,c.messageAt), post=VTCore.botFlow(rows,c.messageAt,c.messageAt+120000);
     return {pre:packBots(pre,!w.truncated),post:packBots(post,!w.truncated),txs:w.txs.length,trades:rows.length,pages:w.pages,truncated:!!w.truncated,err:w.error||null};
   }
@@ -1660,7 +1700,8 @@ function start() {
       for(let i=0;i<todo.length&&!hbStop;i++){
         hbNote='Volume bots: '+(i+1)+' of '+todo.length;renderBt();
         const r=await backfillOne(todo[i]);
-        if(r.err&&r.pre==null){hbNote='Helius error: '+r.err+' (stopped; nothing was charged for failed calls)';return;}
+        // Any error (even after some pages) stops the run without saving, so the call is retried next time.
+        if(r.err){hbNote='Helius error on '+todo[i].name+': '+r.err+' (stopped; run again to retry)';return;}
         set('hb.'+todo[i].id,{...r,at:Date.now()});
       }
       hbNote=hbStop?'Volume bots: stopped; run again to continue':'Volume bots added: open the report';
@@ -1779,13 +1820,15 @@ function start() {
     table('At the check',o.grades.map(g=>[['+'+g.delay+' min · '+gName[g.grade],String(g.n),rate(g),pct(g.ev),pct(g.medianPeak),g.total>g.n?(g.total-g.n)+' had nothing to buy':''],'']));
     box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Same check as the Calls tab: price at +10/+30 min vs the alert price (down '+(-VTCore.LATE.down)+'%+ is its own group); "no trades" = nothing traded in the 5 min before the check. These are descriptions, not signals: a group is only worth acting on if its average stays above zero on new calls.'));
     // Volume bots on past calls: Helius backfill, or the live GMGN reading saved when the call arrived.
-    const preR=o.rows.filter(r=>r.hb?.pre?.n>0), postR=o.rows.filter(r=>r.hb?.post?.n>0||r.ft?.vb120?.n>0);
+    // Only complete readings: a partial window (feed started late, receiver left early, history cut short) is not comparable.
+    const postOf=r=>r.hb?.post?.n>0&&r.hb.post.complete?r.hb.post:r.ft?.vb120?.n>0&&r.ft.vb120.complete?r.ft.vb120:null;
+    const preR=o.rows.filter(r=>r.hb?.pre?.n>0&&r.hb.pre.complete), postR=o.rows.filter(postOf);
     if(preR.length||postR.length){
       box.append(el('h3','margin:4px 0 4px;font-size:14px','Volume bots on past calls'));
       const bands=['under 20%','20–40%','40%+'], band=v=>v==null?null:v<20?bands[0]:v<40?bands[1]:bands[2];
       const split=(list,val,d)=>bands.map(b=>{const sc=list.filter(r=>band(val(r))===b&&r.by[d].status==='scored').map(r=>r.by[d]), x=VTCore.summarize(sc,o.cost);return [[b,String(x.n),rate(x),pct(x.ev),pct(x.medianPeak),''],''];}).filter(x=>x[0][1]!=='0');
       if(preR.length){box.append(el('p','margin:4px 0;color:'+C.muted,'Bot-like share of $ volume in the 5 min before the alert → buying at the alert ('+preR.length+' calls with a reading):'));table('Bots before alert',split(preR,r=>r.hb.pre.share,0));}
-      if(postR.length){box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Bot-like share in the first 2 min after the alert → buying at +10 min, when that reading is already known ('+postR.length+' calls):'));table('Bots first 2 min',split(postR,r=>(r.hb?.post?.n>0?r.hb.post:r.ft.vb120).share,10));}
+      if(postR.length){box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Bot-like share in the first 2 min after the alert → buying at +10 min, when that reading is already known ('+postR.length+' calls):'));table('Bots first 2 min',split(postR,r=>postOf(r).share,10));}
       box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Bot-like = a buy and a sell in one transaction, a flat buy-then-sell within 10s, churn wallets, or dust trades. A rough lower bound from wallet behaviour; exploratory until about 100 calls have a reading.'));
     }
     // Per-call view, last in the report because it is long.
@@ -1948,7 +1991,7 @@ function start() {
       soon();
     });
     // Mark the role as leaving: this tab's next page takes it back at once; if the tab closed, another can take it after 20s.
-    addEventListener('pagehide',()=>{const r=receiver();if(r?.id===TAB)set('receiver',{...r,leaving:Date.now()});});
+    addEventListener('pagehide',()=>{try{recordBots(true);}catch(_){}const r=receiver();if(r?.id===TAB)set('receiver',{...r,leaving:Date.now()});});
     let ticking=false, lastBeat=0;
     async function tick(){
       if(ticking)return;ticking=true;
