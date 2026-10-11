@@ -1682,7 +1682,8 @@ function start() {
       if(by[0].status!=='scored'){noData++;continue;}
       // The live late check, replayed: price vs the alert entry and any swap in the 5 min before the check.
       const late={};
-      for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t+60000>at-300000&&k.t<at));}
+      // Only candles that closed inside [check−5 min, check) count as "traded", so nothing after the check leaks in.
+      for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t>=at-300000&&k.t+60000<=at));}
       rows.push({call:c,by,ex,late,hb:get('hb.'+c.id,null),ft:get('feat.'+c.id,null)});
     }
     const scored=d=>rows.filter(r=>r.by[d].status==='scored');
