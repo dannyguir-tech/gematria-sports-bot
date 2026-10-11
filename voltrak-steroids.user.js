@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VolTrak Steroids
 // @namespace    voltrak-alert
-// @version      3.3.0
+// @version      3.4.0
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -381,7 +381,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.3.0';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.4.0';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -487,7 +487,8 @@ function start() {
     <label>Saved calls<select data-vts="call-list"></select></label>
     <div class="buttons"><button data-vts="open">Open on GMGN</button><button data-vts="export">Export data</button></div>
     <label>Add a call: paste an alert or a contract<input data-vts="paste" placeholder="Contract or alert text"></label><div class="buttons"><button data-vts="import">Add</button></div>
-    <h4>Backtest</h4><p class="note">Scroll back through the VolTrak channel first: every alert you scroll past is saved. Scoring pulls 2h of 1m candles per call from GeckoTerminal (about 7s per call).</p>
+    <h4>Backtest</h4><p class="note" data-vts="bt-help"></p>
+    <div class="buttons" data-vts="history-row"><button data-vts="bt-history">Load channel history</button></div>
     <div class="grid"><label>Target %<input data-vts="bt-tp" type="number" min="1" step="any"></label><label>Stop loss %<input data-vts="bt-sl" type="number" min="1" max="99" step="any"></label><label>Costs %<input data-vts="bt-cost" type="number" min="0" step="any"></label></div>
     <div class="buttons"><button class="primary" data-vts="bt-run">Score calls</button><button data-vts="bt-report">Open report</button></div><p class="note" data-vts="bt-status"></p>
   </section>
@@ -578,7 +579,7 @@ function start() {
     listText($('reasons'),a.reasons);$('missing').textContent=a.missing.length?'Missing: '+a.missing.join(' · '):'';
   }
   async function addCall(call){
-    const key=call.manual?'manual':'calls', cap=call.manual?100:500;
+    const key=call.manual?'manual':'calls', cap=call.manual?100:2000;
     return locked('write.'+key,()=>{const all=get(key,[]);if(all.some(c=>c.id===call.id))return false;set(key,[call,...all].slice(0,cap));callsCache=null;return true;});
   }
   function announce(call){
@@ -665,15 +666,41 @@ function start() {
     }
     if(!lists.length)return null;
     const cs=VTCore.mergeCandles(lists).filter(k=>k.t>=c.messageAt-120000&&k.t<=c.messageAt+BT_H*60000);
-    set('bt.c.'+c.id,cs.map(k=>[k.t/1000,k.o,k.h,k.l,k.c,k.v]));
+    const sig=x=>+x.toPrecision(6);
+    set('bt.c.'+c.id,cs.map(k=>[k.t/1000,sig(k.o),sig(k.h),sig(k.l),sig(k.c)]));
     return cs.length?'ok':'no-trades';
   }
   const btCandidates=()=>calls().filter(c=>!c.manual&&VTCore.MINT.test(c.mint)&&Number.isFinite(c.messageAt));
   function renderBt(){
     const done=get('bt.done',{}), all=btCandidates(), ok=all.filter(c=>done[c.id]==='ok').length, none=all.filter(c=>done[c.id]&&done[c.id]!=='ok').length;
     const young=all.filter(c=>!done[c.id]&&Date.now()-c.messageAt<=(BT_H+5)*60000).length, left=all.length-ok-none-young;
-    $('bt-run').textContent=btRunning?'Stop':'Score calls';
-    $('bt-status').textContent=(btNote?btNote+' · ':'')+all.length+' saved calls: '+ok+' with candles, '+none+' without price data, '+left+' to score, '+young+' under '+(BT_H+5)+' min old.';
+    const oldest=all.reduce((m,c)=>Math.min(m,c.messageAt),Infinity), when=t=>new Date(t).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    $('bt-run').textContent=btRunning?'Stop':'Score calls';$('bt-history').textContent=histRunning?'Stop loading':'Load channel history';
+    $('history-row').hidden=!DISCORD;
+    $('bt-help').textContent=DISCORD?'1) Load channel history: scrolls the VolTrak channel back for you and saves every alert. 2) Score calls: fetches 2h of 1m prices per call from GeckoTerminal (about 7s per call; you can stop and resume). 3) Open report.'
+      :'Open the VolTrak channel in Discord and press "Load channel history" there first. Then score calls (about 7s per call; stop and resume any time).';
+    $('bt-status').textContent=[histNote,btNote].filter(Boolean).join(' · ')+(histNote||btNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+': '+ok+' scored, '+none+' without price data, '+left+' waiting to be scored, '+young+' too recent (under '+(BT_H+5)+' min old).';
+  }
+  // Discord: load older messages by scrolling the channel to the top until Discord stops loading more.
+  // scan() saves every VolTrak alert as it renders, so this only drives the scrolling.
+  let histRunning=false, histStop=false, histNote='';
+  async function loadHistory(){
+    if(histRunning){histStop=true;histNote='Stopping…';renderBt();return;}
+    if(location.pathname.split('/')[3]!==CHANNEL){histNote='Open the VolTrak channel first';renderBt();return;}
+    const scroller=()=>{const li=document.querySelector('li[id^="chat-messages-"]');for(let n=li?.parentElement;n&&n!==document.body;n=n.parentElement){const o=getComputedStyle(n).overflowY;if((o==='auto'||o==='scroll')&&n.scrollHeight>n.clientHeight)return n;}return null;};
+    histRunning=true;histStop=false;
+    const before=get('calls',[]).length;
+    try{
+      let still=0, lastTop='';
+      while(!histStop&&still<10){
+        const sc=scroller();if(!sc){histNote='Could not find the message list';break;}
+        sc.scrollTop=0;await sleep(1500);
+        const top=document.querySelector('li[id^="chat-messages-"]')?.id||'';
+        still=top===lastTop?still+1:0;lastTop=top;
+        histNote='Loading history: '+(get('calls',[]).length-before)+' older calls saved so far';renderBt();
+      }
+      if(!histNote.startsWith('Could not'))histNote=(histStop?'Stopped':'Reached the start of the channel')+': '+(get('calls',[]).length-before)+' older calls saved';
+    }finally{histRunning=false;histStop=false;renderBt();}
   }
   async function runBacktest(){
     if(btRunning){btStop=true;btNote='Stopping…';renderBt();return;}
@@ -835,7 +862,7 @@ function start() {
   }
   $('claim').onclick=async()=>{await ownReceiver(true);isReceiver=true;notice('This GMGN tab receives calls');render();await poll(true);pollFlow(true);};
   $('refresh').onclick=()=>{poll(true);pollFlow(true);};
-  $('bt-run').onclick=()=>runBacktest();$('bt-report').onclick=()=>openReport();$('copy').onclick=()=>{if(current)GM_setClipboard(current,'text');};
+  $('bt-run').onclick=()=>runBacktest();$('bt-history').onclick=()=>loadHistory();$('bt-report').onclick=()=>openReport();$('copy').onclick=()=>{if(current)GM_setClipboard(current,'text');};
   $('initials').onclick=()=>{
     const raw=['cost','proceeds','bag','fee','fixed'].map(k=>$(k).value.trim());
     if(raw.some(x=>x==='')){$('initials-result').textContent='Fill every amount first.';return;}

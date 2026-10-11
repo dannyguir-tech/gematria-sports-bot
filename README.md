@@ -42,6 +42,12 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 `voltrak-steroids.user.js` is a Tampermonkey userscript for Discord and GMGN. It reads new VolTrak calls in Discord and loads them in one GMGN "receiver" tab. There it shows free DEX Screener snapshots and 1m trade flow from GeckoTerminal. It is for analysis only: it never submits trades.
 
+## 3.4.0 changes
+
+- **Load channel history (Calls tab, Discord):** scrolls the VolTrak channel back to its start for you, saving every alert as it loads, so the backtest has hundreds of calls to score instead of only the ones that arrived since install.
+- The script now keeps up to 2,000 saved calls (was 500), and stores scored candles more compactly.
+- The Calls tab shows the oldest saved call next to the counts, so you can see how far back your history goes.
+
 ## 3.3.0 changes
 
 - **Backtest (Calls tab):** first scroll back through the VolTrak channel, which saves every alert you pass. Then press **Score calls**: the script pulls 2h of 1-minute GeckoTerminal candles per call, about 7s each. The candles are cached, so changing the target, stop or costs re-scores instantly.
