@@ -1124,6 +1124,7 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
   <div class="sect"><span class="lbl">Helius · optional</span></div>
   <label class="field"><span class="lbl">Helius API key (or a full RPC URL)</span><span class="inline"><input data-vts="rpc-key" type="password" placeholder="free key from helius.dev" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore><button data-vts="rpc-save">Save</button></span></label>
   <div class="buttons two"><button data-vts="rpc-test">Test key</button><button data-vts="rpc-remove">Remove key</button></div>
+  <div class="buttons"><button data-vts="rpc-sample" hidden>Copy sample transaction</button></div>
   <p class="note" data-vts="rpc-status">Lets the backtest add volume-bot readings to past calls (Calls → Backtest). Free plan: 1M credits a month; one past call uses about 10–300. The key stays in this browser.</p>
   <div class="sect"><span class="lbl">Data check</span></div>
   <p class="note" data-vts="census">GMGN feed: not seen yet in this tab.</p>
@@ -1245,6 +1246,8 @@ function start() {
   $('rpc-save').onclick=()=>{const v=$('rpc-key').value.trim();if(!v||/^••••/.test(v)){maskKey();$('rpc-status').textContent='Type or paste a key first.';return;}set('rpcKey',v);maskKey();$('rpc-status').textContent='Key saved. Press Test key.';};
   $('rpc-remove').onclick=()=>{set('rpcKey','');maskKey();$('rpc-status').textContent='Key removed from this browser.';};
   $('rpc-test').onclick=()=>testKey();
+  // Public on-chain data only (no key): one transaction, for checking the parser against a new format.
+  $('rpc-sample').onclick=()=>{if(rpcSample){GM_setClipboard(JSON.stringify(rpcSample,null,1).slice(0,40000),'text');$('rpc-status').textContent='Sample transaction copied: paste it to Claude.';}};
   $('hb-run').onclick=()=>runBackfill();
   $('mint-copy').onclick=()=>{if(current){GM_setClipboard(current,'text');notice('Contract copied');render();}};
   {const o=get('bt.opt',{tp:100,sl:-50,cost:3});$('bt-tp').value=o.tp;$('bt-sl').value=Math.abs(o.sl);$('bt-cost').value=o.cost;$('bt-delay').value=String(o.delay||0);$('bt-exit').value=String(o.exit||0);$('bt-fill').value=o.fill||'touch';}
@@ -1661,17 +1664,23 @@ function start() {
       onload:r=>{let d=null;try{d=JSON.parse(r.responseText);}catch(_){}resolve({status:r.status,data:d,error:d?.error?.message||(r.status!==200?'HTTP '+r.status:null)});},
       onerror:()=>resolve({status:0,error:'network error'}),ontimeout:()=>resolve({status:0,error:'timeout'})}));
   }
+  let rpcSample=null;
   async function txWindow(mint,from,to,maxPages=40){
     const txs=[];let token=null,pages=0;
     do{
-      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:0,filters:{blockTime:{gte:from,lte:to},status:'succeeded'}};
+      // Solana now has version-1 transactions; the RPC refuses to return them unless asked. If it names a newer
+      // version in its error, retry once with that and remember it.
+      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:get('rpcTxVersion',1),filters:{blockTime:{gte:from,lte:to},status:'succeeded'}};
       if(token)opt.paginationToken=token;
       let r=await rpcCall('getTransactionsForAddress',[mint,opt]);
+      const want=+(String(r.error||'').match(/maxSupportedTransactionVersion\W+(\d+)/)?.[1]);
+      if(Number.isFinite(want)&&want>opt.maxSupportedTransactionVersion&&want<10){set('rpcTxVersion',want);opt.maxSupportedTransactionVersion=want;r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
       if(r.status===429){await sleep(2500);r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
       if(r.error)return {txs,pages,error:r.error,truncated:true};
       const res=r.data?.result, list=Array.isArray(res)?res:Array.isArray(res?.data)?res.data:Array.isArray(res?.transactions)?res.transactions:[];
       // Items are {transaction, meta, blockTime}; some providers nest them one level deeper.
       txs.push(...list.map(x=>x?.meta?x:x?.transaction?.meta?{...x.transaction,blockTime:x.transaction.blockTime??x.blockTime}:x));
+      if(!rpcSample&&txs.length)rpcSample=txs.find(t=>t?.meta&&!t.meta.err)||txs[0];
       token=res?.paginationToken||null;pages++;await sleep(120);
     }while(token&&pages<maxPages);
     return {txs,pages,truncated:!!token};
@@ -1684,6 +1693,8 @@ function start() {
     const per=rows.filter(r=>r.usd>0&&r.amount>0).map(r=>r.usd/r.amount).sort((a,b)=>a-b), med=per.length?per[per.length>>1]:null;
     for(const r of rows)if(r.usd==null){r.usd=med!=null?r.amount*med:0;r.sol=solUsd>0?r.usd/solUsd:null;}
     const pre=VTCore.botFlow(rows,c.messageAt-300000,c.messageAt), post=VTCore.botFlow(rows,c.messageAt,c.messageAt+120000);
+    // Transactions but no trades parsed: the transaction format may have changed. Keep one so the user can share it.
+    if(w.txs.length&&!rows.length)rpcSample=w.txs.find(t=>t?.meta&&!t.meta.err)||w.txs[0];
     return {pre:packBots(pre,!w.truncated),post:packBots(post,!w.truncated),txs:w.txs.length,trades:rows.length,pages:w.pages,truncated:!!w.truncated,err:w.error||null};
   }
   async function testKey(){
@@ -1692,7 +1703,11 @@ function start() {
     const c=btCandidates().filter(x=>Date.now()-x.messageAt>10*60000).sort((a,b)=>b.messageAt-a.messageAt)[0];
     if(!c){const r=await rpcCall('getSlot',[]);st.textContent=r.error?'Key error: '+r.error:'Key works (no past call to test the trade history on yet).';return;}
     const r=await backfillOne(c);
-    st.textContent=r.err?'Key error on '+c.name+': '+r.err+(/method|not (found|supported)/i.test(r.err)?' · this plan may not include getTransactionsForAddress':''):'Works: '+c.name+' · '+r.txs+' transactions → '+r.trades+' trades'+(r.truncated?' (window cut short)':'')+' · bots before the alert '+(r.pre.share??'—')+'%, first 2 min '+(r.post.share??'—')+'%';
+    const planHint=/method not found|not available|upgrade|your plan|paid plan/i.test(r.err||'')?' · this plan may not include getTransactionsForAddress':'';
+    st.textContent=r.err?'Key error on '+c.name+': '+r.err+planHint
+      :r.txs&&!r.trades?'Key works, but '+r.txs+' transactions on '+c.name+' gave 0 trades: the format may have changed. Press "Copy sample" and paste it to Claude.'
+      :'Works: '+c.name+' · '+r.txs+' transactions → '+r.trades+' trades'+(r.truncated?' (window cut short)':'')+' · bots before the alert '+(r.pre.share??'—')+'%, first 2 min '+(r.post.share??'—')+'%';
+    $('rpc-sample').hidden=!rpcSample;
   }
   let hbRunning=false,hbStop=false,hbNote='';
   async function runBackfill(){
