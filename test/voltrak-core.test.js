@@ -281,13 +281,13 @@ test('scoreCall: a delayed entry buys later in the same window; a dead coin at e
   assert.deepEqual([late.outcome, Math.round(late.ret)], ['open', 50]); // the window still ends 120 min after the alert
 });
 
-test('lateGrade: dead, fade on a big drop or a big cluster, buy at or above the call price', () => {
-  assert.equal(VTCore.lateGrade(50, false, 5), 'DEAD');
-  assert.equal(VTCore.lateGrade(-30, true, 5), 'FADE');
-  assert.equal(VTCore.lateGrade(80, true, 35), 'FADE');
-  assert.equal(VTCore.lateGrade(-12, true, 5), 'WAIT');
-  assert.equal(VTCore.lateGrade(0, true, null), 'BUY');
-  assert.equal(VTCore.lateGrade(null, true, 5), 'WAIT');
+test('lateGrade: describes the price at the check (no buy/fade verdicts)', () => {
+  assert.equal(VTCore.lateGrade(50, false), 'NOTRADES');
+  assert.equal(VTCore.lateGrade(-30, true), 'DOWN30');
+  assert.equal(VTCore.lateGrade(-12, true), 'BELOW');
+  assert.equal(VTCore.lateGrade(0, true), 'ABOVE');
+  assert.equal(VTCore.lateGrade(null, true), 'NOPRICE');
+  assert.equal(VTCore.LATE_LEGACY.FADE, 'DOWN30');
 });
 
 test('wilson and backtestReport: buckets, ranges and "stands out" need enough calls', () => {
@@ -342,4 +342,71 @@ test('initials and handoff keep their behaviour', () => {
   assert.equal(VTCore.handoff(call, {1: 1}, null, NOW), 'duplicate');
   assert.equal(VTCore.handoff(call, {}, MINT, NOW), 'already-open');
   assert.equal(VTCore.handoff(call, {}, null, NOW + 31000), 'old');
+});
+
+// Volume bots: per-trade rows at second resolution from a base time.
+const B0 = Date.parse('2026-10-11T12:00:00Z');
+const tr = (sec, side, usd, wallet, o = {}) => ({at: B0 + sec * 1000, side, usd, amount: o.amount ?? usd * 1000, wallet, hash: o.hash ?? wallet + ':' + sec + ':' + side, ex: o.ex ?? 'pump'});
+
+test('botFlow: buy and sell in one transaction is wash; on two exchanges it is arbitrage', () => {
+  const wash = VTCore.botFlow([tr(1, 'buy', 50, 'W1', {hash: 'h1'}), tr(1, 'sell', 50, 'W2', {hash: 'h1'}), tr(5, 'buy', 100, 'R1')], B0, B0 + 60000);
+  assert.deepEqual([wash.byRule.txWash, wash.botWallets, Math.round(wash.botShare)], [2, 2, 50]);
+  const arb = VTCore.botFlow([tr(1, 'buy', 50, 'A', {hash: 'h2', ex: 'pump_amm'}), tr(1, 'sell', 50, 'A', {hash: 'h2', ex: 'meteora'})], B0, B0 + 60000);
+  assert.deepEqual([arb.arb, arb.botUsd], [1, 0]);
+});
+
+test('botFlow: flat round trip within 10s is a bot; 10-30s is only suspect; a profitable flip is not flagged', () => {
+  const fast = VTCore.botFlow([0, 1, 2, 3, 4].flatMap(i => [tr(i * 5, 'buy', 40, 'V' + i), tr(i * 5 + 3, 'sell', 40.5, 'V' + i)]), B0, B0 + 60000);
+  assert.deepEqual([fast.byRule.fastTrip, fast.botWallets, Math.round(fast.botShare)], [10, 5, 100]);
+  const slow = VTCore.botFlow([tr(0, 'buy', 40, 'S'), tr(20, 'sell', 40, 'S'), tr(30, 'buy', 40, 'R')], B0, B0 + 60000);
+  assert.equal(slow.botUsd, 0);
+  assert.ok(slow.suspectShare > 60);
+  // Sniper: buys 1000 tokens for $40, sells them 25s later for $56 (+40%).
+  const sniper = VTCore.botFlow([tr(0, 'buy', 40, 'N', {amount: 1000}), tr(25, 'sell', 56, 'N', {amount: 1000})], B0, B0 + 60000);
+  assert.deepEqual([sniper.botUsd, sniper.suspectShare], [0, 0]);
+});
+
+test('botFlow: churn and dust wallets are flagged; preset-size buyers count as real buyers', () => {
+  const churn = [0, 4, 8, 12, 16, 20].map((s, i) => tr(s * 3, i % 2 ? 'sell' : 'buy', 30 + i * 9, 'C', {amount: 1000}));
+  const dust = [1, 2, 3].map(s => tr(s, 'buy', 1, 'D'));
+  const preset = [20, 45, 80, 150].map(s => tr(s, 'buy', 15, 'P'));
+  const r = VTCore.botFlow([...churn, ...dust, ...preset], B0, B0 + 300000);
+  assert.equal(r.byRule.churn, 6);
+  assert.equal(r.byRule.micro, 3);
+  assert.deepEqual([r.buyers, r.buyersNet], [1, 60]);
+  assert.equal(r.botWallets, 2);
+});
+
+test('botFlow: window, duplicate rows and rows without wallets', () => {
+  const t = tr(5, 'buy', 20, 'X');
+  const r = VTCore.botFlow([t, {...t}, tr(500, 'buy', 99, 'Y'), {at: B0 + 6000, side: 'sell', usd: 5, amount: 1, wallet: null, hash: null, ex: 'pump'}], B0, B0 + 60000);
+  assert.deepEqual([r.n, r.wallets, r.botUsd, r.buyers], [2, 1, 0, 1]);
+  assert.equal(VTCore.botFlow([], 0, 1).botShare, null);
+});
+
+// getTransactionsForAddress (jsonParsed) fixtures: a pump.fun buy, a wash transaction, a plain transfer.
+const MINTX = '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump', PUMPP = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+const tb = (idx, owner, mint, raw) => ({accountIndex: idx, owner, mint, uiTokenAmount: {amount: String(raw), decimals: 6}});
+const ptx = ({keys, pre, post, preTok, postTok, fee = 5000, t = 1791720000, sig = 'sigA', err = null}) =>
+  ({blockTime: t, slot: 1, transaction: {signatures: [sig], message: {accountKeys: keys}}, meta: {err, fee, preBalances: pre, postBalances: post, preTokenBalances: preTok, postTokenBalances: postTok}});
+
+test('txTrades: a pump.fun buy becomes one row for the signer, sized by its SOL change', () => {
+  const tx = ptx({keys: [{pubkey: 'Buyer1', signer: true}, {pubkey: 'Curve', signer: false}, {pubkey: PUMPP, signer: false}],
+    pre: [2e9, 50e9, 1], post: [1.5e9 - 5000, 50.5e9, 1],
+    preTok: [tb(3, 'Curve', MINTX, 800e12)], postTok: [tb(3, 'Curve', MINTX, 799e12), tb(4, 'Buyer1', MINTX, 1e12)]});
+  const rows = VTCore.txTrades(tx, MINTX, 200);
+  assert.equal(rows.length, 1);
+  assert.deepEqual([rows[0].side, rows[0].wallet, rows[0].amount, rows[0].ex, rows[0].hash, rows[0].at], ['buy', 'Buyer1', 1e6, 'pump', 'sigA', 1791720000000]);
+  assert.ok(Math.abs(rows[0].sol - 0.5) < 1e-9 && Math.abs(rows[0].usd - 100) < 1e-6);
+});
+
+test('txTrades: a buy and a sell by two signers in one transaction give two rows (botFlow calls it wash); transfers are skipped', () => {
+  const wash = ptx({sig: 'w1', keys: [{pubkey: 'B1', signer: true}, {pubkey: 'S1', signer: true}, {pubkey: PUMPP}],
+    pre: [3e9, 1e9, 1], post: [2e9, 2e9, 1], preTok: [tb(3, 'S1', MINTX, 5e12)], postTok: [tb(3, 'S1', MINTX, 0), tb(4, 'B1', MINTX, 5e12)]});
+  const rows = VTCore.txTrades(wash, MINTX, 200);
+  assert.deepEqual(rows.map(r => r.side).sort(), ['buy', 'sell']);
+  assert.equal(VTCore.botFlow(rows, 0, 2e12).byRule.txWash, 2);
+  const transfer = ptx({keys: [{pubkey: 'A', signer: true}, {pubkey: 'B'}], pre: [1e9, 0], post: [1e9 - 5000, 0], preTok: [tb(2, 'A', MINTX, 5e12)], postTok: [tb(2, 'A', MINTX, 0), tb(3, 'B', MINTX, 5e12)]});
+  assert.deepEqual(VTCore.txTrades(transfer, MINTX, 200), []);
+  assert.deepEqual(VTCore.txTrades({...transfer, meta: {...transfer.meta, err: {x: 1}}}, MINTX, 200), []);
 });

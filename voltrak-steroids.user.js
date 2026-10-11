@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         VolTrak Steroids
 // @namespace    voltrak-alert
-// @version      3.5.0
+// @version      3.6.0
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
+// @match        https://photon-sol.tinyastro.io/*
+// @match        https://*.tinyastro.io/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -17,6 +19,8 @@
 // @grant        unsafeWindow
 // @connect      api.dexscreener.com
 // @connect      api.geckoterminal.com
+// @connect      mainnet.helius-rpc.com
+// @connect      solana-mainnet.g.alchemy.com
 // @noframes
 // @run-at       document-start
 // ==/UserScript==
@@ -131,7 +135,10 @@ const VTCore = (() => {
   function gmgnTrade(x) {
     const side = {buy: 'buy', b: 'buy', sell: 'sell', s: 'sell'}[String(x?.e).toLowerCase()], at = millis(x?.t) ?? millis(x?.ts);
     if (!side || at == null) return null;
-    return {at, side, usd: number(x.au) || 0, sol: number(x.qa), amount: number(x.ba), price: number(x.pu), wallet: x.m || null, hash: x.h || null, mint: addrOf(x), ex: x.ex || null};
+    // Wallet tags, if GMGN sends any (field name unconfirmed; the Settings data check lists the real fields).
+    const tags = [x.maker_tags, x.makerTags, x.maker_tag, x.tags].find(v => v != null);
+    return {at, side, usd: number(x.au) || 0, sol: number(x.qa), amount: number(x.ba), price: number(x.pu), wallet: x.m || null, hash: x.h || null, mint: addrOf(x), ex: x.ex || null,
+      tags: Array.isArray(tags) ? tags.map(String) : typeof tags === 'string' && tags ? tags.split(',') : null};
   }
   // token_stat item → GMGN's own rolling windows (b/s = buy/sell count, bv/sv = buy/sell volume, v = volume, p = price then).
   function gmgnStat(x, at) {
@@ -169,7 +176,8 @@ const VTCore = (() => {
     const dexWindow = dex && {buys: dex.buys5m, sells: dex.sells5m};
     const pick = [
       [st ? usdShare(st.m1, 10) : null, 'GMGN 1m $ volume', 1, st?.m1],
-      [lf?.m1.complete ? usdShare(lf.m1, 10) : null, 'live 1m trades ($)', 1, lf?.m1],
+      // Right after the alert the 1m window is not full yet, but those trades are the ones that matter most.
+      [lf ? usdShare(lf.m1, 10) : null, lf?.m1.complete ? 'live 1m trades ($)' : 'live trades since open ($)', 1, lf?.m1],
       [f ? usdShare(f.m1, 10) : null, 'GeckoTerminal 1m $ volume', 1, f?.m1],
       [st ? usdShare(st.m5, 1) : null, 'GMGN 5m $ volume', 5, st?.m5],
       [dex && dex.buys5m >= 0 && dex.sells5m >= 0 && dex.buys5m + dex.sells5m > 0 ? 100 * dex.buys5m / (dex.buys5m + dex.sells5m) : null, 'DEX Screener 5m swap count', 5, dexWindow],
@@ -200,7 +208,7 @@ const VTCore = (() => {
     } else missing.push('No DEX Screener pool yet: liquidity unknown');
     reasons.push(L ? 'Live from GMGN\'s own page feed' : (dex?.pools > 1 ? 'DEX flow summed over ' + dex.pools + ' indexed pools' : 'Single indexed pool') + '; upstream update delay is unknown');
     const state = risks.length ? 'CAUTION' : share === null ? 'UNKNOWN' : side === 'SELL SIDE' && momentum < 0 ? 'FADE / REVIEW EXIT' : side === 'BUY SIDE' && momentum > 0 ? 'WATCH BUY SETUP' : 'WAIT';
-    return {state,side,share,basis,reasons,risks,flags,missing};
+    return {state,side,share,basis,reasons,risks,flags,missing,momentum,momentumWindow:momentum==null?null:momentum===m1Change?'1m':'5m'};
   }
   // ---- Backtest: score past calls from 1m candles ----
   // GeckoTerminal ohlcv_list rows [start s, open, high, low, close, volume] → ascending candles. Minutes without swaps are absent.
@@ -285,14 +293,104 @@ const VTCore = (() => {
     return {all, features, timing: {r5: median(scores.map(s => s.r5)), r15: median(scores.map(s => s.r15)), r60: median(scores.map(s => s.r60)),
       peakMin: median(scores.map(s => s.peakMin)), peakWithin5: within(5), peakWithin15: within(15), peakWithin60: within(60)}};
   }
-  // Late check, 10 or 30 min after an alert. change: % vs the price at the alert (null if unknown); traded: any swap in
-  // the 5 min before the check; cluster: the alert's largest cluster %. A rule to test on past calls (the backtest
-  // report grades them the same way), not a prediction.
-  const LATE = {fade: -30, cluster: 30};
-  function lateGrade(change, traded, cluster) {
-    if (!traded) return 'DEAD';
-    if (cluster >= LATE.cluster || (change != null && change <= LATE.fade)) return 'FADE';
-    return change == null ? 'WAIT' : change >= 0 ? 'BUY' : 'WAIT';
+  // ---- Volume bots: wash-trading patterns in per-trade rows {at, side, usd, amount, wallet, hash, ex} ----
+  // Flags (a rough lower bound; rotating wallets and cross-transaction washes are missed; untested as a signal):
+  //  T  one transaction buys and sells the coin on the same exchange (on different exchanges it is arbitrage, not counted);
+  //  F  a wallet buys and sells ≥80% of those tokens back within 10s at nearly the same USD value (flat round trip);
+  //  C  churn: 6+ trades with 2+ buys and 2+ sells, ending within 15% of where it started;
+  //  M  dust: 3+ trades, every one under $3.
+  // A flat trip that takes 10–30s is only "suspect". Profitable flips and repeated preset-size buys are never flagged.
+  const VB = Object.freeze({fastSec: 10, suspectSec: 30, flatTol: 0.04, tokFrac: 0.8, churnN: 6, churnNet: 0.15, microUsd: 3, microN: 3, buyerUsd: 15});
+  function botFlow(trades, from, to, o = VB) {
+    const seen = new Set(), rows = [];
+    for (const t of Array.isArray(trades) ? trades : []) {
+      if (!t || !(t.at >= from && t.at <= to) || (t.side !== 'buy' && t.side !== 'sell')) continue;
+      const key = t.hash ? t.hash + '|' + t.side + '|' + t.wallet + '|' + t.amount : t.wallet + '|' + t.at + '|' + t.side + '|' + t.amount + '|' + t.usd;
+      if (!seen.has(key)) { seen.add(key); rows.push(t); }
+    }
+    rows.sort((a, b) => a.at - b.at);
+    const rule = new Map(), mark = (t, r) => { if (!rule.has(t)) rule.set(t, r); }, group = (list, f) => { const m = new Map(); for (const t of list) { const k = f(t); if (k) (m.get(k) || m.set(k, []).get(k)).push(t); } return m; };
+    let arb = 0, suspectUsd = 0; const arbLegs = new Set();
+    for (const legs of group(rows, t => t.hash).values()) {
+      const buyEx = new Set(legs.filter(t => t.side === 'buy').map(t => t.ex || '')), sellEx = new Set(legs.filter(t => t.side === 'sell').map(t => t.ex || ''));
+      if (!buyEx.size || !sellEx.size) continue;
+      if ([...buyEx].some(e => sellEx.has(e))) legs.forEach(t => mark(t, 'txWash')); else { arb++; legs.forEach(t => arbLegs.add(t)); }
+    }
+    // Arbitrage legs stay out of the wallet rules: buying on one pool and selling on another is real trading.
+    const tokens = t => t.amount > 0 ? t.amount : null, byWallet = group(rows.filter(t => !arbLegs.has(t)), t => t.wallet);
+    for (const list of byWallet.values()) {
+      const used = new Set();
+      for (const b of list) {
+        if (b.side !== 'buy' || rule.has(b) || !(b.usd > 0)) continue;
+        let tok = 0, usd = 0, end = null; const legs = [];
+        for (const s of list) {
+          if (s.side !== 'sell' || used.has(s) || rule.has(s) || s.at < b.at - 999) continue; // 1s timestamps: a sell stamped in the buy's second may pair
+          if (s.at - b.at > o.suspectSec * 1000) break;
+          legs.push(s); tok += tokens(s) ?? 0; usd += s.usd || 0; end = s.at;
+          if (tokens(b) ? tok >= o.tokFrac * tokens(b) : usd >= (1 - o.flatTol) * b.usd) break;
+        }
+        // Flat = sold back at about the buy's price per token (or, without token amounts, about the same USD).
+        const back = tokens(b) ? tok >= o.tokFrac * tokens(b) : legs.length > 0;
+        const flat = tokens(b) && tok > 0 ? Math.abs((usd / tok) / (b.usd / tokens(b)) - 1) <= o.flatTol : Math.abs(usd - b.usd) <= o.flatTol * b.usd;
+        if (!back || !flat) continue;
+        legs.forEach(s => used.add(s));
+        if (end - b.at <= o.fastSec * 1000) { mark(b, 'fastTrip'); legs.forEach(s => mark(s, 'fastTrip')); } else suspectUsd += b.usd + usd;
+      }
+      const buys = list.filter(t => t.side === 'buy'), sells = list.filter(t => t.side === 'sell');
+      const bought = buys.reduce((x, t) => x + (tokens(t) ?? 0), 0), sold = sells.reduce((x, t) => x + (tokens(t) ?? 0), 0);
+      if (list.length >= o.churnN && buys.length >= 2 && sells.length >= 2 && bought > 0 && Math.abs(bought - sold) <= o.churnNet * bought) list.forEach(t => mark(t, 'churn'));
+      if (list.length >= o.microN && list.every(t => (t.usd || 0) < o.microUsd)) list.forEach(t => mark(t, 'micro'));
+    }
+    const usd = rows.reduce((x, t) => x + (t.usd || 0), 0), flagged = rows.filter(t => rule.has(t)), botUsd = flagged.reduce((x, t) => x + (t.usd || 0), 0);
+    const byRule = {txWash: 0, fastTrip: 0, churn: 0, micro: 0}; for (const r of rule.values()) byRule[r]++;
+    const botWallets = new Set(flagged.map(t => t.wallet).filter(Boolean));
+    let buyers = 0, buyersNet = 0;
+    for (const [w, list] of byWallet) {
+      if (botWallets.has(w)) continue;
+      const b = list.filter(t => t.side === 'buy'), s = list.filter(t => t.side === 'sell'), bUsd = b.reduce((x, t) => x + (t.usd || 0), 0), sUsd = s.reduce((x, t) => x + (t.usd || 0), 0);
+      const net = b.some(t => tokens(t)) ? b.reduce((x, t) => x + (tokens(t) ?? 0), 0) - s.reduce((x, t) => x + (tokens(t) ?? 0), 0) : bUsd - sUsd;
+      if (bUsd >= o.buyerUsd && net > 0) { buyers++; buyersNet += bUsd - sUsd; }
+    }
+    return {n: rows.length, usd, botUsd, botShare: usd > 0 ? 100 * botUsd / usd : null, botTradeShare: rows.length ? 100 * flagged.length / rows.length : null,
+      wallets: byWallet.size, botWallets: botWallets.size, byRule, arb, suspectShare: usd > 0 ? 100 * suspectUsd / usd : null,
+      buyers, buyersNet, first: rows[0]?.at ?? null, last: rows[rows.length - 1]?.at ?? null,
+      flagged: flagged.slice(-50).map(t => ({wallet: t.wallet, hash: t.hash, rule: rule.get(t)}))};
+  }
+  // ---- Solana transactions (getTransactionsForAddress, jsonParsed) → per-trade rows for one mint ----
+  // One row per signer whose balance of the mint changed in a pump.fun or PumpSwap transaction. SOL size includes fees
+  // and tips, which is fine for wash-pattern detection. Transfers and other programs are skipped.
+  const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', PUMPSWAP_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', WSOL = 'So11111111111111111111111111111111111111112';
+  function txTrades(tx, mint, solUsd) {
+    const meta = tx?.meta, msg = tx?.transaction?.message;
+    if (!meta || !msg || meta.err) return [];
+    const keys = (msg.accountKeys || []).map(k => typeof k === 'string' ? {pubkey: k} : k || {}), nSig = msg.header?.numRequiredSignatures;
+    const every = keys.map(k => k.pubkey).concat(meta.loadedAddresses?.writable || [], meta.loadedAddresses?.readonly || []);
+    const ex = every.includes(PUMP_PROGRAM) ? 'pump' : every.includes(PUMPSWAP_PROGRAM) ? 'pump_amm' : null;
+    if (!ex) return [];
+    const signers = new Set(keys.filter((k, i) => k.signer ?? (nSig != null ? i < nSig : i === 0)).map(k => k.pubkey));
+    const bal = (list, m) => { const o = new Map(); for (const b of list || []) if (b?.mint === m && b.owner) o.set(b.owner, (o.get(b.owner) || 0) + Number(b.uiTokenAmount?.amount || 0) / 10 ** (b.uiTokenAmount?.decimals ?? 6)); return o; };
+    const pre = bal(meta.preTokenBalances, mint), post = bal(meta.postTokenBalances, mint), wPre = bal(meta.preTokenBalances, WSOL), wPost = bal(meta.postTokenBalances, WSOL);
+    const at = (number(tx.blockTime) ?? 0) * 1000, hash = tx.transaction?.signatures?.[0] || null, price = solUsd > 0 ? solUsd : 150, rows = [];
+    for (const owner of new Set([...pre.keys(), ...post.keys()])) {
+      if (!signers.has(owner)) continue;
+      const d = (post.get(owner) || 0) - (pre.get(owner) || 0);
+      if (!d) continue;
+      const i = keys.findIndex(k => k.pubkey === owner);
+      let sol = i >= 0 && meta.preBalances && meta.postBalances ? (meta.postBalances[i] - meta.preBalances[i] + (i === 0 ? meta.fee || 0 : 0)) / 1e9 : 0;
+      sol += (wPost.get(owner) || 0) - (wPre.get(owner) || 0);
+      rows.push({at, side: d > 0 ? 'buy' : 'sell', amount: Math.abs(d), sol: Math.abs(sol), usd: Math.abs(sol) * price, wallet: owner, hash, ex});
+    }
+    return rows;
+  }
+  // Late check, 10 or 30 min after an alert: where the price is vs the alert price, and whether it still trades.
+  // Descriptive only. The first version graded this BUY/FADE; on 95 past calls no group made money buying at the
+  // check, so the labels now just say what happened. change: % vs the alert price (null if unknown).
+  const LATE = {down: -30};
+  const LATE_LEGACY = {BUY: 'ABOVE', WAIT: 'BELOW', FADE: 'DOWN30', DEAD: 'NOTRADES'};
+  function lateGrade(change, traded) {
+    if (!traded) return 'NOTRADES';
+    if (change == null) return 'NOPRICE';
+    return change <= LATE.down ? 'DOWN30' : change >= 0 ? 'ABOVE' : 'BELOW';
   }
   // ---- Market-wide pump.fun activity (PumpPortal data socket) ----
   function ppEvent(raw) {
@@ -347,7 +445,7 @@ const VTCore = (() => {
     return current === call.mint ? 'already-open' : 'navigate';
   }
   return {MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
-    candles,mergeCandles,scoreCall,wilson,summarize,backtestReport,LATE,lateGrade,ppEvent,marketTape,initials,handoff};
+    candles,mergeCandles,scoreCall,wilson,summarize,backtestReport,VB,botFlow,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff};
 })();
 /* CORE END */
 
@@ -356,14 +454,25 @@ const VTCore = (() => {
 const VTLive = (() => {
   const listeners = new Set(), pending = [], seen = new WeakSet();
   let attachedAt = 0;
+  // Data check: which channels GMGN sends, which fields its trade rows carry (e.g. wallet tags), a few sample rows.
+  const census = {since: Date.now(), frames: 0, hidden: 0, nonText: 0, channels: {}, keys: {}, samples: {}};
+  const note = (frame, hidden) => {
+    census.frames++; if (hidden) census.hidden++;
+    const keys = census.keys[frame.channel] || (census.keys[frame.channel] = []), samples = census.samples[frame.channel] || (census.samples[frame.channel] = []);
+    for (const x of frame.items.slice(0, 5)) for (const k of Object.keys(x)) if (!keys.includes(k) && keys.length < 80) keys.push(k);
+    if (samples.length < 3 && frame.items[0]) samples.push(JSON.stringify(frame.items[0]).slice(0, 1000));
+  };
   const emit = frame => { if (!listeners.size) { if (pending.push(frame) > 200) pending.shift(); return; } for (const fn of listeners) try { fn(frame); } catch (_) {} };
   const watch = ws => {
     if (!ws || seen.has(ws) || !/(^|\.)gmgn\.ai(:|\/|$)/.test(String(ws.url).replace(/^wss?:\/\//, ''))) return;
     seen.add(ws); attachedAt = attachedAt || Date.now();
     ws.addEventListener('message', e => {
-      if (typeof e.data !== 'string' || !/"(token_activity|token_stat)"/.test(e.data)) return;
+      if (typeof e.data !== 'string') { census.nonText++; return; }
+      const ch = e.data.slice(0, 200).match(/"channel"\s*:\s*"([^"]{1,40})"/)?.[1] || '?';
+      if (ch in census.channels || Object.keys(census.channels).length < 60) census.channels[ch] = (census.channels[ch] || 0) + 1;
+      if (!/"(token_activity|token_stat)"/.test(e.data)) return;
       const frame = VTCore.gmgnFrame(e.data);
-      if (frame) emit(frame);
+      if (frame) { try { note(frame, document.hidden); } catch (_) {} emit(frame); }
     });
   };
   if (location.hostname === 'gmgn.ai') {
@@ -376,8 +485,614 @@ const VTLive = (() => {
       WS.prototype.send = function (...args) { try { watch(this); } catch (_) {} return send.apply(this, args); };
     } catch (_) {}
   }
-  return {on(fn) { listeners.add(fn); pending.splice(0).forEach(emit); }, attachedAt: () => attachedAt};
+  return {on(fn) { listeners.add(fn); pending.splice(0).forEach(emit); }, attachedAt: () => attachedAt, census: () => census};
 })();
+
+// Photon probe (Photon tab only, read-only): Photon has no public API, so this records the shape of the data Photon's
+// own page receives (websocket messages and API responses) to find where its volume-bot info lives. Nothing is sent
+// anywhere; "Copy Photon report" puts a trimmed, redacted summary on the clipboard for the user to share.
+const PhotonProbe = (() => {
+  if (!/(^|\.)tinyastro\.io$/.test(location.hostname)) return null;
+  const SECRET = /^(access_?token|refresh_?token|id_?token|auth\w*|session\w*|\w*secret\w*|api_?key|cookie|e?mail|password|jwt|private\w*|seed\w*|mnemonic|otp|code)$/i;
+  const INTEREST = /bot|wash|volume|trade|swap|maker|tag|holder|sniper|bundl|insider|dev/i;
+  const rep = {since: Date.now(), sockets: {}, http: {}, events: {}, keys: {}, samples: {}, domLines: []};
+  const redact = (v, depth = 0) => {
+    if (typeof v === 'string') return /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(v) ? '[redacted]' : v.length > 200 ? v.slice(0, 200) + '…' : v;
+    if (!v || typeof v !== 'object' || depth > 6) return v;
+    if (Array.isArray(v)) return v.slice(0, 4).map(x => redact(x, depth + 1));
+    const o = {}; for (const [k, x] of Object.entries(v).slice(0, 60)) o[k] = SECRET.test(k) ? '[redacted]' : redact(x, depth + 1); return o;
+  };
+  const record = (source, raw) => {
+    let msg = raw;
+    if (typeof raw === 'string') { const i = raw.search(/[[{]/); if (i < 0) return; try { msg = JSON.parse(raw.slice(i)); } catch (_) { return; } }
+    if (!msg || typeof msg !== 'object') return;
+    const first = Array.isArray(msg) ? msg.find(x => x && typeof x === 'object') : msg;
+    const name = source + ':' + String(first?.type ?? first?.event ?? first?.channel ?? first?.e ?? first?.op ?? (Array.isArray(msg) && typeof msg[0] === 'string' ? msg[0] : '?')).slice(0, 40);
+    if (!(name in rep.events) && Object.keys(rep.events).length >= 80) return;
+    rep.events[name] = (rep.events[name] || 0) + 1;
+    const keys = rep.keys[name] || (rep.keys[name] = []);
+    const walk = (o, pre, d) => { if (!o || typeof o !== 'object' || d > 2) return; for (const [k, v] of Object.entries(Array.isArray(o) ? (o[0] ?? {}) : o).slice(0, 60)) { const path = pre + k; if (!keys.includes(path) && keys.length < 120) keys.push(path); walk(v, path + '.', d + 1); } };
+    walk(first, '', 0);
+    const text = JSON.stringify(msg);
+    const samples = rep.samples[name] || (rep.samples[name] = []);
+    if (samples.length < 3 && INTEREST.test(text)) samples.push(JSON.stringify(redact(msg)).slice(0, 1500));
+  };
+  try {
+    const page = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window, WS = page.WebSocket;
+    page.WebSocket = new Proxy(WS, {construct(target, args, newTarget) {
+      const ws = Reflect.construct(target, args, newTarget);
+      try { const u = String(args[0]).replace(/\?.*$/, ''); rep.sockets[u] = (rep.sockets[u] || 0); ws.addEventListener('message', e => { rep.sockets[u]++; if (typeof e.data === 'string') try { record('ws', e.data); } catch (_) {} }); } catch (_) {}
+      return ws;
+    }});
+    const f = page.fetch;
+    page.fetch = function (...args) {
+      const p = f.apply(this, args);
+      try {
+        const url = String(args[0]?.url || args[0]), path = url.replace(/^https?:\/\/[^/]+/, '').replace(/\?.*$/, '');
+        if (INTEREST.test(path)) p.then(r => { rep.http[path] = (rep.http[path] || 0) + 1; return r.clone().text(); }).then(t => record('http ' + path.slice(0, 60), t)).catch(() => {});
+      } catch (_) {}
+      return p;
+    };
+  } catch (_) {}
+  const report = () => {
+    const lines = (document.body?.innerText || '').split('\n').map(x => x.trim()).filter(x => x && x.length < 120 && /volume\s*bot|bot\s*vol|wash|bots?\b/i.test(x));
+    return JSON.stringify({...rep, page: location.pathname.replace(/[1-9A-HJ-NP-Za-km-z]{32,44}/g, '<addr>'), domLines: [...new Set(lines)].slice(0, 30), copiedAt: new Date().toISOString()}, null, 1);
+  };
+  const ui = () => {
+    if (window.top !== window.self || document.getElementById('vts-probe')) return;
+    const b = document.createElement('button'); b.id = 'vts-probe';
+    b.style.cssText = 'position:fixed;left:12px;bottom:12px;z-index:2147483647;font:600 12px system-ui,sans-serif;padding:8px 12px;border-radius:9px;border:1px solid #33445a;background:#0f151c;color:#e8eef6;cursor:pointer;box-shadow:0 6px 20px #0008';
+    const label = () => { const n = Object.values(rep.events).reduce((a, x) => a + x, 0); b.textContent = 'VolTrak: copy Photon report (' + n + ' messages)'; };
+    b.onclick = () => { GM_setClipboard(report(), 'text'); b.textContent = 'Copied: paste it to Claude (check it first)'; setTimeout(label, 4000); };
+    document.body.appendChild(b); label(); setInterval(() => { if (!/^Copied/.test(b.textContent)) label(); }, 3000);
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ui, {once: true}); else ui();
+  return {report};
+})();
+
+// Panel CSS and markup (scoped under #vts-root; no external fonts or images, so page CSP cannot block them).
+const PANEL_CSS = String.raw`/* =====================================================================
+   VolTrak Steroids · panel CSS (production)
+   - Paste inside the <style> at the top of root.innerHTML.
+   - Every selector is scoped under #vts-root. System fonts and inline SVG only.
+   - Dynamic values (--p meter/bar fill, --x/--y/--cy/--px spark marks, --n
+     progress segments) are set with el.style.setProperty() (CSSOM), never with
+     style="" attributes in markup, so a strict style-src CSP cannot block them.
+   - Colour is never the only signal: every tone also has a glyph, a word or a
+     pattern (hazard stripes, hatching, dashed = unproven/pending).
+   - Fills: a solid fill means a warning (FADE, CAUTION, RISK). Positive readings
+     are tinted. The one exception is a proven A grade (n >= 20).
+   ===================================================================== */
+#vts-root{
+  /* surfaces */
+  --bg:#080b0f;--bg2:#0d1218;--card:#10161e;--card2:#16202b;--well:#0a0f15;
+  --line:#1d2733;--line2:#2b3848;--line3:#3d4d62;
+  /* text, contrast on --card: text 16.5:1 · muted 7.9:1 · dim 5.4:1 */
+  --text:#eef3f8;--muted:#9eadbf;--dim:#7f8d9e;
+  /* signals: colour · ink (text on a solid fill) · bg (tint) · line (tint border) */
+  --buy:#2ee88f;--buy-ink:#02170c;--buy-bg:#0c2318;--buy-line:#1f6b47;
+  --sell:#ff5468;--sell-ink:#1f0308;--sell-bg:#2a0e14;--sell-line:#7a2632;
+  --warn:#ffc43d;--warn-ink:#211600;--warn-bg:#241c07;--warn-line:#6b5212;
+  --wait:#93b4ff;--wait-ink:#08142e;--wait-bg:#111b31;--wait-line:#34528c;
+  --lime:#b4ec6e;
+  /* the tool itself: clocks, countdowns, active tab, primary button, focus ring */
+  --accent:#36c9ff;--accent-ink:#021722;
+  /* current reading, switched by data-tone on the root */
+  --tone:#6b7a8d;--tone-ink:#eef3f8;--tone-bg:#121922;--tone-line:#2b3848;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Cascadia Mono","DejaVu Sans Mono","Liberation Mono",monospace;
+  position:fixed;right:16px;bottom:16px;z-index:2147483647;
+  display:flex;flex-direction:column;
+  width:380px;max-width:calc(100vw - 24px);max-height:72vh;
+  container:vts/inline-size;
+  margin:0;padding:0;color:var(--text);font:13px/1.4 var(--sans);text-align:left;letter-spacing:normal;text-transform:none;
+  background:var(--bg);border:1px solid var(--line2);border-radius:12px;
+  box-shadow:0 0 0 1px #000,0 18px 50px #000c;overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+}
+#vts-root[hidden]{display:none!important}
+#vts-root[data-tone=buy]{--tone:var(--buy);--tone-ink:var(--buy-ink);--tone-bg:var(--buy-bg);--tone-line:var(--buy-line)}
+#vts-root[data-tone=sell]{--tone:var(--sell);--tone-ink:var(--sell-ink);--tone-bg:var(--sell-bg);--tone-line:var(--sell-line)}
+#vts-root[data-tone=caution]{--tone:var(--warn);--tone-ink:var(--warn-ink);--tone-bg:var(--warn-bg);--tone-line:var(--warn-line)}
+#vts-root[data-tone=wait]{--tone:var(--wait);--tone-ink:var(--wait-ink);--tone-bg:var(--wait-bg);--tone-line:var(--wait-line)}
+
+/* ---------- base + host-CSS resets (GMGN Tailwind preflight, Discord) ---------- */
+#vts-root *,#vts-root *::before,#vts-root *::after{box-sizing:border-box}
+#vts-root [hidden]{display:none!important}
+/* host pages style generic classes (.sub, .tag, .note, .pill...): neutralise what we don't set ourselves */
+#vts-root :where(div,span,b,i,u,small,strong,em,p,ul,ol,li,label,section,header,nav,footer,details,summary,h3,h4,kbd,sup){color:inherit;background:none;border:0;margin:0;padding:0;box-shadow:none;text-shadow:none;float:none;font-style:normal;text-decoration:none;letter-spacing:inherit;text-transform:inherit;min-width:0;max-width:none;width:auto;height:auto;opacity:1;transform:none;filter:none}
+#vts-root p{margin:6px 0}
+#vts-root .vts-sprite{position:absolute;width:0;height:0;overflow:hidden}
+#vts-root .i{display:inline-block;flex:none;width:1em;height:1em;fill:currentColor;vertical-align:-.125em;overflow:visible}
+#vts-root .pos{color:var(--buy)}#vts-root .neg{color:var(--sell)}#vts-root .warnc{color:var(--warn)}#vts-root .muted{color:var(--muted)}#vts-root .dim{color:var(--dim)}
+#vts-root .lbl{font:700 10.5px/1.2 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
+#vts-root kbd{font:700 10px/1 var(--mono);padding:2px 5px;border:1px solid var(--line2);border-bottom-width:2px;border-radius:4px;background:var(--card2);color:var(--text)}
+#vts-root button,#vts-root input,#vts-root select,#vts-root textarea{
+  -webkit-appearance:none;appearance:none;margin:0;font:inherit;letter-spacing:inherit;text-transform:none;color:var(--text);
+  box-shadow:none;min-height:0;height:auto;max-width:100%;outline:none;text-shadow:none}
+#vts-root button{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;width:auto;
+  background:var(--card2);border:1px solid var(--line2);border-radius:7px;padding:7px 11px;font-weight:650;line-height:1.2;text-align:center;white-space:nowrap;text-decoration:none}
+#vts-root button:hover{background:#1d2836;border-color:var(--line3)}
+#vts-root button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:800}
+#vts-root button.primary:hover{background:#6bd8ff}
+#vts-root button:focus-visible,#vts-root input:focus-visible,#vts-root select:focus-visible,#vts-root summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+#vts-root input,#vts-root select{display:block;width:100%;background:var(--well);border:1px solid var(--line2);border-radius:7px;padding:8px 10px;font-size:13px;line-height:1.25}
+#vts-root input::placeholder{color:var(--dim);opacity:1}
+#vts-root input[type=number]{-moz-appearance:textfield}
+#vts-root input::-webkit-inner-spin-button,#vts-root input::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+#vts-root select{padding-right:30px;cursor:pointer;white-space:nowrap;text-overflow:ellipsis;
+  background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);
+  background-position:calc(100% - 16px) 52%,calc(100% - 11px) 52%;background-size:5px 5px;background-repeat:no-repeat}
+#vts-root select option{background:var(--card);color:var(--text)}
+/* checkbox = switch (knob drawn with a gradient: no pseudo-elements on inputs) */
+#vts-root input[type=checkbox]{flex:none;display:inline-block;width:30px;height:18px;padding:0;border-radius:9px;border:1px solid var(--line3);cursor:pointer;
+  background:radial-gradient(circle at 8px 50%,var(--muted) 0 5px,transparent 5.5px) no-repeat,var(--well)}
+#vts-root input[type=checkbox]:checked{border-color:var(--accent);background:radial-gradient(circle at calc(100% - 8px) 50%,var(--accent-ink) 0 5px,transparent 5.5px) no-repeat,var(--accent)}
+
+/* ---------- header: drag bar; collapsed it becomes the scoreboard ---------- */
+#vts-root header{position:relative;flex:none;display:flex;align-items:center;gap:8px;height:40px;margin:0;padding:0 6px 0 8px;background:var(--bg2);border-bottom:1px solid var(--line);cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
+#vts-root header::before{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:var(--tone)}
+#vts-root .grip{width:10px;height:16px;color:#5a6879}
+#vts-root .brand{flex:none;display:flex;align-items:center;gap:6px;font:800 12px/1 var(--mono);letter-spacing:.18em;white-space:nowrap}
+#vts-root .brand b{font-weight:800}
+#vts-root .brand .i{color:var(--accent);width:14px;height:14px}
+#vts-root[data-tone]:not([data-tab=live]) .brand b{display:none}
+#vts-root .mini{flex:1;min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:8px;white-space:nowrap;overflow:hidden}
+#vts-root[data-tab=live]:not(.vts-collapsed) .mini{visibility:hidden}
+#vts-root .m-state{flex:none;display:inline-flex;align-items:center;gap:5px;padding:5px 7px;border-radius:5px;font:850 11px/1 var(--sans);letter-spacing:.05em;text-transform:uppercase;background:var(--tone-bg);color:var(--tone);box-shadow:inset 0 0 0 1px var(--tone-line)}
+#vts-root[data-tone=sell] .m-state,#vts-root[data-tone=caution] .m-state{background:var(--tone);color:var(--tone-ink);box-shadow:none}
+#vts-root .m-read{display:flex;align-items:baseline;gap:6px;min-width:0}
+#vts-root .m-sym{min-width:0;font:700 11px/1 var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis}
+#vts-root .m-share{flex:none;font:850 16px/1 var(--sans);font-variant-numeric:tabular-nums}
+#vts-root .m-share small{font:700 9.5px/1 var(--mono);letter-spacing:.06em;color:var(--muted);margin-left:3px;text-transform:uppercase}
+#vts-root .m-since{flex:none;display:inline-flex;align-items:center;gap:4px;font:750 13px/1 var(--mono);color:var(--accent);font-variant-numeric:tabular-nums}
+#vts-root .m-since .i{width:.9em;height:.9em}
+#vts-root .m-text{display:none;align-items:center;gap:6px;font:750 11px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+#vts-root .m-text::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+#vts-root .m-bar{display:none}
+#vts-root[data-site=discord] .mini>:not(.m-text){display:none}
+#vts-root[data-site=discord] .m-text{display:inline-flex}
+#vts-root .hbtn{flex:none;width:28px;height:28px;padding:0;background:transparent;border:1px solid var(--line2);border-radius:6px;font-size:14px}
+#vts-root .hbtn .ic-max,#vts-root.vts-collapsed .hbtn .ic-min{display:none}
+#vts-root.vts-collapsed .hbtn .ic-max{display:inline-block}
+/* tone glyphs: all five ship in the markup, the root's data-tone shows one */
+#vts-root .ti{display:inline-flex;flex:none}
+#vts-root .ti .i{display:none}
+#vts-root .ti .t-unk,#vts-root[data-tone] .ti .t-unk{display:inline-block}
+#vts-root[data-tone=buy] .ti .t-unk,#vts-root[data-tone=sell] .ti .t-unk,#vts-root[data-tone=caution] .ti .t-unk,#vts-root[data-tone=wait] .ti .t-unk{display:none}
+#vts-root[data-tone=buy] .ti .t-buy,#vts-root[data-tone=sell] .ti .t-sell,#vts-root[data-tone=caution] .ti .t-caution,#vts-root[data-tone=wait] .ti .t-wait{display:inline-block}
+/* collapsed: one 52px scoreboard row: state block · symbol over share · clock · split bar along the bottom */
+#vts-root.vts-collapsed header{height:52px;padding:0 8px 0 0;border-bottom:0;gap:10px}
+#vts-root.vts-collapsed header::before,#vts-root.vts-collapsed .grip{display:none}
+#vts-root.vts-collapsed[data-tone] .brand{display:none}
+#vts-root.vts-collapsed .mini{justify-content:flex-start;align-self:stretch;gap:12px}
+#vts-root.vts-collapsed .m-state{align-self:stretch;min-width:118px;padding:0 12px;border-radius:0;font-size:13.5px;gap:7px;box-shadow:inset 4px 0 0 var(--tone)}
+#vts-root.vts-collapsed[data-tone=sell] .m-state{box-shadow:none}
+#vts-root.vts-collapsed[data-tone=caution] .m-state{box-shadow:none;padding-left:18px;background:linear-gradient(90deg,transparent 0 8px,var(--warn) 8px),repeating-linear-gradient(135deg,var(--warn-ink) 0 5px,var(--warn) 5px 10px)}
+#vts-root.vts-collapsed .m-state .i{width:16px;height:16px}
+#vts-root.vts-collapsed .m-read{flex-direction:column;align-items:flex-start;gap:3px;max-width:104px}
+#vts-root.vts-collapsed .m-sym{max-width:100%;font-size:10.5px;letter-spacing:.02em}
+#vts-root.vts-collapsed .m-share{font-size:26px;letter-spacing:-.02em}
+#vts-root.vts-collapsed .m-since{font-size:16px}
+#vts-root.vts-collapsed .m-bar{display:block;position:absolute;left:0;right:0;bottom:0;height:3px;background:linear-gradient(90deg,var(--buy) 0 var(--p,50%),var(--sell) var(--p,50%) 100%)}
+#vts-root.vts-collapsed .m-bar.empty{background:var(--line2)}
+#vts-root.vts-collapsed .vts-body,#vts-root.vts-collapsed .tabs,#vts-root.vts-collapsed .foot{display:none}
+
+/* ---------- tabs ---------- */
+#vts-root .tabs{flex:none;display:flex;margin:0;padding:0 4px;background:var(--bg2);border-bottom:1px solid var(--line)}
+#vts-root .tabs button{flex:1;position:relative;background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:var(--muted);font:750 11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;padding:11px 4px 10px}
+#vts-root .tabs button:hover{background:none;color:var(--text)}
+#vts-root .tabs button.on{color:var(--text);border-bottom-color:var(--accent)}
+#vts-root .tabs .badge{display:inline-block;margin-left:5px;min-width:16px;padding:2px 4px;border-radius:8px;background:var(--buy-bg);color:var(--buy);box-shadow:inset 0 0 0 1px var(--buy-line);font:800 9.5px/1 var(--sans);letter-spacing:0}
+
+/* ---------- body (scrolls) + footer (fixed) ---------- */
+#vts-root .vts-body{flex:1 1 auto;min-height:0;padding:10px 12px 12px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
+#vts-root .foot{flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-height:36px;padding:6px 8px 6px 12px;background:var(--bg2);border-top:1px solid var(--line);font-size:11.5px;color:var(--muted)}
+#vts-root .foot .st{flex:1 1 170px;min-width:170px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .foot .fg{display:flex;align-items:center;gap:8px;margin-left:auto}
+#vts-root .foot button{padding:5px 8px;font-size:11.5px;border-radius:6px}
+#vts-root .sw{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--muted);cursor:pointer;white-space:nowrap}
+#vts-root .sw input[type=checkbox]{width:26px;height:16px;background:radial-gradient(circle at 7px 50%,var(--muted) 0 4px,transparent 4.5px) no-repeat,var(--well)}
+#vts-root .sw input[type=checkbox]:checked{background:radial-gradient(circle at calc(100% - 7px) 50%,var(--accent-ink) 0 4px,transparent 4.5px) no-repeat,var(--accent)}
+#vts-root .dot{flex:none;display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim)}
+#vts-root .dot.ok{background:var(--buy)}#vts-root .dot.warn{background:var(--warn)}#vts-root .dot.bad{background:var(--sell)}
+
+/* ---------- LIVE · identity ---------- */
+#vts-root .ident{margin-bottom:8px}
+#vts-root .nm{display:flex;align-items:baseline;gap:7px;min-width:0}
+#vts-root h3{min-width:0;margin:0;font:850 17px/1.2 var(--sans);color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .sym{flex:0 3 auto;min-width:0;font:700 11.5px/1 var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .venue{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-top:6px}
+#vts-root .vtags{display:contents}
+#vts-root .mint{padding:3px 7px;gap:6px;font:600 11px/1.2 var(--mono);color:var(--muted);background:transparent;border-color:var(--line2);border-radius:5px}
+#vts-root .mint .i{width:12px;height:12px}
+#vts-root .tag{flex:none;display:inline-flex;align-items:center;gap:4px;padding:4px 6px;border-radius:4px;border:1px solid var(--line2);color:var(--muted);font:800 10px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase;white-space:nowrap}
+#vts-root .tag.ok{color:var(--buy);border-color:var(--buy-line)}
+#vts-root .tag.warn{color:var(--warn);border-color:var(--warn-line)}
+#vts-root .tag.bad{color:var(--sell-ink);background:var(--sell);border-color:var(--sell)}
+#vts-root .tag.dash{border-style:dashed;border-color:var(--line3)}
+
+/* ---------- LIVE · hero: state band, two decision numbers, meter ---------- */
+#vts-root .hero{container:hero/inline-size;border:1px solid var(--line2);border-radius:10px;overflow:hidden;background:var(--card);background:linear-gradient(180deg,var(--tone-bg) 0,var(--card) 62%)}
+#vts-root .band{display:flex;align-items:center;gap:9px;min-height:58px;padding:7px 8px 7px 12px;background:var(--tone-bg);color:var(--tone);border-bottom:1px solid var(--tone-line);box-shadow:inset 4px 0 0 var(--tone)}
+#vts-root .band .ti .i{width:22px;height:22px}
+#vts-root .band .bt{flex:1;min-width:0}
+#vts-root .band [data-vts=state]{display:block;font:900 20px/1.05 var(--sans);font-size:clamp(15px,5.3cqi,21px);letter-spacing:0;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .band .sub{display:flex;align-items:center;gap:6px;min-width:0;margin-top:5px;font:700 11.5px/1.2 var(--sans);color:inherit;white-space:nowrap;overflow:hidden}
+#vts-root .band .sub>span{min-width:0;overflow:hidden;text-overflow:ellipsis}
+#vts-root .band .sub [data-vts=state-why]{white-space:normal;line-height:1.25;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+#vts-root .band .sub:has([data-vts=state-why]:not([hidden])){align-items:flex-start}
+#vts-root .fresh{flex:none;display:inline-flex;align-items:center;gap:4px;padding:3px 5px;border-radius:4px;background:#04070ad0;color:var(--text);font:800 9.5px/1 var(--mono);letter-spacing:.05em}
+#vts-root .fresh::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--buy)}
+#vts-root .fresh.stale::before{background:var(--warn)}
+#vts-root .fresh.off::before{background:var(--sell)}
+#vts-root .clock{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:5px 8px 6px;border-radius:7px;background:#04070ad9;border:1px solid #ffffff14;color:var(--accent)}
+#vts-root .clock .lbl{font-size:8.5px;letter-spacing:.1em}
+#vts-root .clock b{display:inline-flex;align-items:center;gap:5px;font:750 19px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+#vts-root .clock b .i{width:13px;height:13px}
+#vts-root[data-tone=sell] .band{background:var(--sell);color:var(--sell-ink);border-bottom-color:var(--sell);box-shadow:none}
+#vts-root[data-tone=caution] .band{background:linear-gradient(90deg,transparent 0 10px,var(--warn) 10px),repeating-linear-gradient(135deg,var(--warn-ink) 0 5px,var(--warn) 5px 10px);color:var(--warn-ink);border-bottom-color:var(--warn);box-shadow:none;padding-left:20px}
+#vts-root[data-tone=unknown] .band,#vts-root:not([data-tone]) .band{background:transparent;color:var(--muted);box-shadow:none;border-bottom:1px dashed var(--line2)}
+#vts-root[data-tone=unknown] .hero{background:var(--card)}
+#vts-root .score{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:end;column-gap:14px;padding:10px 12px 6px}
+#vts-root .score>*{min-width:0}
+#vts-root .score .r{text-align:right;justify-self:end}
+#vts-root .big{display:block;margin-top:4px;font:850 52px/.95 var(--sans);font-size:clamp(40px,15cqi,54px);font-variant-numeric:tabular-nums;letter-spacing:-.035em;white-space:nowrap;overflow:hidden;max-width:100%;color:var(--text)}
+#vts-root .big small{font:800 .42em/1 var(--sans);letter-spacing:0;margin-left:2px}
+#vts-root .big.long{font-size:clamp(26px,10cqi,40px)}
+#vts-root .big.up::before,#vts-root .big.down::before{content:"";display:inline-block;width:.38em;height:.34em;margin-right:.07em;background:currentColor;vertical-align:.3em}
+#vts-root .big.up::before{clip-path:polygon(50% 0,100% 100%,0 100%)}
+#vts-root .big.down::before{clip-path:polygon(0 0,100% 0,50% 100%)}
+#vts-root .big.na{color:var(--dim)}
+#vts-root .hsub{display:block;margin-top:6px;font:650 11.5px/1.25 var(--sans);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .hsub b{color:var(--text);font-weight:750}
+#vts-root .side{display:inline-block;padding:3px 5px;border-radius:4px;border:1px solid currentColor;font:800 9.5px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase}
+#vts-root .side.pos{background:var(--buy-bg)}#vts-root .side.neg{background:var(--sell-bg)}
+/* mini trend lines: buy share over 60s (left), MC since the alert (right); hidden under 3 points */
+#vts-root .spark{position:relative;width:100%;height:26px;margin-top:17px;color:var(--muted)}
+#vts-root .spark.pos{color:var(--buy)}#vts-root .spark.neg{color:var(--sell)}#vts-root .spark.mix{color:var(--wait)}
+#vts-root .spark .plot{position:absolute;left:0;top:0;bottom:0;right:0}
+#vts-root .spark.r .plot{right:34px}
+#vts-root .spark svg{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible}
+#vts-root .spark .ln{fill:none;stroke:currentColor;stroke-width:1.75;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
+#vts-root .spark .ar{fill:currentColor;opacity:.12;stroke:none}
+#vts-root .spark .ref{stroke:var(--dim);stroke-width:1;stroke-dasharray:3 3;vector-effect:non-scaling-stroke}
+#vts-root .spark .end{position:absolute;left:var(--x,100%);top:var(--y,50%);width:7px;height:7px;margin:-3.5px 0 0 -3.5px;border-radius:50%;background:currentColor;box-shadow:0 0 0 2px var(--card)}
+#vts-root .spark .cap{position:absolute;top:-14px;font:700 9.5px/1 var(--mono);letter-spacing:.04em;color:var(--muted);white-space:nowrap}
+#vts-root .spark .cap.l{left:0}
+#vts-root .spark .pk{left:var(--px,50%);transform:translateX(-50%);color:var(--text)}
+#vts-root .spark .cl{right:0;top:var(--cy,50%);transform:translateY(-50%);padding:2px 3px;border:1px dashed var(--line3);border-radius:3px;background:var(--card);font-size:8.5px;letter-spacing:.06em;color:var(--muted)}
+#vts-root .spark .cl:empty{display:none}
+#vts-root .spark.none svg,#vts-root .spark.none .end,#vts-root .spark.none .cl{display:none}
+#vts-root .score.nospark .spark{display:none}
+#vts-root .meter{position:relative;display:grid;grid-template-columns:repeat(20,minmax(0,1fr));gap:3px;height:18px;margin:8px 12px 0}
+#vts-root .meter i{border-radius:2px;background:var(--sell);opacity:.78}
+#vts-root .meter i.on{background:var(--buy);opacity:1}
+#vts-root .meter.empty i{background:var(--line2);opacity:1}
+#vts-root .meter::after{content:"";position:absolute;left:50%;top:-5px;bottom:-5px;width:2px;margin-left:-1px;background:var(--text);border-radius:1px;box-shadow:0 0 0 2px var(--card)}
+#vts-root .scale{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:2px 8px;padding:7px 12px 10px;font:750 11.5px/1.25 var(--sans);font-variant-numeric:tabular-nums}
+#vts-root .scale .b{color:var(--buy);white-space:nowrap}
+#vts-root .scale .s{color:var(--sell);white-space:nowrap;text-align:right}
+#vts-root .scale [data-vts=basis]{flex:1 1 0;min-width:0;text-align:center;font:500 11px/1.25 var(--sans);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ---------- LIVE · grade + bots pair, KPIs, late checks ---------- */
+#vts-root .pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin-top:6px}
+#vts-root .cell,#vts-root .kpi{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 10px 8px}
+#vts-root .grade .gb{display:flex;align-items:center;gap:9px;margin-top:7px;min-width:0}
+#vts-root .grade .gl{flex:none;display:grid;place-items:center;width:38px;height:38px;border-radius:7px;border:2px solid var(--line2);font:900 22px/1 var(--sans);color:var(--text)}
+#vts-root .grade .gt{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0}
+#vts-root .grade strong{font:800 14px/1.1 var(--sans);font-variant-numeric:tabular-nums;white-space:nowrap}
+#vts-root .grade .gn{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+#vts-root .grade.g-a .gl{background:var(--buy);border-color:var(--buy);color:var(--buy-ink)}
+#vts-root .grade.g-b .gl{border-color:var(--lime);color:var(--lime)}
+#vts-root .grade.g-c .gl{border-color:var(--warn);color:var(--warn)}
+#vts-root .grade.g-d .gl{border-color:var(--sell);color:var(--sell)}
+#vts-root .grade.unproven .gl,#vts-root .grade.few .gl,#vts-root .grade.none .gl{background:transparent;border:2px dashed var(--line3);color:var(--muted)}
+#vts-root .grade.few .gl,#vts-root .grade.none .gl{color:var(--dim)}
+#vts-root .grade.unproven .gn,#vts-root .grade.few .gn{padding:3px 5px;border:1px dashed var(--line3);border-radius:4px;font:800 9.5px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase}
+#vts-root .grade.none strong{color:var(--muted);font-size:12.5px}
+#vts-root .bots .bv{display:flex;align-items:baseline;gap:5px;margin-top:6px;white-space:nowrap;min-width:0}
+#vts-root .bots .bv b{font:850 20px/1 var(--sans);font-variant-numeric:tabular-nums}
+#vts-root .bots .bv .muted{font-size:11.5px}
+#vts-root .bots .bv .tag{margin-left:auto;align-self:center}
+#vts-root .bots.na .bv .muted{display:none}
+#vts-root .bots .bar{display:flex;height:8px;margin-top:7px;border-radius:3px;overflow:hidden;background:#5f7694}
+#vts-root .bots .bar i{display:block;width:var(--p,0%);background:repeating-linear-gradient(135deg,var(--warn) 0 4px,#5c470f 4px 7px)}
+#vts-root .bots.low .bar i{background:repeating-linear-gradient(135deg,#8c99a8 0 4px,#3a4553 4px 7px)}
+#vts-root .bots.high .bar i{background:repeating-linear-gradient(135deg,var(--sell) 0 4px,#5a1620 4px 7px)}
+#vts-root .bots.na .bar{background:repeating-linear-gradient(90deg,var(--line2) 0 6px,transparent 6px 10px)}
+#vts-root .bots small{display:block;margin-top:6px;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .bots small b{color:var(--text);font-weight:800}
+#vts-root .kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-top:6px}
+#vts-root .kpi b{display:block;margin:4px 0 2px;font:850 20px/1.1 var(--sans);font-variant-numeric:tabular-nums;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .kpi b .i{width:.62em;height:.62em;margin-right:3px;vertical-align:.04em}
+#vts-root .kpi small{display:block;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .kpi.na b{color:var(--dim)}
+#vts-root .late-chips{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin-top:6px}
+#vts-root .lc{position:relative;min-width:0;display:flex;flex-direction:column;gap:5px;padding:7px 10px 8px;border-radius:8px;border:1px solid var(--line2);background:var(--card);overflow:hidden;white-space:nowrap}
+#vts-root .lc .v{font:850 14.5px/1.1 var(--sans);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}
+#vts-root .lc.pend{border-style:dashed;background:transparent}
+#vts-root .lc.pend .v{font:750 14.5px/1.1 var(--mono);color:var(--accent)}
+#vts-root .lc.pend .v.muted{color:var(--muted)}
+#vts-root .lc .prog{position:absolute;left:0;bottom:0;height:2px;width:var(--p,0%);background:var(--accent);opacity:.8}
+#vts-root .lc.g-buy{background:var(--buy-bg);border-color:var(--buy-line);color:var(--buy)}
+#vts-root .lc.g-fade{background:var(--sell);border-color:var(--sell);color:var(--sell-ink)}
+#vts-root .lc.g-wait{border-color:var(--warn-line);color:var(--warn)}
+#vts-root .lc.g-dead{border-color:var(--line2);color:var(--muted)}
+#vts-root .lc.g-fade .lbl{color:inherit;opacity:.8}
+#vts-root .lc.g-buy .v::before{content:"\25B2  "}
+#vts-root .lc.g-wait .v::before{content:"\2016  "}
+#vts-root .lc.g-fade .v::before{content:"\25BC  "}
+#vts-root .lc.g-dead .v::before{content:"\2715  "}
+
+/* ---------- LIVE · flags ---------- */
+#vts-root .flags{list-style:none;display:grid;gap:4px;margin:8px 0 0;padding:0}
+#vts-root .flags li{display:flex;gap:8px;align-items:flex-start;margin:0;padding:6px 8px;border-radius:7px;background:var(--warn-bg);border:1px solid #3a3013;font-size:12.5px;line-height:1.35;color:var(--text)}
+#vts-root .flags li::before{content:"FLAG";flex:none;margin-top:1px;padding:3px 5px;border-radius:3px;background:var(--warn);color:var(--warn-ink);font:850 9.5px/1 var(--mono);letter-spacing:.08em}
+#vts-root .flags li.risk{background:var(--sell-bg);border-color:#4d1c24}
+#vts-root .flags li.risk::before{content:"RISK";background:var(--sell);color:var(--sell-ink)}
+#vts-root .flags:empty,#vts-root .strip:empty,#vts-root .feed:empty,#vts-root .late-chips:empty,#vts-root .kpis:empty,#vts-root .mtop:empty,#vts-root .mkt:empty,#vts-root .btp:empty{display:none}
+
+/* ---------- LIVE · below the fold ---------- */
+#vts-root .sect{display:flex;align-items:center;gap:8px;margin:14px 0 6px}
+#vts-root .sect::after{content:"";order:1;flex:1;height:1px;background:var(--line)}
+#vts-root .sect .lbl+.lbl{order:2;color:var(--dim)}
+#vts-root .flow{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) minmax(0,1fr);border:1px solid var(--line);border-radius:8px;background:var(--card);overflow:hidden}
+#vts-root .flow>*{padding:6px 10px;border-bottom:1px solid var(--line);text-align:right;font:750 13px/1.25 var(--sans);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .flow .h{background:var(--bg2);font:750 10px/1.25 var(--mono);letter-spacing:.09em;color:var(--muted);text-transform:uppercase}
+#vts-root .flow .l{text-align:left;font:600 12px/1.25 var(--sans);color:var(--muted)}
+#vts-root .flow .ft{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:2px 12px;border-bottom:0;text-align:left;font:500 11.5px/1.4 var(--sans);color:var(--muted);white-space:normal}
+#vts-root .flow .ft b{color:var(--text);font-weight:750}
+#vts-root .flow sup,#vts-root .mkt sup{font:800 10px/0 var(--mono);color:var(--dim);margin-left:1px}
+#vts-root .rb{display:inline-block;width:30px;height:5px;margin-right:6px;border-radius:3px;vertical-align:.12em;background:linear-gradient(90deg,var(--buy) 0 var(--p,50%),var(--sell) var(--p,50%) 100%)}
+#vts-root .strip{display:flex;width:100%;justify-content:flex-start;flex-wrap:wrap;gap:4px 10px;margin-top:10px;padding:8px 10px;background:var(--card);border:1px solid var(--line);border-radius:8px;font-size:11.5px;font-weight:500;color:var(--muted);text-align:left;white-space:normal}
+#vts-root .strip span{white-space:nowrap}
+#vts-root .strip b{color:var(--text);font-weight:750}
+#vts-root .strip::before{content:"MARKET 5M";font:700 10.5px/1.5 var(--mono);letter-spacing:.09em}
+#vts-root .strip::after{content:"\203A";margin-left:auto;color:var(--accent);font-weight:800}
+#vts-root .buttons{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+#vts-root .buttons.two>button{flex:1 1 0;min-width:0}
+#vts-root .feed{display:flex;flex-wrap:wrap;gap:2px 10px;margin:2px 0 0;font-size:11.5px;color:var(--muted)}
+#vts-root .feed span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+#vts-root .feed .dot{width:6px;height:6px}
+#vts-root details{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+#vts-root summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px;padding:9px 10px;font:750 10.5px/1.2 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--muted)}
+#vts-root summary::-webkit-details-marker{display:none}
+#vts-root summary::after{content:"+";margin-left:auto;font:700 15px/1 var(--mono);color:var(--muted)}
+#vts-root details[open] summary::after{content:"\2212"}
+#vts-root details[open] summary{border-bottom:1px solid var(--line)}
+#vts-root details>:not(summary){margin-left:10px;margin-right:10px}
+#vts-root details ul{margin-top:8px;margin-bottom:6px;padding-left:16px}
+#vts-root details li{margin:4px 0;font-size:12.5px;line-height:1.4}
+#vts-root details .buttons{margin-bottom:4px}
+#vts-root .note{color:var(--muted);font-size:11.5px;line-height:1.45}
+#vts-root .note b{color:var(--text)}
+#vts-root .result{margin:6px 10px 10px;padding:8px 10px;border-radius:7px;background:var(--well);border:1px solid var(--line2);font-size:12.5px}
+#vts-root .result:empty{display:none}
+
+/* ---------- forms (Recover initials, Calls) ---------- */
+#vts-root .field{display:block;margin:10px 0 0}
+#vts-root .field>.lbl,#vts-root .grid2 .lbl,#vts-root .grid3 .lbl{display:block;margin-bottom:5px}
+#vts-root .inline{display:flex;gap:6px}
+#vts-root .inline input{flex:1;min-width:0}
+#vts-root .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:8px}
+#vts-root .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+#vts-root .grid2 label,#vts-root .grid3 label{display:block;min-width:0}
+#vts-root .pct{position:relative;display:block}
+#vts-root .pct input{padding-right:24px}
+#vts-root .pct::after{content:"%";position:absolute;right:9px;top:50%;transform:translateY(-50%);color:var(--muted);font-weight:700;pointer-events:none}
+
+/* ---------- MARKET ---------- */
+#vts-root .mhead{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px 8px;margin-bottom:8px}
+#vts-root .pill{display:inline-flex;align-items:center;gap:6px;flex:none;min-width:0;max-width:100%;padding:5px 9px;border-radius:999px;border:1px solid var(--line2);font:650 11.5px/1 var(--sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .pill::before{content:"";flex:none;width:7px;height:7px;border-radius:50%;background:var(--dim)}
+#vts-root .pill.ok::before{background:var(--buy)}#vts-root .pill.warn::before{background:var(--warn)}#vts-root .pill.bad::before{background:var(--sell)}
+#vts-root .mtop{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:8px}
+#vts-root .mtop .kpi b{font-size:22px}
+#vts-root .mkt{display:grid;grid-template-columns:minmax(0,1.3fr) repeat(4,minmax(0,1fr));margin:0;border:1px solid var(--line2);border-radius:10px;overflow:hidden;background:var(--card)}
+#vts-root .mkt>*{padding:9px 8px;text-align:right;border-bottom:1px solid var(--line);font:800 14px/1.1 var(--sans);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .mkt>:nth-last-child(-n+5){border-bottom:0}
+#vts-root .mkt .h{background:var(--bg2);font:750 10.5px/1.1 var(--mono);letter-spacing:.09em;color:var(--muted);text-transform:uppercase}
+#vts-root .mkt .l{text-align:left;font:600 12.5px/1.1 var(--sans);color:var(--muted)}
+#vts-root .mkt .hl{background:#122030}
+#vts-root .mkt .h.hl{color:var(--text);box-shadow:inset 0 -2px 0 var(--accent)}
+
+/* ---------- CALLS ---------- */
+#vts-root .recv{display:flex;align-items:center;gap:8px;margin:0 0 4px;padding:8px 10px;border-radius:8px;font-size:12.5px;line-height:1.35;color:var(--text);background:var(--card);border:1px solid var(--line2)}
+#vts-root .recv::before{content:"!";flex:none;display:grid;place-items:center;width:18px;height:18px;border-radius:50%;font:900 11px/1 var(--sans);background:var(--warn);color:var(--warn-ink)}
+#vts-root .recv.ok{background:var(--buy-bg);border-color:var(--buy-line)}
+#vts-root .recv.ok::before{content:"\2713";background:var(--buy);color:var(--buy-ink)}
+#vts-root .mkt.late{grid-template-columns:minmax(0,1fr) 46px repeat(2,minmax(0,1.08fr))}
+#vts-root .mkt.late>*{display:flex;align-items:center;justify-content:flex-end;min-height:34px;padding:7px;font:650 12.5px/1.1 var(--sans)}
+#vts-root .mkt.late .h{min-height:28px;font:750 10.5px/1.1 var(--mono)}
+#vts-root .mkt.late .l{justify-content:flex-start}
+#vts-root .mkt.late .go{justify-content:flex-start;color:var(--text);font-weight:750;cursor:pointer}
+#vts-root .mkt.late .go:hover{text-decoration:underline}
+#vts-root .mkt.late .pend{color:var(--muted);font:650 11.5px/1 var(--mono)}
+#vts-root .gp{display:inline-flex;align-items:center;gap:4px;padding:3px 5px;border-radius:5px;border:1px solid transparent;font:850 11.5px/1 var(--sans);font-variant-numeric:tabular-nums;white-space:nowrap}
+#vts-root .gp::before{font-size:.85em}
+#vts-root .gp.buy{background:var(--buy-bg);border-color:var(--buy-line);color:var(--buy)}
+#vts-root .gp.buy::before{content:"\25B2"}
+#vts-root .gp.fade{background:var(--sell);border-color:var(--sell);color:var(--sell-ink)}
+#vts-root .gp.fade::before{content:"\25BC"}
+#vts-root .gp.wait{border-color:var(--warn-line);color:var(--warn)}
+#vts-root .gp.wait::before{content:"\2016"}
+#vts-root .gp.dead{border-color:var(--line2);color:var(--muted)}
+#vts-root .gp.dead::before{content:"\2715"}
+#vts-root .legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:8px 0 2px;font-size:11px;color:var(--muted)}
+#vts-root .legend span{display:inline-flex;align-items:center;gap:5px}
+#vts-root .btp{margin-top:10px}
+#vts-root .btp .bar{display:flex;gap:2px;height:6px;border-radius:3px;overflow:hidden;background:var(--line)}
+#vts-root .btp .bar i{flex:var(--n,0) 1 0;min-width:0;background:var(--line3)}
+#vts-root .btp .bar i.ok,#vts-root .btp .k.ok::before{background:var(--accent)}
+#vts-root .btp .bar i.none,#vts-root .btp .k.none::before{background:#5a6879}
+#vts-root .btp .bar i.left,#vts-root .btp .k.left::before{background:var(--wait)}
+#vts-root .btp .bar i.young,#vts-root .btp .k.young::before{background:var(--line3)}
+#vts-root .btp .keys{display:flex;flex-wrap:wrap;gap:3px 12px;margin-top:6px;font-size:11px;color:var(--muted)}
+#vts-root .btp .k{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+#vts-root .btp .k::before{content:"";width:8px;height:8px;border-radius:2px}
+#vts-root .btp .k b{color:var(--text)}
+#vts-root .bt-status{margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--card);border:1px solid var(--line);font-size:11.5px;color:var(--muted);line-height:1.45}
+#vts-root .bt-status:empty{display:none}
+
+/* ---------- SETTINGS ---------- */
+#vts-root .set{display:grid}
+#vts-root label.check{display:flex;align-items:center;gap:12px;margin:0;padding:9px 0;border-bottom:1px solid var(--line);cursor:pointer;color:var(--text)}
+#vts-root label.check>span{flex:1;min-width:0}
+#vts-root label.check b{display:block;font:700 13px/1.25 var(--sans)}
+#vts-root label.check small{display:block;margin-top:2px;font-size:11.5px;line-height:1.35;color:var(--muted)}
+
+/* ---------- narrow panels (340-372px) ---------- */
+@container vts (max-width:372px){
+  #vts-root .vts-body{padding:10px 10px 12px}
+  #vts-root .band{gap:7px;padding-right:6px}
+  #vts-root .clock{padding:4px 6px 5px}
+  #vts-root .clock b{font-size:16.5px;gap:4px}
+  #vts-root .clock b .i{width:11px;height:11px}
+  #vts-root .score{column-gap:10px;padding:10px 10px 6px}
+  #vts-root .meter{margin:8px 10px 0;gap:2px}
+  #vts-root .scale{padding:7px 10px 9px}
+  #vts-root .scale [data-vts=basis]{order:3;flex-basis:100%}
+  #vts-root .cell,#vts-root .kpi,#vts-root .lc{padding-left:8px;padding-right:8px}
+  #vts-root .kpi .lbl,#vts-root .cell .lbl,#vts-root .lc .lbl{letter-spacing:.04em}
+  #vts-root .grade .gb{gap:7px}
+  #vts-root .grade .gl{width:34px;height:34px;font-size:20px}
+  #vts-root .bots .bv b,#vts-root .kpi b{font-size:18px}
+  #vts-root .flow>*{padding:6px 8px}
+  #vts-root .mkt>*{padding:8px 6px;font-size:13px}
+  #vts-root .mtop .kpi b{font-size:19px}
+  #vts-root .mkt.late>*{padding:7px 5px;font-size:12px}
+  #vts-root .gp{padding:3px 4px;font-size:11px}
+  #vts-root.vts-collapsed .mini{gap:10px}
+  #vts-root.vts-collapsed .m-state{min-width:0;padding:0 10px;font-size:12.5px;gap:6px}
+  #vts-root.vts-collapsed[data-tone=caution] .m-state{padding-left:16px}
+  #vts-root.vts-collapsed .m-read{max-width:84px}
+  #vts-root.vts-collapsed .m-share{font-size:24px}
+  #vts-root .m-share small{display:none}
+  #vts-root.vts-collapsed .m-since{font-size:15px}
+}
+
+/* ---------- one-shot flash on a new call or a state change (never loops) ----------
+   JS: el.classList.add('flash'); setTimeout(()=>el.classList.remove('flash'),1200)
+   on .band and .m-state. Use the timeout, not animationend: with reduced motion
+   there is no animation, so animationend never fires. */
+@media (prefers-reduced-motion:no-preference){
+  #vts-root .flash{animation:vts-flash .9s ease-out 1}
+  @keyframes vts-flash{0%{box-shadow:inset 0 0 0 2px var(--text),0 0 0 3px var(--tone);filter:brightness(1.55)}100%{filter:none}}
+}
+@media (prefers-reduced-motion:reduce){
+  #vts-root .flash{outline:2px solid var(--text);outline-offset:-2px}
+}`;
+const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusable="false">
+<symbol id="vts-i-up" viewBox="0 0 16 16"><path d="M8 2.2 15.2 13.8H.8z"/></symbol>
+<symbol id="vts-i-down" viewBox="0 0 16 16"><path d="M8 13.8.8 2.2h14.4z"/></symbol>
+<symbol id="vts-i-warn" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 .9 15.7 14.8H.3zM7.1 5.4h1.8v4.9H7.1zm0 6.1h1.8v1.8H7.1z"/></symbol>
+<symbol id="vts-i-pause" viewBox="0 0 16 16"><path d="M3 2.4h3.6v11.2H3zm6.4 0H13v11.2H9.4z"/></symbol>
+<symbol id="vts-i-unk" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 .8a7.2 7.2 0 1 1 0 14.4A7.2 7.2 0 0 1 8 .8zm0 1.7a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z"/><path d="M7.1 10.4h1.8v1.8H7.1zM5.3 6.4a2.7 2.7 0 1 1 4.1 2.3c-.5.3-.6.5-.6 1v.2H7.2v-.4c0-1 .4-1.5 1.1-1.9.4-.3.6-.5.6-.9a.9.9 0 0 0-1.8 0z"/></symbol>
+<symbol id="vts-i-clock" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M8 .8a7.2 7.2 0 1 1 0 14.4A7.2 7.2 0 0 1 8 .8zm0 1.8a5.4 5.4 0 1 0 0 10.8A5.4 5.4 0 0 0 8 2.6z"/><path d="M7.1 4h1.8v3.5l2.7 1.6-.9 1.5-3.6-2.1z"/></symbol>
+<symbol id="vts-i-copy" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" d="M5.6 5.6h7.8v7.8H5.6zM10.4 5.6V2.6H2.6v7.8h3"/></symbol>
+<symbol id="vts-i-refresh" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M13.1 8.6A5.2 5.2 0 1 1 11.4 4"/><path d="M14.2 1.4v5H9.2z"/></symbol>
+<symbol id="vts-i-bolt" viewBox="0 0 16 16"><path d="M9.8.6 2.6 9.3h4.6L6.2 15.4l7.2-8.7H8.8z"/></symbol>
+<symbol id="vts-i-grip" viewBox="0 0 10 16"><path d="M2 2h2.2v2.2H2zm4 0h2.2v2.2H6zM2 6.9h2.2v2.2H2zm4 0h2.2v2.2H6zM2 11.8h2.2V14H2zm4 0h2.2V14H6z"/></symbol>
+<symbol id="vts-i-min" viewBox="0 0 16 16"><path d="M3 7.1h10v1.8H3z"/></symbol>
+<symbol id="vts-i-plus" viewBox="0 0 16 16"><path d="M7.1 3h1.8v4.1H13v1.8H8.9V13H7.1V8.9H3V7.1h4.1z"/></symbol>
+</svg>
+<header>
+  <svg class="i grip" aria-hidden="true"><use href="#vts-i-grip"/></svg>
+  <span class="brand"><svg class="i" aria-hidden="true"><use href="#vts-i-bolt"/></svg><b>VOLTRAK</b></span>
+  <span class="mini" data-vts="mini">
+    <b class="m-state"><span class="ti" aria-hidden="true"><svg class="i t-buy" aria-hidden="true"><use href="#vts-i-up"/></svg><svg class="i t-sell" aria-hidden="true"><use href="#vts-i-down"/></svg><svg class="i t-caution" aria-hidden="true"><use href="#vts-i-warn"/></svg><svg class="i t-wait" aria-hidden="true"><use href="#vts-i-pause"/></svg><svg class="i t-unk" aria-hidden="true"><use href="#vts-i-unk"/></svg></span><span data-vts="mini-state">No data</span></b>
+    <span class="m-read"><span class="m-sym" data-vts="mini-sym"></span><b class="m-share" data-vts="mini-share">—<small>no data</small></b></span>
+    <span class="m-since"><svg class="i" aria-hidden="true"><use href="#vts-i-clock"/></svg><span data-vts="mini-since">—</span></span>
+    <span class="m-text" data-vts="mini-text"></span>
+    <i class="m-bar empty" data-vts="mini-bar"></i>
+  </span>
+  <button class="hbtn" data-vts="collapse" title="Collapse to the scoreboard (Alt+V hides the panel)"><svg class="i ic-min" aria-hidden="true"><use href="#vts-i-min"/></svg><svg class="i ic-max" aria-hidden="true"><use href="#vts-i-plus"/></svg></button>
+</header>
+<nav class="tabs" data-vts="tabs"><button data-tab="live" class="on">Live</button><button data-tab="market">Market</button><button data-tab="calls">Calls<span class="badge" data-vts="calls-badge" hidden></span></button><button data-tab="settings">Settings</button></nav>
+<div class="vts-body">
+<section data-pane="live"><div data-vts="gmgn">
+  <div class="ident">
+    <div class="nm"><h3 data-vts="token">Open a Solana token</h3><span class="sym" data-vts="symbol"></span></div>
+    <div class="venue"><button class="mint" data-vts="mint-copy" title="Copy contract address" hidden><span data-vts="mint"></span><svg class="i" aria-hidden="true"><use href="#vts-i-copy"/></svg></button><span class="vtags" data-vts="venue"></span></div>
+  </div>
+  <div class="hero">
+    <div class="band"><span class="ti" aria-hidden="true"><svg class="i t-buy" aria-hidden="true"><use href="#vts-i-up"/></svg><svg class="i t-sell" aria-hidden="true"><use href="#vts-i-down"/></svg><svg class="i t-caution" aria-hidden="true"><use href="#vts-i-warn"/></svg><svg class="i t-wait" aria-hidden="true"><use href="#vts-i-pause"/></svg><svg class="i t-unk" aria-hidden="true"><use href="#vts-i-unk"/></svg></span><span class="bt"><span data-vts="state">Unknown</span><span class="sub"><b class="fresh" data-vts="fresh" hidden></b><span data-vts="momentum"></span><span data-vts="state-why" hidden></span></span></span><span class="clock" data-vts="clock" title="time since the alert"><span class="lbl">Since alert</span><b><svg class="i" aria-hidden="true"><use href="#vts-i-clock"/></svg><span data-vts="since">—</span></b></span></div>
+    <div class="score">
+      <span class="lbl">Buy share</span><span class="lbl r">vs call MC</span>
+      <b class="big na" data-vts="share">—</b><b class="big r na" data-vts="move">—</b>
+      <span class="hsub"><span class="side" data-vts="side" hidden></span></span><span class="hsub r" data-vts="mc-line">no call MC</span>
+      <div class="spark none" data-vts="share-spark" title="Buy share over the last 60s; dotted line = 50%"><div class="plot"><svg viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"><polygon class="ar" points=""/><line class="ref" x1="0" y1="12" x2="100" y2="12"/><polyline class="ln" points=""/></svg><i class="end"></i></div><span class="cap l"></span></div><div class="spark r none" data-vts="mc-spark" title="Market cap since the alert; dashed line = call MC"><div class="plot"><svg viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"><polygon class="ar" points=""/><line class="ref" x1="0" y1="12" x2="100" y2="12"/><polyline class="ln" points=""/></svg><i class="end"></i><span class="cap pk"></span></div><span class="cap cl"></span></div>
+    </div>
+    <div class="meter empty" data-vts="meter" role="meter" aria-label="Buy share" aria-valuemin="0" aria-valuemax="100"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="scale"><span class="b" data-vts="split-buy"></span><span data-vts="basis" title="">no data yet</span><span class="s" data-vts="split-sell"></span></div>
+  </div>
+  <div class="pair">
+    <div class="cell grade none" data-vts="grade" title="Setup grade from the backtest: how past calls with this setup did"><span class="lbl">Setup grade</span><div class="gb"><b class="gl" data-vts="grade-letter">—</b><span class="gt"><strong data-vts="grade-text">No similar calls yet</strong><span class="gn" data-vts="grade-note">needs 5+ calls</span></span></div></div>
+    <div class="cell bots na" data-vts="vol-bots" title="Share of 5m $ volume from wallets flagged as wash-trading bots"><span class="lbl">Volume bots</span><div class="bv"><b data-vts="bots-pct">—</b><span class="muted">of 5m vol</span><span class="tag" data-vts="bots-level">No data</span></div><div class="bar"><i data-vts="bots-bar"></i></div><small data-vts="bots-org">needs GMGN live trades</small></div>
+  </div>
+  <div class="kpis" data-vts="kpis"></div>
+  <div class="late-chips" data-vts="late-chips"></div>
+  <ul class="flags" data-vts="risks"></ul>
+  <div class="sect"><span class="lbl">Flow</span><span class="lbl" data-vts="flow-src">GMGN live</span></div>
+  <div class="flow" data-vts="metrics"></div>
+  <button class="strip" data-vts="market-strip" title="Open the Market tab"></button>
+  <div class="buttons two"><button data-vts="refresh"><svg class="i" aria-hidden="true"><use href="#vts-i-refresh"/></svg>Refresh</button><button data-vts="copy"><svg class="i" aria-hidden="true"><use href="#vts-i-copy"/></svg>Copy CA</button></div>
+  <p class="feed" data-vts="feed"></p>
+  <details><summary>Why this reading</summary><ul data-vts="reasons"></ul><p class="note" data-vts="missing"></p><p class="note">The state, gauge and grade are context, not buy or sell orders and not win probabilities. The backtest in the Calls tab shows what has actually worked.</p></details>
+  <details><summary>Recover initials <kbd>Alt+I</kbd></summary><p class="note">GMGN has <b>Sell inits</b> in its Instant Trade tools; place the sale there. Enter all amounts in one currency.</p>
+    <div class="grid2"><label><span class="lbl">Total buy cost</span><input data-vts="cost" type="number" min="0" step="any"></label><label><span class="lbl">Proceeds received</span><input data-vts="proceeds" type="number" min="0" step="any" value="0"></label><label><span class="lbl">Remaining bag value</span><input data-vts="bag" type="number" min="0" step="any"></label><label><span class="lbl">Fee / slippage %</span><input data-vts="fee" type="number" min="0" max="99" step="any" value="0"></label><label><span class="lbl">Fixed sale cost</span><input data-vts="fixed" type="number" min="0" step="any" value="0"></label></div>
+    <div class="buttons"><button data-vts="initials">Calculate</button></div><p class="result" data-vts="initials-result"></p><p class="note">Nothing is submitted by this script.</p></details>
+</div></section>
+<section data-pane="market" hidden>
+  <div class="mhead"><span class="lbl">pump.fun · market-wide</span><span class="pill" data-vts="market-status"></span></div>
+  <div class="mtop" data-vts="market-top"></div>
+  <div class="mkt" data-vts="market"></div>
+  <p class="note" data-vts="market-note"></p>
+</section>
+<section data-pane="calls" hidden>
+  <p class="recv" data-vts="discord" hidden><span data-vts="receiver"></span></p>
+  <div class="sect"><span class="lbl">Late checks</span><span class="lbl">+10 / +30 min</span></div>
+  <div data-vts="late"></div>
+  <div class="legend"><span><b class="gp buy">ABOVE</b> at or above the call price</span><span><b class="gp wait">BELOW</b> down 0–30%</span><span><b class="gp fade">DOWN</b> down 30%+</span><span><b class="gp dead">NO TRADES</b> none for 5 min</span></div>
+  <p class="note">What the price did, not a signal. The backtest report shows what buying at each check did on your past calls.</p>
+  <div class="sect"><span class="lbl">Saved calls</span></div>
+  <select data-vts="call-list"></select>
+  <div class="buttons two"><button data-vts="open">Open on GMGN</button><button data-vts="export">Export data</button></div>
+  <label class="field"><span class="lbl">Add a call · paste an alert or contract</span><span class="inline"><input data-vts="paste" placeholder="Contract or alert text"><button data-vts="import">Add</button></span></label>
+  <div class="sect"><span class="lbl">Backtest</span><span class="lbl">GeckoTerminal 1m</span></div>
+  <p class="note" data-vts="bt-help"></p>
+  <div class="buttons" data-vts="history-row" hidden><button data-vts="bt-history">Load channel history</button></div>
+  <label class="field"><span class="lbl">Buy at</span><select data-vts="bt-delay"><option value="0">The alert</option><option value="10">10 min after the alert</option><option value="30">30 min after the alert</option></select></label>
+  <div class="grid3 field"><label><span class="lbl">Target</span><span class="pct"><input data-vts="bt-tp" type="number" min="1" step="any"></span></label><label><span class="lbl">Stop loss</span><span class="pct"><input data-vts="bt-sl" type="number" min="1" max="99" step="any"></span></label><label><span class="lbl">Costs</span><span class="pct"><input data-vts="bt-cost" type="number" min="0" step="any"></span></label></div>
+  <div class="buttons two"><button class="primary" data-vts="bt-run">Score calls</button><button data-vts="bt-report">Open report</button></div>
+  <div class="buttons"><button data-vts="hb-run">Add volume bots to past calls (Helius)</button></div>
+  <div class="btp" data-vts="bt-progress"></div>
+  <p class="bt-status" data-vts="bt-status"></p>
+</section>
+<section data-pane="settings" hidden>
+  <div class="set">
+    <label class="check"><span><b>Market feed</b><small>PumpPortal public socket: pump.fun launches and graduations (its trade stream now needs a paid key)</small></span><input type="checkbox" data-vts="market-on"></label>
+    <label class="check"><span><b>GeckoTerminal fallback trades</b><small>Used when GMGN’s live feed is quiet</small></span><input type="checkbox" data-vts="trades"></label>
+    <label class="check"><span><b>Voice alert on Discord</b><small>Speaks the token name when a call arrives</small></span><input type="checkbox" data-vts="sound"></label>
+    <label class="check"><span><b>Alert when a call is still above its call price</b><small>Notification at +10 / +30 min. Not a buy signal; off by default</small></span><input type="checkbox" data-vts="late-alerts"></label>
+  </div>
+  <div class="sect"><span class="lbl">Data sources</span></div>
+  <p class="note">Live: GMGN’s own page feed (token_activity, token_stat), read-only; nothing is sent on GMGN’s connection. Fallbacks: DEX Screener snapshots and GeckoTerminal trades when the live feed is quiet.</p>
+  <p class="note">Market: PumpPortal’s public data socket (one connection, receiving GMGN tab only): launches and graduations. Volume bots: computed from GMGN’s live trades for the coin on screen.</p>
+  <div class="sect"><span class="lbl">Helius · optional</span></div>
+  <label class="field"><span class="lbl">Helius API key (or a full RPC URL)</span><span class="inline"><input data-vts="rpc-key" type="password" placeholder="free key from helius.dev" autocomplete="off" spellcheck="false"><button data-vts="rpc-save">Save</button></span></label>
+  <div class="buttons"><button data-vts="rpc-test">Test key</button></div>
+  <p class="note" data-vts="rpc-status">Lets the backtest add volume-bot readings to past calls (Calls → Backtest). Free plan: 1M credits a month; one past call uses about 10–300. The key stays in this browser.</p>
+  <div class="sect"><span class="lbl">Data check</span></div>
+  <p class="note" data-vts="census">GMGN feed: not seen yet in this tab.</p>
+  <div class="buttons"><button data-vts="census-copy">Copy GMGN feed report</button></div>
+  <p class="note">Shows which fields GMGN's live feed sends (for example whether it tags wash-trading wallets). Paste the report to Claude to improve the volume-bot reading. It contains public trade data only.</p>
+  <div class="sect"><span class="lbl">Keys</span></div>
+  <p class="note"><kbd>Alt+V</kbd> hides the panel · <kbd>Alt+I</kbd> opens Recover initials · drag the header to move it. No private keys or trading endpoints. Disable the old VolTrak script before using this one.</p>
+</section>
+</div>
+<footer class="foot"><span class="dot" data-vts="dot"></span><span class="st" data-vts="status"></span><span class="fg" data-vts="foot-gmgn"><label class="sw" title="Open new calls in this tab automatically"><input type="checkbox" data-vts="autoload" checked><span>Auto-open</span></label><button class="primary" data-vts="claim" title="Make this GMGN tab the one that receives calls">Use this tab for calls</button></span></footer>`;
 
 function start() {
   'use strict';
@@ -393,7 +1108,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.5.0';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.6.0';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -422,6 +1137,34 @@ function start() {
   // GMGN live state for the token on screen: trades seen (deduped by tx), GMGN's token_stat rollup, first/last message time.
   let live=null;
   const resetLive=mint=>{live={mint,since:Date.now(),first:0,at:0,stat:null,trades:[],keys:new Set(),prunedAt:Date.now()};};resetLive(current);
+  // Volume-bot readings per live call (receiver tab only): bot-like share of the first 60s and 120s after the alert,
+  // from GMGN's trades for that coin, saved as 'feat.<id>' so the backtest can test them once enough calls have one.
+  // complete = the feed was on this coin within 15s of the alert and stayed until the end of the window.
+  const packBots=(r,complete)=>({n:r.n,usd:Math.round(r.usd),share:r.botShare==null?null:+r.botShare.toFixed(1),tradeShare:r.botTradeShare==null?null:+r.botTradeShare.toFixed(1),
+    wallets:r.wallets,bots:r.botWallets,buyers:r.buyers,buyersNet:Math.round(r.buyersNet),arb:r.arb,suspect:r.suspectShare==null?null:+r.suspectShare.toFixed(1),
+    rules:[r.byRule.txWash,r.byRule.fastTrip,r.byRule.churn,r.byRule.micro],complete});
+  function recordBots(leaving=false){
+    if(!GMGN||!isReceiver||!live?.mint)return;
+    const now=Date.now();
+    for(const c of calls()){
+      if(c.historical||c.manual||c.mint!==live.mint||now<c.messageAt||now-c.messageAt>15*60000)continue;
+      const key='feat.'+c.id, f=get(key,null)||{t:c.messageAt};let changed=false;
+      for(const sec of [60,120]){
+        const end=c.messageAt+sec*1000;if(f['vb'+sec]||(now<end&&!leaving))continue;
+        // No feed for this coin yet: wait up to 30s past the window, then mark it missed. Feed started after the
+        // window closed: missed. Otherwise save what the feed saw (complete only if it started within 15s of the alert).
+        if(!live.first){if(leaving||now-end>30000){f['vb'+sec]={missed:true,complete:false};changed=true;}continue;}
+        if(live.first>end){f['vb'+sec]={missed:true,complete:false};changed=true;continue;}
+        const r=VTCore.botFlow(live.trades,c.messageAt,Math.min(end,now));
+        f['vb'+sec]=packBots(r,live.first<=c.messageAt+15000&&now>=end);changed=true;
+      }
+      if(!changed)continue;
+      set(key,f);
+      const ids=get('featIds',[]);if(!ids.includes(c.id)){ids.unshift(c.id);for(const old of ids.splice(1000))GM_deleteValue(PREFIX+'feat.'+old);set('featIds',ids);}
+    }
+  }
+  // Leaving a coin: save what was seen so far (marked incomplete) before its trades are dropped.
+  const switchLive=mint=>{try{recordBots(true);}catch(_){}resetLive(mint);};
   const tradeKey=t=>t.hash?t.hash+':'+t.side+':'+t.wallet+':'+t.amount:null;
   const liveFresh=()=>!!live&&live.mint===current&&Date.now()-live.at<20000;
   const liveNow=()=>live&&live.mint===current?VTCore.liveView(live.trades,live.stat,live.at,Date.now(),live.first||Infinity):null;
@@ -429,108 +1172,18 @@ function start() {
   const soon=()=>{if(renderQueued)return;renderQueued=true;setTimeout(()=>{renderQueued=false;render();},250);};
   try{if(typeof GM_listValues==='function'&&!get('cleaned',false)){for(const k of GM_listValues())if(k.startsWith(PREFIX+'mint-alert.'))GM_deleteValue(k);set('cleaned',true);}}catch(_){}
   const root=document.createElement('section'); root.id='vts-root';
-  root.innerHTML=`<style>
-  #vts-root{--bg:#0f151c;--card:#16202b;--line:#263243;--text:#e8eef6;--muted:#8d9bac;--green:#3ecf8e;--red:#f06b6d;--amber:#f2c45a;--blue:#5b8def;position:fixed;right:16px;bottom:16px;width:360px;max-width:calc(100vw - 24px);z-index:2147483647;color:var(--text);font:13px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);border:1px solid var(--line);border-radius:14px;box-shadow:0 10px 36px #000a;overflow:hidden}
-  #vts-root *{box-sizing:border-box}#vts-root [hidden]{display:none!important}
-  #vts-root header{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:grab;background:var(--card);border-bottom:1px solid var(--line)}
-  #vts-root .title{font-weight:700}#vts-root .mini{flex:1;text-align:right;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  #vts-root button,#vts-root input,#vts-root select{font:inherit;border:1px solid #33445a;border-radius:7px;background:#1b2735;color:var(--text);padding:6px 9px;max-width:100%}
-  #vts-root button{cursor:pointer}#vts-root button:hover{background:#243447}#vts-root button.primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}#vts-root header button{padding:2px 9px}
-  #vts-root .tabs{display:flex;background:var(--card);border-bottom:1px solid var(--line)}
-  #vts-root .tabs button{flex:1;border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--muted);padding:8px 4px;font-weight:600}
-  #vts-root .tabs button.on{color:var(--text);border-bottom-color:var(--blue)}
-  #vts-root .vts-body{padding:12px;max-height:min(72vh,640px);overflow:auto}
-  #vts-root .status{display:flex;gap:7px;align-items:baseline;color:var(--muted);font-size:11.5px;margin-bottom:10px}
-  #vts-root .dot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--muted)}#vts-root .dot.ok{background:var(--green)}#vts-root .dot.warn{background:var(--amber)}#vts-root .dot.bad{background:var(--red)}
-  #vts-root .claim{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-  #vts-root .head{display:flex;gap:8px;align-items:flex-start}#vts-root h3{flex:1;margin:0;font-size:17px;line-height:1.25;word-break:break-word}
-  #vts-root .chip{flex:none;padding:3px 9px;border-radius:999px;font-size:11.5px;font-weight:700;background:#2a3442;white-space:nowrap}
-  #vts-root .chip.buy{background:#123d2c;color:var(--green)}#vts-root .chip.sell{background:#40191b;color:var(--red)}#vts-root .chip.caution{background:#3d3214;color:var(--amber)}
-  #vts-root .mint{color:var(--muted);font:11px ui-monospace,Menlo,monospace;margin:3px 0 12px;word-break:break-all}
-  #vts-root .gaugehead{display:flex;justify-content:space-between;align-items:baseline}#vts-root .gaugehead b{font-size:22px}
-  #vts-root .gauge{height:10px;position:relative;background:linear-gradient(90deg,var(--red),#55606e 50%,var(--green));border-radius:6px;margin:6px 0 3px}
-  #vts-root .needle{height:18px;width:4px;background:#fff;border-radius:2px;position:absolute;top:-4px;margin-left:-2px;box-shadow:0 0 0 2px var(--bg)}
-  #vts-root .scale{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:10.5px}
-  #vts-root .tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:12px 0}
-  #vts-root .tile{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px 8px;min-width:0}
-  #vts-root .tile span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em}
-  #vts-root .tile b{display:block;font-size:13.5px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#vts-root .tile i{font-style:normal}
-  #vts-root .pos{color:var(--green)}#vts-root .neg{color:var(--red)}#vts-root .warnc{color:var(--amber)}#vts-root .muted{color:var(--muted)}
-  #vts-root ul{margin:6px 0;padding-left:18px}#vts-root li{margin:3px 0}#vts-root .flags li{color:var(--amber)}#vts-root .flags li.risk{color:var(--red)}
-  #vts-root .strip{display:flex;gap:4px 12px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin:8px 0;cursor:pointer}#vts-root .strip b{color:var(--text)}
-  #vts-root .buttons{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
-  #vts-root .note{color:var(--muted);font-size:11px;margin:6px 0}#vts-root p{margin:6px 0}
-  #vts-root details{border-top:1px solid var(--line);margin-top:10px;padding-top:8px}#vts-root summary{cursor:pointer;color:var(--muted);font-weight:600}
-  #vts-root label{display:block;font-size:11.5px;color:var(--muted);margin:6px 0}#vts-root label.check{display:flex;gap:7px;align-items:center;color:var(--text);font-size:12.5px}
-  #vts-root input,#vts-root select{width:100%}#vts-root input[type=checkbox]{width:auto;margin:0}
-  #vts-root .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}#vts-root .grid2{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-  #vts-root h4{margin:14px 0 4px;font-size:13px}#vts-root .row{display:flex;justify-content:space-between;gap:8px;align-items:baseline}
-  #vts-root .mkt{display:grid;grid-template-columns:minmax(0,1.35fr) repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:12px;margin:8px 0}
-  #vts-root .mkt>*{padding:6px 6px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  #vts-root .mkt .h{background:var(--card);color:var(--muted);font-weight:600}#vts-root .mkt .l{text-align:left;color:var(--muted)}
-  #vts-root .mkt.late{grid-template-columns:minmax(0,1.3fr) minmax(0,.6fr) repeat(2,minmax(0,1.05fr))}#vts-root .mkt.late>*{font-weight:600}#vts-root .mkt .go{text-align:left;color:var(--text);cursor:pointer}#vts-root .mkt .go:hover{text-decoration:underline}
-  </style>
-  <header><span class="title">VolTrak</span><span class="mini" data-vts="mini"></span><button data-vts="collapse" title="Collapse">−</button></header>
-  <nav class="tabs" data-vts="tabs"><button data-tab="live">Live</button><button data-tab="market">Market</button><button data-tab="calls">Calls</button><button data-tab="settings">Settings</button></nav>
-  <div class="vts-body">
-  <div class="status"><span class="dot" data-vts="dot"></span><span data-vts="status"></span></div>
-  <section data-pane="live"><div data-vts="gmgn">
-    <div class="claim"><button class="primary" data-vts="claim">Use this tab for calls</button><label class="check"><input data-vts="autoload" type="checkbox"> Auto-open new calls</label></div>
-    <div class="head"><h3 data-vts="token">Open a Solana token</h3><span class="chip" data-vts="state">UNKNOWN</span></div>
-    <div class="mint" data-vts="mint"></div>
-    <div class="gaugehead"><span class="muted">Buy share</span><b data-vts="share">—</b></div>
-    <div class="gauge"><span class="needle" data-vts="needle" hidden></span></div>
-    <div class="scale"><span>Sellers</span><span data-vts="basis"></span><span>Buyers</span></div>
-    <div class="tiles" data-vts="metrics"></div>
-    <ul class="flags" data-vts="risks"></ul>
-    <div class="strip" data-vts="market-strip" title="Open the Market tab"></div>
-    <div class="buttons"><button data-vts="refresh">Refresh</button><button data-vts="copy">Copy CA</button></div>
-    <p class="note" data-vts="feed"></p>
-    <details><summary>Why this reading</summary><ul data-vts="reasons"></ul><p class="note" data-vts="missing"></p><p class="note">The gauge and state are context, not buy/sell orders or probabilities. The backtest in the Calls tab shows what has actually worked.</p></details>
-    <details><summary>Recover initials (calculator)</summary><p class="note">GMGN has <b>Sell inits</b> in its Instant Trade tools; place the sale there. Enter all amounts in one currency.</p>
-      <div class="grid2"><label>Total buy cost<input data-vts="cost" type="number" min="0" step="any"></label><label>Proceeds received<input data-vts="proceeds" type="number" min="0" step="any" value="0"></label><label>Remaining bag value<input data-vts="bag" type="number" min="0" step="any"></label><label>Fee/slippage %<input data-vts="fee" type="number" min="0" max="99" step="any" value="0"></label><label>Fixed sale cost<input data-vts="fixed" type="number" min="0" step="any" value="0"></label></div>
-      <div class="buttons"><button data-vts="initials">Calculate</button></div><p data-vts="initials-result"></p><p class="note">Nothing is submitted by this script. Alt+I opens this calculator.</p></details>
-  </div></section>
-  <section data-pane="market" hidden>
-    <div class="row"><b>pump.fun, market-wide</b><span class="note" data-vts="market-status"></span></div>
-    <div class="mkt" data-vts="market"></div><p class="note" data-vts="market-note"></p>
-  </section>
-  <section data-pane="calls" hidden>
-    <p data-vts="discord"><span data-vts="receiver"></span></p>
-    <h4>Late checks: +10 and +30 min after each call</h4>
-    <div data-vts="late"></div>
-    <p class="note">BUY = at or above the call price and still trading · WAIT = down 0–30% · FADE = down 30%+ or a cluster ≥30% · DEAD = no trades for 5 min. An untested rule: the backtest report shows how each grade did on past calls.</p>
-    <label>Saved calls<select data-vts="call-list"></select></label>
-    <div class="buttons"><button data-vts="open">Open on GMGN</button><button data-vts="export">Export data</button></div>
-    <label>Add a call: paste an alert or a contract<input data-vts="paste" placeholder="Contract or alert text"></label><div class="buttons"><button data-vts="import">Add</button></div>
-    <h4>Backtest</h4><p class="note" data-vts="bt-help"></p>
-    <div class="buttons" data-vts="history-row"><button data-vts="bt-history">Load channel history</button></div>
-    <label>Buy at<select data-vts="bt-delay"><option value="0">The alert</option><option value="10">10 min after the alert</option><option value="30">30 min after the alert</option></select></label>
-    <div class="grid"><label>Target %<input data-vts="bt-tp" type="number" min="1" step="any"></label><label>Stop loss %<input data-vts="bt-sl" type="number" min="1" max="99" step="any"></label><label>Costs %<input data-vts="bt-cost" type="number" min="0" step="any"></label></div>
-    <div class="buttons"><button class="primary" data-vts="bt-run">Score calls</button><button data-vts="bt-report">Open report</button></div><p class="note" data-vts="bt-status"></p>
-  </section>
-  <section data-pane="settings" hidden>
-    <label class="check"><input type="checkbox" data-vts="market-on"> Market feed (PumpPortal)</label>
-    <label class="check"><input type="checkbox" data-vts="market-trades"> Include all pump.fun trades (volume, traders)</label>
-    <label class="check"><input type="checkbox" data-vts="trades"> GeckoTerminal fallback trade feed</label>
-    <label class="check"><input type="checkbox" data-vts="sound"> Voice alert on Discord</label>
-    <label class="check"><input type="checkbox" data-vts="late-alerts"> Alert when a late check grades BUY</label>
-    <h4>Data sources</h4>
-    <p class="note">Live: GMGN's own page feed (token_activity, token_stat), read-only; nothing is sent on GMGN's connection. Fallbacks: DEX Screener snapshots and GeckoTerminal trades when the live feed is quiet.</p>
-    <p class="note">Market: PumpPortal's public data socket (one connection, receiving GMGN tab only) for pump.fun launches, graduations and bonding-curve trades. PumpSwap trades after graduation are not in the free feed.</p>
-    <p class="note">No private keys or trading endpoints. Alt+V hides the panel; drag the header to move it. Disable the old VolTrak script before using this one.</p>
-  </section>
-  </div>`;
+  root.innerHTML='<style>'+PANEL_CSS+'</style>'+PANEL_HTML;
   document.body.appendChild(root);
   const $=key=>root.querySelector('[data-vts="'+key+'"]');
-  $('discord').hidden=!DISCORD; $('gmgn').hidden=!GMGN;
+  $('discord').hidden=!DISCORD; $('gmgn').hidden=!GMGN; $('foot-gmgn').hidden=!GMGN; $('history-row').hidden=!DISCORD;
+  root.dataset.site=GMGN?'gmgn':'discord';
   // Tabs: Live is GMGN-only; the last tab used is remembered per site.
   const tabKey='tab.'+(GMGN?'gmgn':'discord');
   root.querySelector('[data-tab="live"]').hidden=!GMGN;
   function showTab(name){
     if(name==='live'&&!GMGN||!root.querySelector('[data-pane="'+name+'"]'))name=GMGN?'live':'calls';
     root.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===name));
-    root.querySelectorAll('[data-pane]').forEach(p=>p.hidden=p.dataset.pane!==name);set(tabKey,name);
+    root.querySelectorAll('[data-pane]').forEach(p=>p.hidden=p.dataset.pane!==name);set(tabKey,name);root.dataset.tab=name;
   }
   root.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
   showTab(get(tabKey,GMGN?'live':'calls'));
@@ -538,64 +1191,197 @@ function start() {
   $('autoload').checked=get('autoload',true); $('sound').checked=get('sound',true); $('trades').checked=get('trades',true);
   $('autoload').onchange=()=>set('autoload',$('autoload').checked);
   $('sound').onchange=()=>set('sound',$('sound').checked);
-  $('late-alerts').checked=get('lateAlerts',true);$('late-alerts').onchange=()=>set('lateAlerts',$('late-alerts').checked);
+  $('late-alerts').checked=get('lateAlerts',false);$('late-alerts').onchange=()=>set('lateAlerts',$('late-alerts').checked);
   $('trades').onchange=()=>{set('trades',$('trades').checked);flow=null;flowError='';render();};
-  $('market-on').checked=get('marketOn',true); $('market-trades').checked=get('marketTrades',true);
+  $('market-on').checked=get('marketOn',true);
   $('market-on').onchange=()=>{set('marketOn',$('market-on').checked);marketDisconnect();render();};
-  $('market-trades').onchange=()=>{set('marketTrades',$('market-trades').checked);marketDisconnect();render();};
+  $('census-copy').onclick=()=>{GM_setClipboard(JSON.stringify({version:VERSION,site:location.hostname,...VTLive.census()},null,1),'text');notice('GMGN feed report copied: paste it to Claude');render();};
+  $('rpc-key').value=get('rpcKey','')?'••••'+String(get('rpcKey','')).slice(-4):'';
+  $('rpc-key').onfocus=()=>{if(/^••••/.test($('rpc-key').value))$('rpc-key').value='';};
+  $('rpc-save').onclick=()=>{const v=$('rpc-key').value.trim();if(/^••••/.test(v))return;set('rpcKey',v);$('rpc-key').value=v?'••••'+v.slice(-4):'';$('rpc-status').textContent=v?'Key saved. Press Test key.':'Key removed.';};
+  $('rpc-test').onclick=()=>testKey();
+  $('hb-run').onclick=()=>runBackfill();
+  $('mint-copy').onclick=()=>{if(current){GM_setClipboard(current,'text');notice('Contract copied');render();}};
   {const o=get('bt.opt',{tp:100,sl:-50,cost:3});$('bt-tp').value=o.tp;$('bt-sl').value=Math.abs(o.sl);$('bt-cost').value=o.cost;$('bt-delay').value=String(o.delay||0);}
-  $('collapse').onclick=()=>{const b=root.querySelector('.vts-body'),hide=!b.hidden;b.hidden=hide;$('tabs').hidden=hide;$('collapse').textContent=hide?'+':'−';};
+  // Collapsed = the header alone, as a scoreboard (state, buy share, time since the alert).
+  const setCollapsed=on=>{root.classList.toggle('vts-collapsed',on);set('collapsed',on);};
+  setCollapsed(get('collapsed',false));
+  $('collapse').onclick=()=>setCollapsed(!root.classList.contains('vts-collapsed'));
   let drag=null;
   root.querySelector('header').onpointerdown=e=>{if(e.target.closest('button'))return;const b=root.getBoundingClientRect();drag={x:e.clientX-b.left,y:e.clientY-b.top};e.currentTarget.setPointerCapture(e.pointerId);};
   root.querySelector('header').onpointermove=e=>{if(!drag)return;root.style.left=Math.max(0,Math.min(innerWidth-root.offsetWidth,e.clientX-drag.x))+'px';root.style.top=Math.max(0,Math.min(innerHeight-root.offsetHeight,e.clientY-drag.y))+'px';root.style.right='auto';root.style.bottom='auto';};
   root.querySelector('header').onpointerup=()=>{drag=null;};
   // e.code, not e.key: on macOS Option+V types "√", so e.key never equals "v".
-  document.addEventListener('keydown',e=>{if(!e.altKey||e.ctrlKey||e.metaKey)return;if(e.code==='KeyV'){root.hidden=!root.hidden;e.preventDefault();}if(GMGN&&e.code==='KeyI'){root.hidden=false;root.querySelector('.vts-body').hidden=false;$('tabs').hidden=false;showTab('live');$('initials').closest('details').open=true;e.preventDefault();}});
+  document.addEventListener('keydown',e=>{if(!e.altKey||e.ctrlKey||e.metaKey)return;if(e.code==='KeyV'){root.hidden=!root.hidden;e.preventDefault();}if(GMGN&&e.code==='KeyI'){root.hidden=false;setCollapsed(false);showTab('live');$('initials').closest('details').open=true;e.preventDefault();}});
   function listText(el,rows){el.replaceChildren(...rows.map(t=>{const li=document.createElement('li');li.textContent=t;return li;}));}
   const fmt=n=>n==null?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:1,notation:'compact'}).format(n);
-  const usd=n=>n==null?'—':'$'+fmt(n);
+  const usd=n=>n==null?'—':'$'+(Math.abs(n)<1000?Math.round(n):fmt(n));
   const ago=t=>t==null?'—':Math.max(0,Math.round((Date.now()-t)/1000))+'s ago';
   const freshFlow=()=>flow&&flow.mint===current&&Date.now()-flow.at<=30000?flow:null;
   let listSignature='';
+  // Display names for assess() states: they describe who is trading right now, not what to do.
+  const STATE_UI={'WATCH BUY SETUP':['buy','Buyers leading','Buyers'],'FADE / REVIEW EXIT':['sell','Sellers leading','Sellers'],'WAIT':['wait','No clear side','Even'],'CAUTION':['caution','Caution','Caution'],'UNKNOWN':['unknown','No data','No data']};
+  const sinceText=ms=>{if(!(ms>=0))return '—';const t=Math.floor(ms/1000),h=Math.floor(t/3600),m=Math.floor(t%3600/60),x=String(t%60).padStart(2,'0');return h>=48?'+'+Math.floor(h/24)+'d':h?'+'+h+':'+String(m).padStart(2,'0')+':'+x:'+'+m+':'+x;};
+  const mmss=ms=>{const t=Math.max(0,Math.ceil(ms/1000));return Math.floor(t/60)+':'+String(t%60).padStart(2,'0');};
+  const node=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;};
+  const signed=(v,d=0)=>(v>=0?'+':'−')+Math.abs(v).toLocaleString('en-US',{maximumFractionDigits:d,minimumFractionDigits:d});
+  // Trend lines: buy share over the last 60s and market cap since the alert, sampled while this token is on screen.
+  let sparkMint=null, shareHist=[], mcHist=[], mcSrc='', lastTone='', lastShown=null;
+  function drawSpark(el,pts,o){
+    const svg=el.querySelector('svg'), cap=el.querySelector('.cap.l'), pk=el.querySelector('.cap.pk'), cl=el.querySelector('.cap.cl');
+    if(cap)cap.textContent=o.cap||'';
+    el.classList.remove('pos','neg','mix');
+    if(pts.length<3){el.classList.add('none');if(pk)pk.textContent='';if(cl)cl.textContent='';return;}
+    el.classList.remove('none');if(o.cls)el.classList.add(o.cls);
+    const vs=pts.map(q=>q.v).concat(o.ref!=null?[o.ref]:[]), lo=o.lo??Math.min(...vs), hi=o.hi??Math.max(...vs), span=hi-lo||1, t0=pts[0].t, t1=Math.max(t0+1,pts[pts.length-1].t);
+    const X=t=>100*(t-t0)/(t1-t0), Y=v=>22-20*(v-lo)/span, line=pts.map(q=>X(q.t).toFixed(1)+','+Y(q.v).toFixed(1)).join(' ');
+    svg.querySelector('.ln').setAttribute('points',line);svg.querySelector('.ar').setAttribute('points',line+' 100,24 0,24');
+    const ry=o.ref!=null?Y(o.ref):12, ref=svg.querySelector('.ref');ref.setAttribute('y1',ry.toFixed(1));ref.setAttribute('y2',ry.toFixed(1));
+    const last=pts[pts.length-1];el.style.setProperty('--x',X(last.t).toFixed(1)+'%');el.style.setProperty('--y',(Y(last.v)/24*100).toFixed(1)+'%');
+    if(cl){cl.textContent=o.ref!=null?'CALL':'';el.style.setProperty('--cy',(ry/24*100).toFixed(1)+'%');}
+    if(pk){const top=pts.reduce((m,q)=>q.v>m.v?q:m,pts[0]);pk.textContent=o.peak?o.peak(top.v):'';el.style.setProperty('--px',Math.min(88,Math.max(12,X(top.t))).toFixed(1)+'%');}
+  }
+  function flash(){for(const e of [root.querySelector('.band'),root.querySelector('.m-state')]){if(!e)continue;e.classList.remove('flash');void e.offsetWidth;e.classList.add('flash');setTimeout(()=>e.classList.remove('flash'),1200);}}
+  // Late-check grade → chip/pill class and text.
+  const LATE_UI={ABOVE:['buy','ABOVE'],BELOW:['wait','BELOW'],DOWN30:['fade','DOWN'],NOTRADES:['dead','NO TRADES'],NOPRICE:['dead','NO PRICE']};
+  const lateCode=g=>VTCore.LATE_LEGACY[g]||g, lateView=L=>LATE_UI[lateCode(L.grade)]||['dead',String(L.grade)];
+  const lateQuiet=L=>['NOTRADES','NOPRICE'].includes(lateCode(L.grade));
+  // Setup checks (g1, from the first 22 calls): largest cluster under 30%, age at call 10 min+, MC at call $20K+.
+  function setupChecks(c){
+    if(!c)return null;
+    const cl=c.clusters?.length?Math.max(...c.clusters):null, age=c.ageSeconds==null?null:c.ageSeconds/60;
+    const checks=[['cluster',cl,v=>v<30,'largest cluster under 30%'],['age',age,v=>v>=10,'age at call 10 min+'],['mc',c.callMc,v=>v>=20000,'MC at call $20K+']];
+    const known=checks.filter(x=>x[1]!=null&&Number.isFinite(x[1]));
+    return {points:known.filter(x=>x[2](x[1])).length,known:known.length,hits:known.filter(x=>x[2](x[1])).map(x=>x[3]),misses:known.filter(x=>!x[2](x[1])).map(x=>x[3])};
+  }
+  function renderGrade(c){
+    const g=setupChecks(c), cell=$('grade');
+    cell.className='cell grade '+(g?'unproven':'none');
+    $('grade-letter').textContent=g?g.points+'/'+g.known:'—';
+    $('grade-text').textContent=g?g.points+' of '+g.known+' checks':'No call data';
+    $('grade-note').textContent=g?'untested':'needs a VolTrak call';
+    cell.title=g?'Setup checks from the first 22 calls (not proven): '+[...g.hits.map(x=>'✓ '+x),...g.misses.map(x=>'✗ '+x)].join(' · '):'Open a VolTrak call to see its setup checks';
+  }
+  function renderBots(now){
+    const cell=$('vol-bots'), on=live&&live.mint===current&&live.trades.length>0&&now-live.at<60000, vb=on?VTCore.botFlow(live.trades,now-300000,now):null;
+    if(!vb||!vb.n||vb.botShare==null){
+      cell.className='cell bots na';$('bots-pct').textContent='—';$('bots-level').textContent='No data';$('bots-level').className='tag';$('bots-bar').style.setProperty('--p','0%');
+      $('bots-org').textContent=on?'no trades in the last 5m':'needs GMGN live trades';cell.title='Volume bots need GMGN’s live trade feed for the coin on screen.';return null;
+    }
+    const sh=vb.botShare, lv=sh<15?['low','Low','']:sh<40?['med','Med','warn']:['high','High','bad'], partial=live.first>now-300000;
+    cell.className='cell bots '+lv[0];$('bots-pct').textContent=Math.round(sh)+'%';$('bots-level').textContent=lv[1];$('bots-level').className='tag'+(lv[2]?' '+lv[2]:'');
+    cell.querySelector('.bv .muted').textContent=partial?'of last '+mmss(now-live.first):'of 5m vol';
+    $('bots-bar').style.setProperty('--p',Math.min(100,sh).toFixed(0)+'%');
+    const org=$('bots-org');org.replaceChildren(node('b','',String(vb.buyers)),' real buyers'+(vb.buyersNet?' · '+(vb.buyersNet>=0?'+':'−')+usd(Math.abs(vb.buyersNet))+' net':''));
+    cell.title='Bot-like = buy+sell in one transaction ('+vb.byRule.txWash+' trades), flat buy-then-sell within 10s ('+vb.byRule.fastTrip+'), churn wallets ('+vb.byRule.churn+'), dust trades ('+vb.byRule.micro+'). '+vb.botWallets+' of '+vb.wallets+' wallets flagged'+(vb.arb?'; '+vb.arb+' arbitrage txs not counted':'')+'. Rough lower bound; untested as a signal.';
+    return vb;
+  }
   function render(){
     const all=calls().slice().sort((a,b)=>b.messageAt-a.messageAt), signature=all.map(c=>c.id).join('|');
     if(signature!==listSignature){const v=$('call-list').value;$('call-list').replaceChildren(...all.slice(0,100).map(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name+' · '+new Date(c.messageAt).toLocaleTimeString()+(c.historical?' · history':'');return o;}));if(all.some(c=>c.id===v))$('call-list').value=v;listSignature=signature;}
     renderMarket();renderBt();renderLate();
+    const nowAll=Date.now(), active=all.filter(c=>!c.historical&&!c.manual&&nowAll-c.messageAt<30*60000).length;
+    $('calls-badge').hidden=!active;$('calls-badge').textContent=active||'';
     $('status').textContent=(Date.now()<noteUntil?note+' · ':'')+status+(hasLocks?'':' · Web Locks unavailable: tab coordination is best effort');
+    const C=VTLive.census();$('census').textContent=GMGN?(C.frames?'GMGN feed: '+C.frames+' frames since '+new Date(C.since).toLocaleTimeString()+' · channels: '+Object.keys(C.channels).slice(0,8).join(', ')+' · trade fields: '+(C.keys.token_activity||[]).join(', '):'GMGN feed: no frames seen yet in this tab.'):'Open a GMGN token tab to run the data check there.';
     if(DISCORD){
       const alive=receiverAlive(receiver());
+      root.dataset.tone='unknown';
       $('dot').className='dot '+(alive?'ok':'warn');
-      $('receiver').textContent=alive?'✓ GMGN receiver connected: new calls open there automatically.':'No GMGN receiver: open a GMGN token page and press “Use this tab for calls”.';
-      $('mini').textContent=alive?'receiver connected':'no GMGN receiver';$('mini').className='mini '+(alive?'pos':'warnc');
+      $('receiver').textContent=alive?'GMGN receiver connected: new calls open there automatically.':'No GMGN receiver: open a GMGN token page and press “Use this tab for calls”.';
+      $('discord').className='recv'+(alive?' ok':'');
+      $('mini-text').textContent=alive?'receiver connected':'no GMGN receiver';$('mini-text').className='m-text '+(alive?'pos':'warnc');
       return;
     }
     const now=Date.now(), c=all.find(x=>x.mint===current)||null, f=freshFlow(), L=liveNow(), a=VTCore.assess(c,snapshot,now,fetchError,f,L);
     const Lf=L&&now-L.at<=15000?L:null, st=Lf?.stat&&now-Lf.stat.at<=15000?Lf.stat:null, lf=Lf?.flow||null;
+    const [tone,label,short]=STATE_UI[a.state]||STATE_UI.UNKNOWN;
+    if(lastShown!==null&&(tone!==lastTone||current!==lastShown))flash();
+    lastTone=tone;lastShown=current;root.dataset.tone=tone;
     $('dot').className='dot '+(Lf?'ok':snapshot||f?'warn':'bad');
-    $('claim').textContent=isReceiver?'✓ This tab receives calls':'Use this tab for calls';$('claim').className=isReceiver?'':'primary';
-    $('token').textContent=c?.name|| (current?'Token':'Open a Solana token');$('mint').textContent=current||'';
-    $('feed').textContent='Sources: '+(Lf?'GMGN live ('+ago(Lf.at)+')':VTLive.attachedAt()?'GMGN live waiting for this token':'GMGN live not connected')+' · '+(snapshot?'DEX Screener ('+ago(snapshot.at)+')':'DEX Screener: no pool yet')+(get('trades',true)&&!Lf?' · '+(flowError||(f?'GeckoTerminal ('+ago(f.at)+')':'GeckoTerminal starting')):'');
-    const tone=a.state==='WATCH BUY SETUP'?'buy':a.state==='FADE / REVIEW EXIT'?'sell':a.state==='CAUTION'?'caution':'', share=a.share==null?'—':Math.round(a.share)+'%';
-    $('state').textContent=a.state;$('state').className='chip '+tone;
-    $('share').textContent=share;$('share').className=a.share==null?'':a.share>=60?'pos':a.share<=40?'neg':'';
-    $('needle').hidden=a.share==null;if(a.share!=null)$('needle').style.left=Math.max(0,Math.min(100,a.share))+'%';
-    $('basis').textContent=a.basis||'no data yet';
-    $('mini').textContent=current?a.state+(a.share==null?'':' · '+share+' buys'):'';$('mini').className='mini '+({buy:'pos',sell:'neg',caution:'warnc'}[tone]||'');
-    const w1=st?.m1||lf?.m1||f?.m1, wallets=lf||f, part=w=>w.complete?'':'+', last=Lf?.last, mc=Lf?.marketCap??snapshot?.marketCap, move=mc>0&&c?.callMc>0?(mc/c.callMc-1)*100:null;
-    const split=(x,y)=>[[x,'pos'],[' / ',''],[y,'neg']];
-    const tiles=[['1m buys / sells',w1?split(w1.buys??'—',w1.sells??'—'):'—'],['1m buy $ / sell $',w1?split(usd(w1.buyUsd),usd(w1.sellUsd)):'—'],
-      ['5m buys / sells',st?split(st.m5.buys??'—',st.m5.sells??'—'):snapshot?split(snapshot.buys5m??'—',snapshot.sells5m??'—'):'—'],['5m / 1h volume',st?usd(st.m5.volume)+' / '+usd(st.h1.volume):usd(snapshot?.volume5m)+' / '+usd(snapshot?.volume1h)],
-      ['Wallets 1m / 5m',wallets?wallets.m1.wallets+part(wallets.m1)+' / '+wallets.m5.wallets+part(wallets.m5):'—'],['Last trade',last?[[last.side+' '+usd(last.usd),last.side==='buy'?'pos':'neg'],[' · '+ago(last.at),'muted']]:f?ago(f.lastTradeAt):'—'],
-      ['Market cap',mc?[[usd(mc),''],...(move==null?[]:[[' '+(move>=0?'+':'')+move.toFixed(0)+'% vs call',move>=0?'pos':'neg']])]:'—'],['Call MC',usd(c?.callMc)],
-      ['Liquidity',usd(snapshot?.liquidity)],['Main pool',snapshot?(snapshot.dex||'DEX')+(snapshot.pools>1?' +'+(snapshot.pools-1)+' more':''):'—'],
-      ['At call',c?.migrated==null?'—':c.migrated?'Migrated':'Bonding curve'],['Largest cluster',c?.clusters?.length?Math.max(...c.clusters)+'%':'—']];
-    $('metrics').replaceChildren(...tiles.map(([k,v])=>{
-      const d=document.createElement('div'),l=document.createElement('span'),r=document.createElement('b');d.className='tile';l.textContent=k;
-      if(Array.isArray(v))v.forEach(([t,cls])=>{const i=document.createElement('i');if(cls)i.className=cls;i.textContent=t;r.append(i);});else r.textContent=v;
-      r.title=r.textContent;d.append(l,r);return d;}));
-    const item=(t,cls)=>{const li=document.createElement('li');if(cls)li.className=cls;li.textContent=t;return li;};
-    $('risks').replaceChildren(...a.risks.map(t=>item(t,'risk')),...a.flags.map(t=>item(t,'')));
-    listText($('reasons'),a.reasons);$('missing').textContent=a.missing.length?'Missing: '+a.missing.join(' · '):'';
+    $('claim').hidden=isReceiver;
+    // Identity.
+    $('token').textContent=c?.name||(current?'Token':'Open a Solana token');$('token').title=c?.name||'';
+    $('symbol').textContent=c?.symbol?'$'+c.symbol:'';
+    $('mint').textContent=current?current.slice(0,4)+'…'+current.slice(-4):'';$('mint-copy').hidden=!current;$('mint-copy').title=current?current+' · click to copy':'';
+    const pool=snapshot?.dex?({pumpfun:'pump.fun',pumpswap:'PumpSwap',raydium:'Raydium',meteora:'Meteora'}[snapshot.dex]||snapshot.dex):null;
+    $('venue').replaceChildren(...[pool&&[pool+(snapshot.pools>1?' +'+(snapshot.pools-1):''),''],c?.migrated!=null&&[c.migrated?'Migrated':'Bonding curve',''],c&&!c.historical&&!c.manual&&['Call '+new Date(c.messageAt).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}),'dash']].filter(Boolean).map(([t,cls])=>node('span','tag'+(cls?' '+cls:''),t)));
+    // State band.
+    $('state').textContent=label;
+    const fr=$('fresh'), fs=Lf?['LIVE '+Math.max(0,Math.round((now-Lf.at)/1000))+'s','']:snapshot?['DEX '+Math.max(0,Math.round((now-snapshot.at)/1000))+'s','stale']:f?['GECKO '+Math.max(0,Math.round((now-f.at)/1000))+'s','stale']:current?['NO FEED','off']:null;
+    fr.hidden=!fs;if(fs){fr.textContent=fs[0];fr.className='fresh'+(fs[1]?' '+fs[1]:'');}
+    const why=a.state==='CAUTION'&&a.risks.length?a.risks[0]+(a.risks.length>1?' · +'+(a.risks.length-1)+' more':''):'';
+    $('state-why').hidden=!why;$('state-why').textContent=why;$('state-why').title=a.risks.join(' · ');
+    $('momentum').hidden=!!why;$('momentum').textContent=a.momentum!=null?'price '+a.momentumWindow+' '+(a.momentum>=0?'▲ +':'▼ ')+Math.abs(a.momentum).toFixed(1)+'%':'';
+    $('since').textContent=c?sinceText(now-c.messageAt):'—';$('clock').title=c?'Alert at '+new Date(c.messageAt).toLocaleTimeString()+' · time since the alert':'Time since the alert';
+    // Decision numbers: buy share and move vs the call's market cap, each with a trend line.
+    if(sparkMint!==current){sparkMint=current;shareHist=[];mcHist=[];mcSrc='';}
+    const share=a.share, mc=Lf?.marketCap??snapshot?.marketCap, move=mc>0&&c?.callMc>0?(mc/c.callMc-1)*100:null;
+    // One price source per trend line: live and DEX market caps can differ, so a source switch restarts the line.
+    const mcFrom=Lf?.marketCap?'live':'dex';if(mc>0&&mcFrom!==mcSrc){mcSrc=mcFrom;mcHist=[];}
+    if(share!=null&&(!shareHist.length||now-shareHist[shareHist.length-1].t>=2000))shareHist.push({t:now,v:share});
+    shareHist=shareHist.filter(q=>now-q.t<=60000);
+    if(mc>0&&(!mcHist.length||now-mcHist[mcHist.length-1].t>=5000)){mcHist.push({t:now,v:mc});if(mcHist.length>360)mcHist=mcHist.filter((_,i)=>i%2===0||i===mcHist.length-1);}
+    const sh=$('share');sh.className='big'+(share==null?' na':share>=60?' pos':share<=40?' neg':'');sh.replaceChildren(...(share==null?['—']:[String(Math.round(share)),node('small','','%')]));
+    const side=$('side');side.hidden=share==null;side.textContent=share>=60?'▲ Buy side':share<=40?'▼ Sell side':'≈ Mixed';side.className='side'+(share>=60?' pos':share<=40?' neg':'');
+    const mv=$('move');mv.className='big r'+(move==null?' na':move>=0?' pos up':' neg down')+(move!=null&&Math.abs(move)>=1000?' long':'');mv.replaceChildren(...(move==null?['—']:[signed(move),node('small','','%')]));
+    $('mc-line').replaceChildren(...(mc>0&&c?.callMc>0?[node('b','',usd(mc)),' from '+usd(c.callMc)]:mc>0?['MC ',node('b','',usd(mc))]:['no call MC']));
+    drawSpark($('share-spark'),shareHist,{lo:0,hi:100,ref:50,cls:share>=60?'pos':share<=40?'neg':'mix',cap:shareHist.length>=3?'60s':Lf?'60s · filling':'60s · needs live trades'});
+    drawSpark($('mc-spark'),mcHist,{ref:c?.callMc>0?c.callMc:null,cls:move==null?'mix':move>=0?'pos':'neg',peak:v=>c?.callMc>0?'peak '+signed((v/c.callMc-1)*100)+'%':''});
+    // Meter: 20 cells, one per 5% of buy share.
+    const meter=$('meter');meter.classList.toggle('empty',share==null);[...meter.children].forEach((e,i)=>e.classList.toggle('on',share!=null&&i<Math.round(share/5)));
+    if(share==null)meter.removeAttribute('aria-valuenow');else meter.setAttribute('aria-valuenow',String(Math.round(share)));
+    const w1=st?.m1||lf?.m1||f?.m1, dexOnly=a.basis?.startsWith('DEX');
+    $('split-buy').textContent=dexOnly&&snapshot?'▲ '+snapshot.buys5m+' buys':w1?'▲ '+(w1.buys??'—')+' buys · '+usd(w1.buyUsd):'';
+    $('split-sell').textContent=dexOnly&&snapshot?snapshot.sells5m+' sells ▼':w1?usd(w1.sellUsd)+' · '+(w1.sells??'—')+' sells ▼':'';
+    $('basis').textContent=a.basis||'no data yet';$('basis').title=a.basis?'Buy share basis: '+a.basis:'';
+    renderGrade(c);
+    const vb=renderBots(now);
+    // KPIs.
+    const wl=lf||f, part=w=>w.complete?'':'+', last=Lf?.last, lastAt=last?.at??f?.lastTradeAt, cl=c?.clusters?.length?Math.max(...c.clusters):null;
+    const kpi=(lbl,val,sub,cls,icon)=>{const d=node('div','kpi'+(cls==='na'?' na':'')),b=node('b',cls&&cls!=='na'?cls:'');if(icon){b.append(node('span','',icon))}b.append(val);d.append(node('span','lbl',lbl),b,typeof sub==='string'?node('small','',sub):sub);return d;};
+    const lastSub=node('small');if(last){lastSub.append(node('span',last.side==='buy'?'pos':'neg',last.side==='buy'?'▲':'▼'),' '+last.side+' '+usd(last.usd));}else lastSub.textContent=lastAt?'GeckoTerminal':'no trades seen';
+    $('kpis').replaceChildren(
+      wl?kpi('Wallets 1m',wl.m1.wallets+part(wl.m1),wl.m5.wallets+part(wl.m5)+' in 5m'):kpi('Wallets 1m','—','no live feed','na'),
+      cl==null?kpi('Top cluster','—','not in alert','na'):kpi('Top cluster',(cl>=10?Math.round(cl):cl.toFixed(1))+'%',cl>=30?'high: review':'largest at call',cl>=30?'warnc':'',cl>=30?'⚠ ':''),
+      lastAt?kpi('Last trade',Math.max(0,Math.round((now-lastAt)/1000))+'s',lastSub,now-lastAt>30000?'warnc':''):kpi('Last trade','—','no trades seen','na'));
+    // Late checks for this call.
+    const lateAll=get('late',{}), chips=[];
+    if(c&&!c.historical&&!c.manual)for(const d of LATE_AT){
+      const Lc=lateAll[c.id]?.[d], due=c.messageAt+d*60000, ch=node('div','lc');ch.append(node('span','lbl','+'+d+' min'));
+      if(Lc?.grade){const [k,t]=lateView(Lc);ch.className='lc g-'+k;ch.append(node('b','v',t+(Lc.change==null||lateQuiet(Lc)?'':' '+signed(Lc.change)+'%')));}
+      else if(Lc?.missed||now>due+5*60000)ch.className='lc pend',ch.append(node('b','v muted','missed'));
+      else{ch.className='lc pend';ch.append(node('b','v',now<due?'in '+mmss(due-now):'checking…'));const pr=node('i','prog');pr.style.setProperty('--p',Math.min(100,100*(now-c.messageAt)/(d*60000)).toFixed(0)+'%');ch.append(pr);}
+      chips.push(ch);
+    }
+    $('late-chips').replaceChildren(...chips);
+    $('risks').replaceChildren(...a.risks.map(t=>node('li','risk',t)),...a.flags.map(t=>node('li','',t)));
+    // Flow table: 1m and 5m from the best live source.
+    const m5=st?.m5||lf?.m5||null, cells=[];
+    const add=(cls,t,plus)=>{const e=node('span',cls,t);if(plus)e.append(node('sup','','+'));cells.push(e);};
+    const shr=w=>w&&(w.buyUsd||0)+(w.sellUsd||0)>0?100*(w.buyUsd||0)/((w.buyUsd||0)+(w.sellUsd||0)):null;
+    const bar=(v,plus)=>{const e=node('span');if(v==null){e.textContent='—';}else{const i=node('i','rb');i.style.setProperty('--p',v.toFixed(0)+'%');e.append(i,Math.round(v)+'%');if(plus)e.append(node('sup','','+'));}cells.push(e);};
+    add('h l','Window');add('h','1m');add('h','5m');
+    add('l','▲ Buys');add('',w1?.buys??'—',w1&&w1.complete===false);add('',m5?.buys??snapshot?.buys5m??'—',m5&&m5.complete===false);
+    add('l','▼ Sells');add('',w1?.sells??'—',w1&&w1.complete===false);add('',m5?.sells??snapshot?.sells5m??'—',m5&&m5.complete===false);
+    add('l','Buy share $');bar(shr(w1),w1&&w1.complete===false);bar(shr(m5),m5&&m5.complete===false);
+    add('l','Wallets');add('',wl?wl.m1.wallets:'—',wl&&!wl.m1.complete);add('',wl?wl.m5.wallets:'—',wl&&!wl.m5.complete);
+    add('l','Volume');add('',usd(st?.m1.volume??(w1?(w1.buyUsd||0)+(w1.sellUsd||0):null)));add('',usd(st?.m5.volume??(m5?(m5.buyUsd||0)+(m5.sellUsd||0):snapshot?.volume5m)));
+    const ft=node('span','ft');for(const [k,v] of [['Liquidity',usd(snapshot?.liquidity)],['1h vol',usd(st?.h1?.volume??snapshot?.volume1h)],['Pool',pool||'—']]){const x=node('span','',k+' ');x.append(node('b','',v));ft.append(x);}
+    cells.push(ft);$('metrics').replaceChildren(...cells);
+    $('flow-src').textContent=st||lf?'GMGN live':f?'GeckoTerminal + DEX':snapshot?'DEX Screener':'no data';
+    // Sources line.
+    const src=(ok,t)=>{const e=node('span');e.append(node('i','dot '+ok),t);return e;};
+    $('feed').replaceChildren(src(Lf?'ok':VTLive.attachedAt()?'warn':'bad',Lf?'GMGN live '+Math.max(0,Math.round((now-Lf.at)/1000))+'s ago':VTLive.attachedAt()?'GMGN live waiting':'GMGN live not connected'),
+      src(snapshot?'ok':'warn',snapshot?'DEX Screener '+Math.max(0,Math.round((now-snapshot.at)/1000))+'s ago':'DEX Screener: no pool yet'),
+      ...(get('trades',true)&&!Lf?[src(f?'ok':flowError?'bad':'warn',flowError||(f?'GeckoTerminal '+Math.max(0,Math.round((now-f.at)/1000))+'s ago':'GeckoTerminal starting'))]:[]));
+    listText($('reasons'),[...a.reasons,...(vb?['Volume bots: '+Math.round(vb.botShare)+'% of '+(live.first>now-300000?'recent':'5m')+' $ volume from '+vb.botWallets+' flagged wallets (rough lower bound; untested as a signal)']:[])]);
+    $('missing').textContent=a.missing.length?'Missing: '+a.missing.join(' · '):'';
+    // Collapsed scoreboard.
+    $('mini-state').textContent=short;$('mini-sym').textContent=c?.symbol?'$'+c.symbol:current?current.slice(0,4)+'…':'';
+    $('mini-share').replaceChildren(...(share==null?['—',node('small','','no data')]:[Math.round(share)+'%',node('small','','buys')]));
+    $('mini-since').textContent=c?sinceText(now-c.messageAt):'—';
+    const mb=$('mini-bar');mb.classList.toggle('empty',share==null);if(share!=null)mb.style.setProperty('--p',share.toFixed(0)+'%');
   }
   async function addCall(call){
     const key=call.manual?'manual':'calls', cap=call.manual?100:2000;
@@ -617,17 +1403,17 @@ function start() {
   // Market-wide pump.fun activity from PumpPortal's public data socket. Only the receiving GMGN tab connects (one socket);
   // it shares a snapshot every 10s so the Discord tab can show it too.
   const PP='wss://pumpportal.fun/api/data', SOL='So11111111111111111111111111111111111111112', tape=VTCore.marketTape();
-  let pp=null, ppStatus='off', ppSince=0, ppTries=0, ppNext=0, ppTrades=0, solUsd=null, solAt=0, solTry=0, lastSnap=0;
+  let pp=null, ppStatus='off', ppSince=0, ppTries=0, ppNext=0, ppTrades=0, ppMsgs=0, ppErr='', ppLast='', ppClose=null, solUsd=null, solAt=0, solTry=0, lastSnap=0;
   function marketConnect(){
     if(pp||Date.now()<ppNext)return;
-    let ws;try{ws=new WebSocket(PP);}catch(_){ppStatus='blocked by this page';ppNext=Date.now()+60000;return;}
-    pp=ws;ppStatus='connecting';
-    ws.addEventListener('open',()=>{if(pp!==ws)return;ppStatus='connected';ppSince=Date.now();ppTries=0;
-      ws.send(JSON.stringify({method:'subscribeNewToken'}));ws.send(JSON.stringify({method:'subscribeMigration'}));
-      if(get('marketTrades',true))ws.send(JSON.stringify({method:'subscribeTokenTrade',keys:[]}));});
-    ws.addEventListener('message',e=>{if(pp!==ws)return;const ev=VTCore.ppEvent(e.data);if(ev.kind==='trade')ppTrades++;tape.add(ev,Date.now());});
-    ws.addEventListener('error',()=>{if(pp===ws)ppStatus='connection failed (blocked or offline)';});
-    ws.addEventListener('close',()=>{if(pp!==ws)return;pp=null;ppTries=Math.min(ppTries+1,5);ppNext=Date.now()+2000*2**ppTries;ppStatus='reconnecting';});
+    // Free events only: launches and graduations. PumpPortal's trade stream needs a funded API key (since May 2026).
+    let ws;try{ws=new WebSocket(PP);}catch(e){ppStatus='blocked by this page';ppErr=String(e?.message||e).slice(0,80);ppNext=Date.now()+60000;return;}
+    pp=ws;ppStatus='connecting';let opened=false;
+    ws.addEventListener('open',()=>{if(pp!==ws)return;opened=true;ppStatus='connected';ppSince=Date.now();ppTries=0;
+      ws.send(JSON.stringify({method:'subscribeNewToken'}));ws.send(JSON.stringify({method:'subscribeMigration'}));});
+    ws.addEventListener('message',e=>{if(pp!==ws)return;ppMsgs++;const ev=VTCore.ppEvent(e.data);if(ev.kind==='trade')ppTrades++;else if(ev.kind==='other'&&typeof e.data==='string')ppLast=e.data.slice(0,80);tape.add(ev,Date.now());});
+    ws.addEventListener('error',()=>{if(pp===ws)ppStatus=opened?'connection error':'blocked by this page or offline';});
+    ws.addEventListener('close',e=>{if(pp!==ws)return;pp=null;ppClose=e.code;ppTries=Math.min(ppTries+1,5);ppNext=Date.now()+2000*2**ppTries;ppStatus=opened?'reconnecting':'blocked by this page or offline';});
   }
   function marketDisconnect(){const ws=pp;pp=null;ppStatus='off';ppSince=0;ppNext=0;if(ws)try{ws.close();}catch(_){}}
   async function refreshSol(){
@@ -635,28 +1421,34 @@ function start() {
     solTry=Date.now();const r=await http(DEX+SOL), pair=VTCore.selectPair(Array.isArray(r.data)?r.data:null,SOL,null);
     if(pair){solUsd=VTCore.number(pair.priceUsd);solAt=Date.now();}
   }
-  const marketView=()=>({at:Date.now(),status:ppStatus,since:ppSince,trades:ppTrades>0,windows:tape.windows(Date.now(),ppSince||Date.now(),solUsd)});
+  const marketView=()=>({at:Date.now(),status:ppStatus,since:ppSince,trades:ppTrades>0,msgs:ppMsgs,windows:tape.windows(Date.now(),ppSince||Date.now(),solUsd)});
   function renderMarket(){
     const on=get('marketOn',true), own=GMGN&&isReceiver&&on, m=own?marketView():get('marketSnap',null), fresh=on&&!!m&&Date.now()-m.at<30000&&!!m.since;
-    $('market-status').textContent=!on?'off':own?ppStatus+(ppSince?' · listening '+Math.floor((Date.now()-ppSince)/60000)+'m':''):fresh?'via the receiving GMGN tab':'';
+    const pill=$('market-status'), mins=m?.since?Math.floor((Date.now()-m.since)/60000):0;
+    pill.className='pill '+(!on?'':fresh?'ok':/blocked|error|offline/.test(own?ppStatus:'')?'bad':'warn');
+    pill.textContent=!on?'off':own?ppStatus+(ppSince?' · '+mins+'m · '+ppMsgs+' msgs':'')+(ppClose&&!ppSince?' · code '+ppClose:''):fresh?'via receiver · '+mins+'m':'no receiver';
     if(!fresh){
-      $('market').replaceChildren();$('market-strip').replaceChildren();
-      $('market-note').textContent=!on?'The market feed is off (Settings).':own?'Connecting to PumpPortal…':'Market numbers come from the receiving GMGN tab: open a GMGN token page and press “Use this tab for calls”.';
+      $('market').replaceChildren();$('market-top').replaceChildren();$('market-strip').replaceChildren();
+      $('market-note').textContent=!on?'The market feed is off (Settings).':own?(/blocked/.test(ppStatus)?'This page blocked the PumpPortal connection'+(ppErr?' ('+ppErr+')':'')+'. Launches and graduations are unavailable here.':'Connecting to PumpPortal…'+(ppLast?' Last message: '+ppLast:'')):'Market numbers come from the receiving GMGN tab: open a GMGN token page and press “Use this tab for calls”.';
       return;
     }
-    const W=m.windows, mins=[1,5,10,30], plus=k=>W[k].complete?'':'+', cells=[];
-    const add=(cls,t)=>{const e=document.createElement('span');if(cls)e.className=cls;e.textContent=t;cells.push(e);};
-    add('h l','Last');mins.forEach(k=>add('h',k+'m'));
-    const line=(label,val)=>{add('l',label);mins.forEach(k=>add('',val(W[k])+plus(k)));};
-    const vol=w=>w.usd!=null?usd(w.usd):fmt(w.sol)+' SOL';
+    const W=m.windows, cols=[1,5,10,30], plus=k=>W[k].complete?'':'+', span=(cls,t,sup)=>{const e=document.createElement('span');if(cls)e.className=cls;e.textContent=t;if(sup){const x=document.createElement('sup');x.textContent='+';e.append(x);}return e;};
+    // Pace: the 5m per-minute rate vs the 30m average (both partial while listening is shorter).
+    // Pace needs a baseline: shown once the feed has listened for 10+ minutes.
+    const pace=k=>{if(mins<10)return ['pace after 10m','muted'];const a=W[5][k]/5, base=W[30][k]/Math.min(30,mins);if(!(base>0))return ['—','muted'];const r=a/base;return [(r>1.15?'▲ ':r<0.87?'▼ ':'≈ ')+r.toFixed(1)+'× pace',r>1.15?'pos':r<0.87?'neg':'muted'];};
+    const kpi=(label,val,[sub,cls])=>{const d=document.createElement('div'),l=document.createElement('span'),b=document.createElement('b'),sm=document.createElement('small');d.className='kpi';l.className='lbl';l.textContent=label;b.textContent=val;sm.textContent=sub;sm.className=cls;d.append(l,b,sm);return d;};
+    $('market-top').replaceChildren(kpi('Grads 5m',W[5].migrations+plus(5),pace('migrations')),kpi('Launches 5m',W[5].creates+plus(5),pace('creates')),kpi('Grad rate 30m',W[30].creates?(100*W[30].migrations/W[30].creates).toFixed(1)+'%':'—',['grads per launch','muted']));
+    const cells=[span('h l','Last'),...cols.map(k=>span('h'+(k===5?' hl':''),k+'m'))];
+    const line=(label,val)=>{cells.push(span('l',label));cols.forEach(k=>cells.push(span(k===5?'hl':'',String(val(W[k])),!W[k].complete)));};
     line('Graduated',w=>w.migrations);line('Launches',w=>w.creates);
-    if(m.trades){line('Volume',vol);line('Traders',w=>fmt(w.traders));line('Per token',w=>w.tokens?(w.traders/w.tokens).toFixed(1):'—');}
+    const short=n=>new Intl.NumberFormat('en-US',{maximumFractionDigits:0,notation:'compact'}).format(n);
+    if(m.trades){line('Volume',w=>w.usd!=null?'$'+short(w.usd):short(w.sol)+' SOL');line('Traders',w=>short(w.traders));}
     $('market').replaceChildren(...cells);
-    $('market-note').textContent=(m.trades?'Volume and traders: pump.fun bonding-curve trades only; per token = average traders per traded token. ':get('marketTrades',true)?'No trade data yet: PumpPortal may not stream all trades for free. ':'')+'"+" = still filling (listening for less than that window).';
-    const strip=[['Graduated 5m',W[5].migrations+plus(5)],['30m',W[30].migrations+plus(30)]];
-    if(m.trades)strip.push(['Traders 5m',fmt(W[5].traders)+plus(5)],['Volume 5m',vol(W[5])+plus(5)]);
-    $('market-strip').replaceChildren(...strip.map(([k,v])=>{const s=document.createElement('span'),b=document.createElement('b');s.append(k+' ');b.textContent=v;s.append(b);return s;}));
+    $('market-note').textContent='Pace = 5m per-minute rate vs the 30m average: ▲ above 1.15×, ▼ below 0.87×. "+" = still filling (listening for less than that window). Free feed: launches and graduations only.';
+    const strip=[['Grad',W[5].migrations+plus(5)],['Launch',W[5].creates+plus(5)],['Grad 30m',W[30].migrations+plus(30)]];
+    $('market-strip').replaceChildren(...strip.map(([k,v])=>{const e=document.createElement('span'),b=document.createElement('b');e.append(k+' ');b.textContent=v;e.append(b);return e;}));
   }
+
   // Backtest: score saved calls against GeckoTerminal 1m candles. Candles are cached per call, so changing the
   // target, stop or costs re-scores instantly without refetching.
   const BT_H=120, LATE_AT=[10,30], BT_DELAYS=[0,...LATE_AT], sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -696,11 +1488,18 @@ function start() {
     const done=get('bt.done',{}), all=btCandidates(), ok=all.filter(c=>done[c.id]==='ok').length, none=all.filter(c=>done[c.id]&&done[c.id]!=='ok').length;
     const young=all.filter(c=>!done[c.id]&&Date.now()-c.messageAt<=(BT_H+5)*60000).length, left=all.length-ok-none-young;
     const oldest=all.reduce((m,c)=>Math.min(m,c.messageAt),Infinity), when=t=>new Date(t).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
-    $('bt-run').textContent=btRunning?'Stop':'Score calls';$('bt-history').textContent=histRunning?'Stop loading':'Load channel history';
+    $('bt-run').textContent=btRunning?'Stop':'Score calls';$('hb-run').textContent=hbRunning?'Stop adding volume bots':'Add volume bots to past calls (Helius)';$('bt-history').textContent=histRunning?'Stop loading':'Load channel history';
     $('history-row').hidden=!DISCORD;
+    // Progress bar: scored / no price data / waiting / too recent.
+    const parts=[['ok',ok,'scored'],['none',none,'no price data'],['left',left,'waiting'],['young',young,'too recent']].filter(x=>x[1]>0);
+    if(parts.length){
+      const bar=document.createElement('div'),keys=document.createElement('div');bar.className='bar';keys.className='keys';
+      for(const [k,n,t] of parts){const i=document.createElement('i');i.className=k;i.style.setProperty('--n',String(n));bar.append(i);const sp=document.createElement('span'),b=document.createElement('b');sp.className='k '+k;b.textContent=n;sp.append(b,' '+t);keys.append(sp);}
+      $('bt-progress').replaceChildren(bar,keys);
+    }else $('bt-progress').replaceChildren();
     $('bt-help').textContent=DISCORD?'1) Load channel history: scrolls the VolTrak channel back for you and saves every alert. 2) Score calls: fetches 2h of 1m prices per call from GeckoTerminal (about 7–10s per call; slows down automatically if GeckoTerminal rate-limits; you can stop and resume). 3) Open report.'
       :'Open the VolTrak channel in Discord and press "Load channel history" there first. Then score calls (about 7–10s per call; stop and resume any time).';
-    $('bt-status').textContent=[histNote,btNote].filter(Boolean).join(' · ')+(histNote||btNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+': '+ok+' scored, '+none+' without price data, '+left+' waiting to be scored, '+young+' too recent (under '+(BT_H+5)+' min old).';
+    $('bt-status').textContent=[histNote,btNote,hbNote].filter(Boolean).join(' · ')+(histNote||btNote||hbNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+'. Calls under '+(BT_H+5)+' min old wait until their 2h window is complete.';
   }
   // Discord: load older messages by scrolling the channel to the top until Discord stops loading more.
   // scan() saves every VolTrak alert as it renders, so this only drives the scrolling.
@@ -770,17 +1569,17 @@ function start() {
             if(cc!==c)continue;
             const base=L.base?.mc||c.callMc, change=base>0?(s.marketCap/base-1)*100:null;
             const traded=s.buys5m==null&&s.sells5m==null?true:(s.buys5m||0)+(s.sells5m||0)>0;
-            const grade=VTCore.lateGrade(change,traded,c.clusters?.length?Math.max(...c.clusters):null);
-            L[d]={at,mc:s.marketCap,change,traded,grade};if(grade==='BUY')fresh.push([c,d,change]);
+            const grade=VTCore.lateGrade(change,traded);
+            L[d]={at,mc:s.marketCap,change,traded,grade,rule:2};if(grade==='ABOVE')fresh.push([c,d,change]);
           }
         }
       }
       set('late',late);
-      if(!get('lateAlerts',true))return;
+      if(!get('lateAlerts',false))return;
       for(const [c,d,change] of fresh){
-        GM_notification({title:'VolTrak +'+d+' min · '+c.name,text:'Late check: BUY grade ('+(change>=0?'+':'')+change.toFixed(0)+'% vs the call, still trading). Click to open on GMGN.',timeout:15000,
+        GM_notification({title:'VolTrak +'+d+' min · '+c.name,text:'Still above the call price ('+(change>=0?'+':'')+change.toFixed(0)+'%) and trading. Not a buy signal: see the backtest report. Click to open on GMGN.',timeout:15000,
           onclick:()=>GMGN?openToken(c.mint):GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true})});
-        say('VolTrak. '+c.name+'. '+d+' minute check: buy grade.');
+        say('VolTrak. '+c.name+'. '+d+' minute check: above call price.');
       }
     });}finally{lateBusy=false;}
   }
@@ -789,8 +1588,8 @@ function start() {
     const late=get('late',{}), now=Date.now(), list=calls().filter(c=>!c.historical&&!c.manual).sort((a,b)=>b.messageAt-a.messageAt).slice(0,20);
     const cell=(c,d)=>{
       const L=late[c.id]?.[d], due=c.messageAt+d*60000;
-      if(L?.grade)return [L.grade+(L.change==null||L.grade==='DEAD'?'':' '+(L.change>=0?'+':'')+L.change.toFixed(0)+'%'),{BUY:'pos',WAIT:'warnc',FADE:'neg'}[L.grade]||'muted'];
-      return [L?.missed||now>due+5*60000?'missed':now<due?'in '+Math.ceil((due-now)/60000)+'m':'checking…','muted'];
+      if(L?.grade){const [k,t]=lateView(L);return [t+(L.change==null||lateQuiet(L)?'':' '+(L.change>=0?'+':'−')+Math.abs(L.change).toFixed(0)+'%'),k];}
+      return [L?.missed||now>due+5*60000?'missed':now<due?'in '+Math.ceil((due-now)/60000)+'m':'checking…',null];
     };
     const age=t=>{const m=Math.floor((now-t)/60000);return m<60?m+'m':m<2880?Math.floor(m/60)+'h':Math.floor(m/1440)+'d';};
     const data=list.map(c=>[c,age(c.messageAt),...LATE_AT.map(d=>cell(c,d))]);
@@ -800,10 +1599,68 @@ function start() {
     const add=(text,cls,go)=>{const d=document.createElement('span');d.textContent=text;if(cls)d.className=cls;if(go){d.title='Open on GMGN';d.onclick=go;}box.append(d);};
     ['Call','Age',...LATE_AT.map(d=>'+'+d+' min')].forEach((h,i)=>add(h,'h'+(i<2?' l':'')));
     for(const [c,time,...cells] of data){
-      add(c.name,'go',()=>GMGN?(VTCore.mintFromURL(location.href)!==c.mint&&openToken(c.mint)):GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true}));add(time,'l');
-      for(const [t,cls] of cells)add(t,cls);
+      add(c.name,'go',()=>GMGN?(VTCore.mintFromURL(location.href)!==c.mint&&openToken(c.mint)):GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true}));add(time,'l muted');
+      // Graded cells are pills (class gp + grade); pending/missed cells are muted text.
+      for(const [t,k] of cells){if(!k){add(t,'pend');continue;}const d=document.createElement('span'),b=document.createElement('b');b.className='gp '+k;b.textContent=t;d.append(b);box.append(d);}
     }
     $('late').replaceChildren(box);
+  }
+  // Helius (optional, the user's own key): every trade around each past call's alert, for volume-bot readings on
+  // history. getTransactionsForAddress pages through all successful transactions touching the mint in a time window.
+  const rpcUrl=()=>{const k=String(get('rpcKey','')||'').trim();return !k?null:/^https:\/\//i.test(k)?k:'https://mainnet.helius-rpc.com/?api-key='+encodeURIComponent(k);};
+  function rpcCall(method,params){
+    const url=rpcUrl();if(!url)return Promise.resolve({status:0,error:'no key'});
+    return new Promise(resolve=>GM_xmlhttpRequest({method:'POST',url,headers:{'Content-Type':'application/json',Accept:'application/json'},data:JSON.stringify({jsonrpc:'2.0',id:'vt',method,params}),timeout:25000,
+      onload:r=>{let d=null;try{d=JSON.parse(r.responseText);}catch(_){}resolve({status:r.status,data:d,error:d?.error?.message||(r.status!==200?'HTTP '+r.status:null)});},
+      onerror:()=>resolve({status:0,error:'network error'}),ontimeout:()=>resolve({status:0,error:'timeout'})}));
+  }
+  async function txWindow(mint,from,to,maxPages=40){
+    const txs=[];let token=null,pages=0;
+    do{
+      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:0,filters:{blockTime:{gte:from,lte:to},status:'succeeded'}};
+      if(token)opt.paginationToken=token;
+      let r=await rpcCall('getTransactionsForAddress',[mint,opt]);
+      if(r.status===429){await sleep(2500);r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
+      if(r.error)return {txs,pages,error:r.error};
+      const res=r.data?.result, list=Array.isArray(res)?res:Array.isArray(res?.data)?res.data:Array.isArray(res?.transactions)?res.transactions:[];
+      // Items are {transaction, meta, blockTime}; some providers nest them one level deeper.
+      txs.push(...list.map(x=>x?.meta?x:x?.transaction?.meta?{...x.transaction,blockTime:x.transaction.blockTime??x.blockTime}:x));
+      token=res?.paginationToken||null;pages++;await sleep(120);
+    }while(token&&pages<maxPages);
+    return {txs,pages,truncated:!!token};
+  }
+  async function backfillOne(c){
+    const t=Math.floor(c.messageAt/1000), w=await txWindow(c.mint,t-300,t+180);
+    if(w.error&&!w.txs.length)return {err:w.error};
+    const rows=w.txs.flatMap(tx=>VTCore.txTrades(tx,c.mint,solUsd));
+    const pre=VTCore.botFlow(rows,c.messageAt-300000,c.messageAt), post=VTCore.botFlow(rows,c.messageAt,c.messageAt+120000);
+    return {pre:packBots(pre,!w.truncated),post:packBots(post,!w.truncated),txs:w.txs.length,trades:rows.length,pages:w.pages,truncated:!!w.truncated,err:w.error||null};
+  }
+  async function testKey(){
+    const st=$('rpc-status');if(!rpcUrl()){st.textContent='Add a key first.';return;}
+    st.textContent='Testing…';await refreshSol();
+    const c=btCandidates().filter(x=>Date.now()-x.messageAt>10*60000).sort((a,b)=>b.messageAt-a.messageAt)[0];
+    if(!c){const r=await rpcCall('getSlot',[]);st.textContent=r.error?'Key error: '+r.error:'Key works (no past call to test the trade history on yet).';return;}
+    const r=await backfillOne(c);
+    st.textContent=r.err?'Key error on '+c.name+': '+r.err+(/method|not (found|supported)/i.test(r.err)?' · this plan may not include getTransactionsForAddress':''):'Works: '+c.name+' · '+r.txs+' transactions → '+r.trades+' trades'+(r.truncated?' (window cut short)':'')+' · bots before the alert '+(r.pre.share??'—')+'%, first 2 min '+(r.post.share??'—')+'%';
+  }
+  let hbRunning=false,hbStop=false,hbNote='';
+  async function runBackfill(){
+    if(hbRunning){hbStop=true;hbNote='Stopping…';renderBt();return;}
+    if(!rpcUrl()){hbNote='Add a Helius key in Settings first';renderBt();return;}
+    hbRunning=true;hbStop=false;
+    try{
+      await refreshSol();
+      const done=get('bt.done',{}), todo=btCandidates().filter(c=>done[c.id]==='ok'&&!get('hb.'+c.id,null)).sort((a,b)=>b.messageAt-a.messageAt);
+      if(!todo.length){hbNote='Volume bots: every scored call already has a reading';return;}
+      for(let i=0;i<todo.length&&!hbStop;i++){
+        hbNote='Volume bots: '+(i+1)+' of '+todo.length;renderBt();
+        const r=await backfillOne(todo[i]);
+        if(r.err&&r.pre==null){hbNote='Helius error: '+r.err+' (stopped; nothing was charged for failed calls)';return;}
+        set('hb.'+todo[i].id,{...r,at:Date.now()});
+      }
+      hbNote=hbStop?'Volume bots: stopped; run again to continue':'Volume bots added: open the report';
+    }finally{hbRunning=false;hbStop=false;renderBt();}
   }
   function openReport(){
     const tp=Math.max(1,+$('bt-tp').value||100), sl=-Math.min(99,Math.abs(+$('bt-sl').value||50)), cost=Math.max(0,+$('bt-cost').value||0);
@@ -817,13 +1674,13 @@ function start() {
       for(const d of BT_DELAYS)by[d]=VTCore.scoreCall(cs,c.messageAt,{tp,sl,horizon:BT_H,delay:d});
       if(by[0].status!=='scored'){noData++;continue;}
       // The live late check, replayed: price vs the alert entry and any swap in the 5 min before the check.
-      const late={}, cl=c.clusters?.length?Math.max(...c.clusters):null;
-      for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t+60000>at-300000&&k.t<at),cl);}
-      rows.push({call:c,by,late});
+      const late={};
+      for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t+60000>at-300000&&k.t<at));}
+      rows.push({call:c,by,late,hb:get('hb.'+c.id,null),ft:get('feat.'+c.id,null)});
     }
     const scored=d=>rows.filter(r=>r.by[d].status==='scored');
     const entries=BT_DELAYS.map(d=>({delay:d,dead:rows.length-scored(d).length,...VTCore.summarize(scored(d).map(r=>r.by[d]),cost)}));
-    const grades=LATE_AT.flatMap(d=>['BUY','WAIT','FADE','DEAD'].map(g=>{const all=rows.filter(r=>r.late[d]===g), sc=all.filter(r=>r.by[d].status==='scored');
+    const grades=LATE_AT.flatMap(d=>['ABOVE','BELOW','DOWN30','NOTRADES','NOPRICE'].map(g=>{const all=rows.filter(r=>r.late[d]===g), sc=all.filter(r=>r.by[d].status==='scored');
       return {delay:d,grade:g,total:all.length,...VTCore.summarize(sc.map(r=>r.by[d]),cost)};}).filter(x=>x.total));
     const items=scored(delay).map(r=>({call:r.call,score:r.by[delay]}));
     showReport(VTCore.backtestReport(items,cost),items,{tp,sl,cost,noData,delay,entries,grades,rows});
@@ -844,11 +1701,13 @@ function start() {
       // blank when the coin had no trades at that time.
       const later=BT_DELAYS.filter(d=>d), f=v=>v==null?null:v.toFixed(1);
       const cols=['name','symbol','mint','alert_time','call_mc','age_min','largest_cluster','bot_share','fresh_share','top_holder','holders','outcome','trade_return','peak','peak_min','trough','r5','r10','r15','r30','r60',
-        ...later.flatMap(d=>['grade','outcome','trade_return','peak','peak_min','r15','r60'].map(x=>'buy'+d+'_'+x))];
+        ...later.flatMap(d=>['grade','outcome','trade_return','peak','peak_min','r15','r60'].map(x=>'buy'+d+'_'+x)),
+        'bots_pre_share','bots_pre_wallets','bots_pre_buyers','bots_2m_share','bots_2m_wallets','bots_2m_buyers','bots_trades','bots_truncated','live_bots_60s','live_bots_120s','live_buyers_120s','live_bots_complete'];
       const q=v=>v==null?'':/[",\n]/.test(String(v))?'"'+String(v).replace(/"/g,'""')+'"':String(v);
-      const lines=o.rows.map(({call:c,by,late})=>{const s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
+      const lines=o.rows.map(({call:c,by,late,hb,ft})=>{const s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
         c.holders>0&&c.bots!=null?(100*c.bots/c.holders).toFixed(1):null,c.holders>0&&c.fresh!=null?(100*c.fresh/c.holders).toFixed(1):null,c.topHolder,c.holders,s.outcome,f(s.ret),f(s.peakPct),f(s.peakMin),f(s.troughPct),f(s.r5),f(s.r10),f(s.r15),f(s.r30),f(s.r60),
-        ...later.flatMap(d=>{const x=by[d];return [late[d],...(x.status==='scored'?[x.outcome,f(x.ret),f(x.peakPct),f(x.peakMin),f(x.r15),f(x.r60)]:[null,null,null,null,null,null])];})].map(q).join(',');});
+        ...later.flatMap(d=>{const x=by[d];return [late[d],...(x.status==='scored'?[x.outcome,f(x.ret),f(x.peakPct),f(x.peakMin),f(x.r15),f(x.r60)]:[null,null,null,null,null,null])];}),
+        hb?.pre?.share,hb?.pre?.bots,hb?.pre?.buyers,hb?.post?.share,hb?.post?.bots,hb?.post?.buyers,hb?.trades,hb?hb.truncated:null,ft?.vb60?.share,ft?.vb120?.share,ft?.vb120?.buyers,ft?.vb120?ft.vb120.complete:null].map(q).join(',');});
       const url=URL.createObjectURL(new Blob([[cols.join(','),...lines].join('\n')],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='voltrak-backtest-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     };
     const a=rep.all, t=rep.timing;
@@ -883,21 +1742,32 @@ function start() {
     table('Buy at',o.entries.map(e=>[[e.delay?'+'+e.delay+' min':'Alert',String(e.n),rate(e),pct(e.ev),pct(e.medianPeak),
       [e.delay===o.delay?'this report':'',e.dead?e.dead+' dead by then':''].filter(Boolean).join(' · ')],e.delay===o.delay?'':'#9aa7b6']));
     box.append(el('p','margin:4px 0 12px;color:'+C.muted,'"Dead" = no trades within 5 min of the entry time, so there was nothing to buy. Change "Buy at" in the Calls tab to see the splits below for another entry time.'));
-    // Late-check grades replayed on past calls: does BUY at +10/+30 beat the rest?
-    box.append(el('h3','margin:4px 0 4px;font-size:14px','Late-check grades: buying at the check, by grade'));
-    table('Grade',o.grades.map(g=>[['+'+g.delay+' min '+g.grade,String(g.n),rate(g),pct(g.ev),pct(g.medianPeak),g.total>g.n?(g.total-g.n)+' had nothing to buy':''],'']));
-    box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Same rule as the live check in the Calls tab: BUY = at or above the alert price and traded in the last 5 min; WAIT = down 0–'+(-VTCore.LATE.fade)+'%; FADE = down '+(-VTCore.LATE.fade)+'%+ or a cluster ≥'+VTCore.LATE.cluster+'%; DEAD = no trades for 5 min. The grade is only useful if BUY clearly beats the other rows once there are enough calls.'));
+    // Late checks replayed on past calls: what buying at +10/+30 did, by where the price was at the check.
+    box.append(el('h3','margin:4px 0 4px;font-size:14px','Late checks: buying at the check, by where the price was'));
+    const gName={ABOVE:'above call',BELOW:'below call (0 to −30%)',DOWN30:'down 30%+',NOTRADES:'no trades',NOPRICE:'no price'};
+    table('At the check',o.grades.map(g=>[['+'+g.delay+' min · '+gName[g.grade],String(g.n),rate(g),pct(g.ev),pct(g.medianPeak),g.total>g.n?(g.total-g.n)+' had nothing to buy':''],'']));
+    box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Same check as the Calls tab: price at +10/+30 min vs the alert price (down '+(-VTCore.LATE.down)+'%+ is its own group); "no trades" = nothing traded in the 5 min before the check. These are descriptions, not signals: a group is only worth acting on if its average stays above zero on new calls.'));
+    // Volume bots on past calls: Helius backfill, or the live GMGN reading saved when the call arrived.
+    const preR=o.rows.filter(r=>r.hb?.pre?.n>0), postR=o.rows.filter(r=>r.hb?.post?.n>0||r.ft?.vb120?.n>0);
+    if(preR.length||postR.length){
+      box.append(el('h3','margin:4px 0 4px;font-size:14px','Volume bots on past calls'));
+      const bands=['under 20%','20–40%','40%+'], band=v=>v==null?null:v<20?bands[0]:v<40?bands[1]:bands[2];
+      const split=(list,val,d)=>bands.map(b=>{const sc=list.filter(r=>band(val(r))===b&&r.by[d].status==='scored').map(r=>r.by[d]), x=VTCore.summarize(sc,o.cost);return [[b,String(x.n),rate(x),pct(x.ev),pct(x.medianPeak),''],''];}).filter(x=>x[0][1]!=='0');
+      if(preR.length){box.append(el('p','margin:4px 0;color:'+C.muted,'Bot-like share of $ volume in the 5 min before the alert → buying at the alert ('+preR.length+' calls with a reading):'));table('Bots before alert',split(preR,r=>r.hb.pre.share,0));}
+      if(postR.length){box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Bot-like share in the first 2 min after the alert → buying at +10 min, when that reading is already known ('+postR.length+' calls):'));table('Bots first 2 min',split(postR,r=>(r.hb?.post?.n>0?r.hb.post:r.ft.vb120).share,10));}
+      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Bot-like = a buy and a sell in one transaction, a flat buy-then-sell within 10s, churn wallets, or dust trades. A rough lower bound from wallet behaviour; exploratory until about 100 calls have a reading.'));
+    }
     // Per-call view, last in the report because it is long.
     const eachCall=()=>{
       box.append(el('h3','margin:16px 0 4px;font-size:14px','Each call at +10 and +30 min (newest first)'));
-      const tb=el('table','border-collapse:collapse;width:100%;max-width:900px;table-layout:fixed'), gc={BUY:C.green,WAIT:C.amber,FADE:C.red}, oc={win:C.green,loss:C.red}, cg=el('colgroup');
+      const tb=el('table','border-collapse:collapse;width:100%;max-width:900px;table-layout:fixed'), gc={ABOVE:C.green,BELOW:C.amber,DOWN30:C.red}, oc={win:C.green,loss:C.red}, cg=el('colgroup');
       ['28%',...LATE_AT.flatMap(()=>['14%','22%'])].forEach(w=>{const c=el('col');c.style.width=w;cg.append(c);});tb.append(cg);
       const hr=el('tr');['Call',...LATE_AT.flatMap(d=>['+'+d+' check','Bought at +'+d])].forEach(h=>hr.append(el('th','text-align:left;color:'+C.muted+';font-weight:600;padding:4px 8px;border-bottom:1px solid '+C.line,h)));tb.append(hr);
       const td=(text,color)=>el('td','padding:4px 8px;border-bottom:1px solid #1b2531;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'+(color?';color:'+color:''),text);
       for(const r of o.rows.slice().sort((x,y)=>y.call.messageAt-x.call.messageAt).slice(0,100)){
         const tr=el('tr');tr.append(td(r.call.name+' · '+new Date(r.call.messageAt).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})));
         for(const d of LATE_AT){
-          const s=r.by[d];tr.append(td(r.late[d]==='DEAD'?'DEAD':r.late[d]+' '+pct(r.by[0]['r'+d]),gc[r.late[d]]||C.muted));
+          const s=r.by[d];tr.append(td(['NOTRADES','NOPRICE'].includes(r.late[d])?gName[r.late[d]]:pct(r.by[0]['r'+d])+' · '+gName[r.late[d]].split(' (')[0],gc[r.late[d]]||C.muted));
           tr.append(td(s.status!=='scored'?'—':s.outcome+' '+pct(s.ret)+' · peak '+pct(s.peakPct),oc[s.outcome]||C.muted));
         }
         tb.append(tr);
@@ -1031,7 +1901,7 @@ function start() {
     VTLive.on(frame=>{
       const now=Date.now(), pageMint=VTCore.mintFromURL(location.href);
       if(!pageMint)return;
-      if(live.mint!==pageMint)resetLive(pageMint);
+      if(live.mint!==pageMint)switchLive(pageMint);
       let changed=false;
       for(const x of frame.items){
         // Only the token on screen. Rows without an address are trusted once the page has been on its token for 3s.
@@ -1053,7 +1923,7 @@ function start() {
       if(ticking)return;ticking=true;
       try{
         const next=VTCore.mintFromURL(location.href);
-        if(next!==lastMint){lastMint=next;current=next;snapshot=null;flow=null;gtPools={};fetchError='';flowError='';lastResponse=0;lastFlow=0;if(live.mint!==next)resetLive(next);}
+        if(next!==lastMint){lastMint=next;current=next;snapshot=null;flow=null;gtPools={};fetchError='';flowError='';lastResponse=0;lastFlow=0;if(live.mint!==next)switchLive(next);}
         if(Date.now()-lastBeat>=5000){lastBeat=Date.now();isReceiver=await ownReceiver();}
         status=(isReceiver?'Receiving calls':'Display only: another GMGN tab receives calls')+' · '+(liveFresh()?'live from GMGN':'fallback data');
         if(isReceiver)receiveLatest();
@@ -1061,7 +1931,7 @@ function start() {
           marketConnect();refreshSol();
           if(Date.now()-lastSnap>=10000){lastSnap=Date.now();tape.prune(lastSnap);if(ppSince)set('marketSnap',marketView());}
         }else if(pp)marketDisconnect();
-        poll();pollFlow();render();
+        recordBots();poll();pollFlow();render();
       }finally{ticking=false;}
     }
     // Short delay lets a duplicated tab learn it needs a fresh ID before it can act as the receiver.

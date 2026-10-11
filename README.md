@@ -42,6 +42,27 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 `voltrak-steroids.user.js` is a Tampermonkey userscript for Discord and GMGN. It reads new VolTrak calls in Discord and loads them in one GMGN "receiver" tab. There it shows free DEX Screener snapshots and 1m trade flow from GeckoTerminal. It is for analysis only: it never submits trades.
 
+## 3.6.0 changes
+
+- **New panel design:**
+  - A state band with a since-alert clock, plus two big numbers: buy share and move vs the call MC, each with a trend line.
+  - A 20-cell buy/sell meter, KPI tiles, +10/+30 countdown chips, a 1m/5m flow table, and a footer that stays visible.
+  - A collapsed "scoreboard" header (state · $SYMBOL · buy share · clock).
+  - States are worded as descriptions: Buyers leading / Sellers leading / No clear side / Caution.
+- **Volume bots (live, GMGN tab):** the share of the last 5 minutes' $ volume coming from wash-trading wallets, plus the count of real buyers. Wallets are flagged for:
+  - a buy and a sell in one transaction
+  - a flat buy-then-sell within 10 s
+  - churn wallets
+  - dust trades
+
+  Arbitrage across pools, profitable flips and repeated preset buys are not flagged. Each new call saves a 60 s and a 120 s reading, so the backtest can test it later.
+- **Helius (optional):** paste a Helius API key (the free plan works) in Settings, then press "Add volume bots to past calls". This reads every trade from 5 minutes before to 3 minutes after each past alert. The report and CSV gain volume-bot splits (`bots_pre_*`, `bots_2m_*`).
+- **Late checks reworded:** ABOVE / BELOW / DOWN 30%+ / NO TRADES. They describe the price; they are not BUY/FADE verdicts. On 95 past calls, no late-check group made money. Notifications are now off by default and say "not a buy signal".
+- **Market tab:** launches and graduations with pace vs the 30-minute average, and connection diagnostics. PumpPortal's trade stream now needs a funded API key, so the script no longer asks for it.
+- **Data checks:**
+  - "Copy GMGN feed report" (Settings) lists the fields GMGN's live feed sends.
+  - On Photon (tinyastro.io), a "VolTrak: copy Photon report" button records the shape of Photon's data, with tokens and keys redacted. This is the first step toward showing Photon's volume-bot number in the GMGN panel.
+
 ## 3.5.0 changes
 
 - **Late checks (Calls tab):** 10 and 30 min after each new call, the script reads DEX Screener once and grades the call: BUY (at or above the call price and still trading), WAIT (down 0–30%), FADE (down 30% or more, or a cluster of 30% or more) or DEAD (no trades for 5 min). The last 20 calls are listed with both grades, and a BUY grade sends a notification (it can be turned off in Settings). The rule is untested until the backtest says otherwise.
