@@ -42,6 +42,13 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 `voltrak-steroids.user.js` is a Tampermonkey userscript for Discord and GMGN. It reads new VolTrak calls in Discord and loads them in one GMGN "receiver" tab. There it shows free DEX Screener snapshots and 1m trade flow from GeckoTerminal. It is for analysis only: it never submits trades.
 
+## 3.5.0 changes
+
+- **Late checks (Calls tab):** 10 and 30 min after each new call, the script reads DEX Screener once and grades the call: BUY (at or above the call price and still trading), WAIT (down 0–30%), FADE (down 30% or more, or a cluster of 30% or more) or DEAD (no trades for 5 min). The last 20 calls are listed with both grades, and a BUY grade sends a notification (it can be turned off in Settings). The rule is untested until the backtest says otherwise.
+- **Backtest "Buy at":** scores buying at the alert, at +10 min or at +30 min from the same cached candles, with no new requests. The report compares the three entry times, shows how each late-check grade did on past calls, and lists every call's +10/+30 grade next to the result of buying then.
+- The CSV adds `r10`, `r30` and, for +10 and +30, `buyN_grade`, `buyN_outcome`, `buyN_trade_return`, `buyN_peak`, `buyN_peak_min`, `buyN_r15` and `buyN_r60`.
+- 3.4.1: GeckoTerminal pacing adapts after a rate limit (60s pause, then slower), and the GMGN tab's GeckoTerminal fallback stays quiet while scoring runs.
+
 ## 3.4.0 changes
 
 - **Load channel history (Calls tab, Discord):** scrolls the VolTrak channel back to its start for you, saving every alert as it loads, so the backtest has hundreds of calls to score instead of only the ones that arrived since install.

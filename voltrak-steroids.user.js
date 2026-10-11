@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VolTrak Steroids
 // @namespace    voltrak-alert
-// @version      3.4.1
+// @version      3.5.0
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -214,13 +214,15 @@ const VTCore = (() => {
     for (const list of lists) for (const k of list) { const o = byMinute.get(k.t); if (!o || k.v > o.v) byMinute.set(k.t, k); }
     return [...byMinute.values()].sort((a, b) => a.t - b.t);
   }
-  // Outcome of buying an alert at `at` (ms): target/stop in %, horizon in minutes.
-  function scoreCall(cs, at, opt = {}) {
-    const tp = opt.tp ?? 100, sl = opt.sl ?? -50, horizon = opt.horizon ?? 120;
-    const minute = Math.floor(at / 60000) * 60000, end = at + horizon * 60000, i0 = cs.findIndex(k => k.t >= minute);
+  // Outcome of buying `delay` minutes after an alert at `alertAt` (ms): target/stop in %. The horizon (minutes) counts
+  // from the alert, so every entry delay is judged over the same window.
+  function scoreCall(cs, alertAt, opt = {}) {
+    const tp = opt.tp ?? 100, sl = opt.sl ?? -50, horizon = opt.horizon ?? 120, at = alertAt + (opt.delay ?? 0) * 60000;
+    const minute = Math.floor(at / 60000) * 60000, end = alertAt + horizon * 60000, i0 = cs.findIndex(k => k.t >= minute);
+    // No swap within 5 min of the entry time (e.g. a dead coin at +30 min): nothing to buy.
     if (i0 < 0 || cs[i0].t - at > 5 * 60000) return {status: 'no-trades'};
-    // Entry: close of the alert's own minute, else the next traded minute's open. The alert minute's high/low are
-    // skipped because they may come from before the alert.
+    // Entry: close of the entry time's own minute, else the next traded minute's open. That minute's high/low are
+    // skipped because they may come from before the entry.
     const own = cs[i0].t === minute, entry = own ? cs[i0].c : cs[i0].o, path = cs.slice(own ? i0 + 1 : i0).filter(k => k.t < end);
     const pct = p => (p / entry - 1) * 100, stop = entry * (1 + sl / 100), target = entry * (1 + tp / 100);
     let peak = entry, peakAt = at, trough = entry, outcome = 'open', ret = null, outcomeAt = null;
@@ -233,9 +235,10 @@ const VTCore = (() => {
       else if (k.h >= target) { outcome = 'win'; ret = tp; outcomeAt = k.t; }
     }
     const priceAt = min => { let p = entry; for (const k of path) { if (k.t + 60000 <= at + min * 60000) p = k.c; else break; } return pct(p); };
-    const rEnd = priceAt(horizon);
+    const rEnd = priceAt((end - at) / 60000);
     return {status: 'scored', entry, outcome, ret: ret ?? rEnd, outcomeMin: outcomeAt == null ? null : (outcomeAt - at) / 60000,
-      peakPct: pct(peak), peakMin: (peakAt - at) / 60000, troughPct: pct(trough), r5: priceAt(5), r15: priceAt(15), r60: priceAt(60), rEnd};
+      peakPct: pct(peak), peakMin: (peakAt - at) / 60000, troughPct: pct(trough),
+      r5: priceAt(5), r10: priceAt(10), r15: priceAt(15), r30: priceAt(30), r60: priceAt(60), rEnd};
   }
   const median = a => { const s = a.filter(Number.isFinite).sort((x, y) => x - y), m = s.length >> 1; return !s.length ? null : s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
   // 95% Wilson interval for a win rate, in %.
@@ -281,6 +284,15 @@ const VTCore = (() => {
     const within = m => scores.length ? 100 * scores.filter(s => s.peakMin <= m).length / scores.length : null;
     return {all, features, timing: {r5: median(scores.map(s => s.r5)), r15: median(scores.map(s => s.r15)), r60: median(scores.map(s => s.r60)),
       peakMin: median(scores.map(s => s.peakMin)), peakWithin5: within(5), peakWithin15: within(15), peakWithin60: within(60)}};
+  }
+  // Late check, 10 or 30 min after an alert. change: % vs the price at the alert (null if unknown); traded: any swap in
+  // the 5 min before the check; cluster: the alert's largest cluster %. A rule to test on past calls (the backtest
+  // report grades them the same way), not a prediction.
+  const LATE = {fade: -30, cluster: 30};
+  function lateGrade(change, traded, cluster) {
+    if (!traded) return 'DEAD';
+    if (cluster >= LATE.cluster || (change != null && change <= LATE.fade)) return 'FADE';
+    return change == null ? 'WAIT' : change >= 0 ? 'BUY' : 'WAIT';
   }
   // ---- Market-wide pump.fun activity (PumpPortal data socket) ----
   function ppEvent(raw) {
@@ -335,7 +347,7 @@ const VTCore = (() => {
     return current === call.mint ? 'already-open' : 'navigate';
   }
   return {MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
-    candles,mergeCandles,scoreCall,wilson,summarize,backtestReport,ppEvent,marketTape,initials,handoff};
+    candles,mergeCandles,scoreCall,wilson,summarize,backtestReport,LATE,lateGrade,ppEvent,marketTape,initials,handoff};
 })();
 /* CORE END */
 
@@ -381,7 +393,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.4.1';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.5.0';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -456,6 +468,7 @@ function start() {
   #vts-root .mkt{display:grid;grid-template-columns:minmax(0,1.35fr) repeat(4,minmax(0,1fr));border:1px solid var(--line);border-radius:8px;overflow:hidden;font-size:12px;margin:8px 0}
   #vts-root .mkt>*{padding:6px 6px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   #vts-root .mkt .h{background:var(--card);color:var(--muted);font-weight:600}#vts-root .mkt .l{text-align:left;color:var(--muted)}
+  #vts-root .mkt.late{grid-template-columns:minmax(0,1.3fr) minmax(0,.6fr) repeat(2,minmax(0,1.05fr))}#vts-root .mkt.late>*{font-weight:600}#vts-root .mkt .go{text-align:left;color:var(--text);cursor:pointer}#vts-root .mkt .go:hover{text-decoration:underline}
   </style>
   <header><span class="title">VolTrak</span><span class="mini" data-vts="mini"></span><button data-vts="collapse" title="Collapse">−</button></header>
   <nav class="tabs" data-vts="tabs"><button data-tab="live">Live</button><button data-tab="market">Market</button><button data-tab="calls">Calls</button><button data-tab="settings">Settings</button></nav>
@@ -484,11 +497,15 @@ function start() {
   </section>
   <section data-pane="calls" hidden>
     <p data-vts="discord"><span data-vts="receiver"></span></p>
+    <h4>Late checks: +10 and +30 min after each call</h4>
+    <div data-vts="late"></div>
+    <p class="note">BUY = at or above the call price and still trading · WAIT = down 0–30% · FADE = down 30%+ or a cluster ≥30% · DEAD = no trades for 5 min. An untested rule: the backtest report shows how each grade did on past calls.</p>
     <label>Saved calls<select data-vts="call-list"></select></label>
     <div class="buttons"><button data-vts="open">Open on GMGN</button><button data-vts="export">Export data</button></div>
     <label>Add a call: paste an alert or a contract<input data-vts="paste" placeholder="Contract or alert text"></label><div class="buttons"><button data-vts="import">Add</button></div>
     <h4>Backtest</h4><p class="note" data-vts="bt-help"></p>
     <div class="buttons" data-vts="history-row"><button data-vts="bt-history">Load channel history</button></div>
+    <label>Buy at<select data-vts="bt-delay"><option value="0">The alert</option><option value="10">10 min after the alert</option><option value="30">30 min after the alert</option></select></label>
     <div class="grid"><label>Target %<input data-vts="bt-tp" type="number" min="1" step="any"></label><label>Stop loss %<input data-vts="bt-sl" type="number" min="1" max="99" step="any"></label><label>Costs %<input data-vts="bt-cost" type="number" min="0" step="any"></label></div>
     <div class="buttons"><button class="primary" data-vts="bt-run">Score calls</button><button data-vts="bt-report">Open report</button></div><p class="note" data-vts="bt-status"></p>
   </section>
@@ -497,6 +514,7 @@ function start() {
     <label class="check"><input type="checkbox" data-vts="market-trades"> Include all pump.fun trades (volume, traders)</label>
     <label class="check"><input type="checkbox" data-vts="trades"> GeckoTerminal fallback trade feed</label>
     <label class="check"><input type="checkbox" data-vts="sound"> Voice alert on Discord</label>
+    <label class="check"><input type="checkbox" data-vts="late-alerts"> Alert when a late check grades BUY</label>
     <h4>Data sources</h4>
     <p class="note">Live: GMGN's own page feed (token_activity, token_stat), read-only; nothing is sent on GMGN's connection. Fallbacks: DEX Screener snapshots and GeckoTerminal trades when the live feed is quiet.</p>
     <p class="note">Market: PumpPortal's public data socket (one connection, receiving GMGN tab only) for pump.fun launches, graduations and bonding-curve trades. PumpSwap trades after graduation are not in the free feed.</p>
@@ -520,11 +538,12 @@ function start() {
   $('autoload').checked=get('autoload',true); $('sound').checked=get('sound',true); $('trades').checked=get('trades',true);
   $('autoload').onchange=()=>set('autoload',$('autoload').checked);
   $('sound').onchange=()=>set('sound',$('sound').checked);
+  $('late-alerts').checked=get('lateAlerts',true);$('late-alerts').onchange=()=>set('lateAlerts',$('late-alerts').checked);
   $('trades').onchange=()=>{set('trades',$('trades').checked);flow=null;flowError='';render();};
   $('market-on').checked=get('marketOn',true); $('market-trades').checked=get('marketTrades',true);
   $('market-on').onchange=()=>{set('marketOn',$('market-on').checked);marketDisconnect();render();};
   $('market-trades').onchange=()=>{set('marketTrades',$('market-trades').checked);marketDisconnect();render();};
-  {const o=get('bt.opt',{tp:100,sl:-50,cost:3});$('bt-tp').value=o.tp;$('bt-sl').value=Math.abs(o.sl);$('bt-cost').value=o.cost;}
+  {const o=get('bt.opt',{tp:100,sl:-50,cost:3});$('bt-tp').value=o.tp;$('bt-sl').value=Math.abs(o.sl);$('bt-cost').value=o.cost;$('bt-delay').value=String(o.delay||0);}
   $('collapse').onclick=()=>{const b=root.querySelector('.vts-body'),hide=!b.hidden;b.hidden=hide;$('tabs').hidden=hide;$('collapse').textContent=hide?'+':'−';};
   let drag=null;
   root.querySelector('header').onpointerdown=e=>{if(e.target.closest('button'))return;const b=root.getBoundingClientRect();drag={x:e.clientX-b.left,y:e.clientY-b.top};e.currentTarget.setPointerCapture(e.pointerId);};
@@ -541,7 +560,7 @@ function start() {
   function render(){
     const all=calls().slice().sort((a,b)=>b.messageAt-a.messageAt), signature=all.map(c=>c.id).join('|');
     if(signature!==listSignature){const v=$('call-list').value;$('call-list').replaceChildren(...all.slice(0,100).map(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name+' · '+new Date(c.messageAt).toLocaleTimeString()+(c.historical?' · history':'');return o;}));if(all.some(c=>c.id===v))$('call-list').value=v;listSignature=signature;}
-    renderMarket();renderBt();
+    renderMarket();renderBt();renderLate();
     $('status').textContent=(Date.now()<noteUntil?note+' · ':'')+status+(hasLocks?'':' · Web Locks unavailable: tab coordination is best effort');
     if(DISCORD){
       const alive=receiverAlive(receiver());
@@ -582,11 +601,9 @@ function start() {
     const key=call.manual?'manual':'calls', cap=call.manual?100:2000;
     return locked('write.'+key,()=>{const all=get(key,[]);if(all.some(c=>c.id===call.id))return false;set(key,[call,...all].slice(0,cap));callsCache=null;return true;});
   }
-  function announce(call){
-    // Only Discord announces. No sound in GMGN and no repeated speech after navigation.
-    if(!get('sound',true))return;
-    try{const u=new SpeechSynthesisUtterance('VolTrak. '+call.name+'. Check Steroids.');u.rate=1.05;speechSynthesis.speak(u);}catch(_){}
-  }
+  // Only Discord speaks. No sound in GMGN and no repeated speech after navigation.
+  function say(text){if(!DISCORD||!get('sound',true))return;try{const u=new SpeechSynthesisUtterance(text);u.rate=1.05;speechSynthesis.speak(u);}catch(_){}}
+  const announce=call=>say('VolTrak. '+call.name+'. Check Steroids.');
   function http(url){return new Promise(resolve=>GM_xmlhttpRequest({method:'GET',url,headers:{Accept:'application/json'},timeout:8000,onload:r=>{let data=null;if(r.status===200)try{data=JSON.parse(r.responseText);}catch(_){}resolve({status:r.status,data});},onerror:()=>resolve({status:0,data:null}),ontimeout:()=>resolve({status:0,data:null})}));}
   // Switch tokens inside GMGN's page (its Next.js router) instead of a full reload; reload if the router is missing or stalls.
   let kick=()=>{};
@@ -642,7 +659,7 @@ function start() {
   }
   // Backtest: score saved calls against GeckoTerminal 1m candles. Candles are cached per call, so changing the
   // target, stop or costs re-scores instantly without refetching.
-  const BT_H=120, sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  const BT_H=120, LATE_AT=[10,30], BT_DELAYS=[0,...LATE_AT], sleep=ms=>new Promise(r=>setTimeout(r,ms));
   let btRunning=false, btStop=false, btNote='', gtLast=0, gtGap=3000;
   // GeckoTerminal's free tier allows ~30 requests/min per IP, shared by every tab. Start at 20/min; after a rate limit,
   // pause 60s and double the gap (up to 15s), then ease back by 10% per successful request. While scoring runs, the
@@ -721,16 +738,95 @@ function start() {
       btNote=btStop?'Stopped; run again to continue':'Done: open the report';
     }finally{btRunning=false;btStop=false;renderBt();}
   }
+  // Late checks: 10 and 30 min after each live alert, read DEX Screener once and grade the call (VTCore.lateGrade).
+  // The base price is DEX Screener's own market cap in the first 3 min after the alert (else the alert's MC). Discord
+  // tabs and the GMGN receiver all run this; the lock and the stored results keep it to one request per check.
+  let lateBusy=false;
+  async function lateChecks(){
+    if(lateBusy||GMGN&&!isReceiver)return;
+    const last=LATE_AT[LATE_AT.length-1], recent=()=>calls().filter(c=>!c.historical&&!c.manual&&Date.now()-c.messageAt<(last+6)*60000);
+    if(!recent().length)return;
+    lateBusy=true;
+    try{await locked('late',async()=>{
+      const late=get('late',{}), now=Date.now(), list=recent(), due=new Set(), checks=[];
+      for(const c of list){
+        const L=late[c.id]||(late[c.id]={t:c.messageAt}), retry=now-(L.tried||0)>=15000; // a coin DEX has not indexed yet: every 15s
+        if(!L.base&&now-c.messageAt<3*60000&&retry){L.tried=now;due.add(c.mint);}
+        for(const d of LATE_AT){
+          const t=c.messageAt+d*60000;if(L[d]||now<t)continue;
+          if(now>t+5*60000)L[d]={missed:true};else if(retry||L.tried===now){L.tried=now;due.add(c.mint);checks.push([c,d]);}
+        }
+      }
+      for(const [id,L] of Object.entries(late))if(now-L.t>48*3600000)delete late[id];
+      const fresh=[];
+      if(due.size){
+        const res=await http(DEX+[...due].slice(0,30).join(',')), at=Date.now(), rows=Array.isArray(res.data)?res.data:null;
+        if(rows)for(const c of list){
+          if(!due.has(c.mint))continue;
+          const s=VTCore.normalize(VTCore.selectPair(rows,c.mint),at,rows), L=late[c.id];
+          if(!s?.marketCap)continue; // not indexed yet: retried until the 5-min window closes
+          if(!L.base&&at-c.messageAt<3*60000)L.base={mc:s.marketCap,at};
+          for(const [cc,d] of checks){
+            if(cc!==c)continue;
+            const base=L.base?.mc||c.callMc, change=base>0?(s.marketCap/base-1)*100:null;
+            const traded=s.buys5m==null&&s.sells5m==null?true:(s.buys5m||0)+(s.sells5m||0)>0;
+            const grade=VTCore.lateGrade(change,traded,c.clusters?.length?Math.max(...c.clusters):null);
+            L[d]={at,mc:s.marketCap,change,traded,grade};if(grade==='BUY')fresh.push([c,d,change]);
+          }
+        }
+      }
+      set('late',late);
+      if(!get('lateAlerts',true))return;
+      for(const [c,d,change] of fresh){
+        GM_notification({title:'VolTrak +'+d+' min · '+c.name,text:'Late check: BUY grade ('+(change>=0?'+':'')+change.toFixed(0)+'% vs the call, still trading). Click to open on GMGN.',timeout:15000,
+          onclick:()=>GMGN?openToken(c.mint):GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true})});
+        say('VolTrak. '+c.name+'. '+d+' minute check: buy grade.');
+      }
+    });}finally{lateBusy=false;}
+  }
+  let lateSignature='';
+  function renderLate(){
+    const late=get('late',{}), now=Date.now(), list=calls().filter(c=>!c.historical&&!c.manual).sort((a,b)=>b.messageAt-a.messageAt).slice(0,20);
+    const cell=(c,d)=>{
+      const L=late[c.id]?.[d], due=c.messageAt+d*60000;
+      if(L?.grade)return [L.grade+(L.change==null||L.grade==='DEAD'?'':' '+(L.change>=0?'+':'')+L.change.toFixed(0)+'%'),{BUY:'pos',WAIT:'warnc',FADE:'neg'}[L.grade]||'muted'];
+      return [L?.missed||now>due+5*60000?'missed':now<due?'in '+Math.ceil((due-now)/60000)+'m':'checking…','muted'];
+    };
+    const age=t=>{const m=Math.floor((now-t)/60000);return m<60?m+'m':m<2880?Math.floor(m/60)+'h':Math.floor(m/1440)+'d';};
+    const data=list.map(c=>[c,age(c.messageAt),...LATE_AT.map(d=>cell(c,d))]);
+    const signature=JSON.stringify(data.map(([c,...r])=>[c.id,r]));if(signature===lateSignature)return;lateSignature=signature;
+    if(!list.length){const p=document.createElement('p');p.className='note';p.textContent='Calls that arrive while this script runs show here. History calls are graded in the backtest report instead.';$('late').replaceChildren(p);return;}
+    const box=document.createElement('div');box.className='mkt late';
+    const add=(text,cls,go)=>{const d=document.createElement('span');d.textContent=text;if(cls)d.className=cls;if(go){d.title='Open on GMGN';d.onclick=go;}box.append(d);};
+    ['Call','Age',...LATE_AT.map(d=>'+'+d+' min')].forEach((h,i)=>add(h,'h'+(i<2?' l':'')));
+    for(const [c,time,...cells] of data){
+      add(c.name,'go',()=>GMGN?(VTCore.mintFromURL(location.href)!==c.mint&&openToken(c.mint)):GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true}));add(time,'l');
+      for(const [t,cls] of cells)add(t,cls);
+    }
+    $('late').replaceChildren(box);
+  }
   function openReport(){
     const tp=Math.max(1,+$('bt-tp').value||100), sl=-Math.min(99,Math.abs(+$('bt-sl').value||50)), cost=Math.max(0,+$('bt-cost').value||0);
-    set('bt.opt',{tp,sl,cost});
-    const done=get('bt.done',{}), items=[];let noData=0;
+    const delay=BT_DELAYS.includes(+$('bt-delay').value)?+$('bt-delay').value:0;
+    set('bt.opt',{tp,sl,cost,delay});
+    // Every call is scored at each entry delay from the same cached candles (no extra requests).
+    const done=get('bt.done',{}), rows=[];let noData=0;
     for(const c of btCandidates()){
       if(done[c.id]!=='ok'){if(done[c.id])noData++;continue;}
-      const score=VTCore.scoreCall(VTCore.candles(get('bt.c.'+c.id,[])),c.messageAt,{tp,sl,horizon:BT_H});
-      if(score.status==='scored')items.push({call:c,score});else noData++;
+      const cs=VTCore.candles(get('bt.c.'+c.id,[])), by={};
+      for(const d of BT_DELAYS)by[d]=VTCore.scoreCall(cs,c.messageAt,{tp,sl,horizon:BT_H,delay:d});
+      if(by[0].status!=='scored'){noData++;continue;}
+      // The live late check, replayed: price vs the alert entry and any swap in the 5 min before the check.
+      const late={}, cl=c.clusters?.length?Math.max(...c.clusters):null;
+      for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t+60000>at-300000&&k.t<at),cl);}
+      rows.push({call:c,by,late});
     }
-    showReport(VTCore.backtestReport(items,cost),items,{tp,sl,cost,noData});
+    const scored=d=>rows.filter(r=>r.by[d].status==='scored');
+    const entries=BT_DELAYS.map(d=>({delay:d,dead:rows.length-scored(d).length,...VTCore.summarize(scored(d).map(r=>r.by[d]),cost)}));
+    const grades=LATE_AT.flatMap(d=>['BUY','WAIT','FADE','DEAD'].map(g=>{const all=rows.filter(r=>r.late[d]===g), sc=all.filter(r=>r.by[d].status==='scored');
+      return {delay:d,grade:g,total:all.length,...VTCore.summarize(sc.map(r=>r.by[d]),cost)};}).filter(x=>x.total));
+    const items=scored(delay).map(r=>({call:r.call,score:r.by[delay]}));
+    showReport(VTCore.backtestReport(items,cost),items,{tp,sl,cost,noData,delay,entries,grades,rows});
   }
   function showReport(rep,items,o){
     document.getElementById('vts-report')?.remove();
@@ -744,42 +840,80 @@ function start() {
     const head=el('div','display:flex;gap:8px;align-items:center;margin-bottom:10px'), csv=btn('Download CSV','csv'), close=btn('Close','close');
     head.append(el('h2','margin:0;flex:1;font-size:18px','Backtest of saved VolTrak calls'),csv,close);box.append(head);close.onclick=()=>wrap.remove();
     csv.onclick=()=>{
-      const cols=['name','symbol','mint','alert_time','call_mc','age_min','largest_cluster','bot_share','fresh_share','top_holder','holders','outcome','trade_return','peak','peak_min','trough','r5','r15','r60'];
+      // One row per call. The first block buys at the alert (same columns as before); buy10_/buy30_ buy later and are
+      // blank when the coin had no trades at that time.
+      const later=BT_DELAYS.filter(d=>d), f=v=>v==null?null:v.toFixed(1);
+      const cols=['name','symbol','mint','alert_time','call_mc','age_min','largest_cluster','bot_share','fresh_share','top_holder','holders','outcome','trade_return','peak','peak_min','trough','r5','r10','r15','r30','r60',
+        ...later.flatMap(d=>['grade','outcome','trade_return','peak','peak_min','r15','r60'].map(x=>'buy'+d+'_'+x))];
       const q=v=>v==null?'':/[",\n]/.test(String(v))?'"'+String(v).replace(/"/g,'""')+'"':String(v);
-      const lines=items.map(({call:c,score:s})=>[c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
-        c.holders>0&&c.bots!=null?(100*c.bots/c.holders).toFixed(1):null,c.holders>0&&c.fresh!=null?(100*c.fresh/c.holders).toFixed(1):null,c.topHolder,c.holders,s.outcome,s.ret.toFixed(1),s.peakPct.toFixed(1),s.peakMin.toFixed(1),s.troughPct.toFixed(1),s.r5.toFixed(1),s.r15.toFixed(1),s.r60.toFixed(1)].map(q).join(','));
+      const lines=o.rows.map(({call:c,by,late})=>{const s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
+        c.holders>0&&c.bots!=null?(100*c.bots/c.holders).toFixed(1):null,c.holders>0&&c.fresh!=null?(100*c.fresh/c.holders).toFixed(1):null,c.topHolder,c.holders,s.outcome,f(s.ret),f(s.peakPct),f(s.peakMin),f(s.troughPct),f(s.r5),f(s.r10),f(s.r15),f(s.r30),f(s.r60),
+        ...later.flatMap(d=>{const x=by[d];return [late[d],...(x.status==='scored'?[x.outcome,f(x.ret),f(x.peakPct),f(x.peakMin),f(x.r15),f(x.r60)]:[null,null,null,null,null,null])];})].map(q).join(',');});
       const url=URL.createObjectURL(new Blob([[cols.join(','),...lines].join('\n')],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='voltrak-backtest-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     };
     const a=rep.all, t=rep.timing;
-    box.append(el('p','margin:0 0 12px;color:'+C.muted,'Rules: buy at the alert minute\'s close; sell at +'+o.tp+'% or '+o.sl+'%, whichever comes first, otherwise at the price after '+BT_H+' min. Costs '+o.cost+'% per trade. '+o.noData+' saved call'+(o.noData===1?'':'s')+' had no price data.'));
+    const at=d=>d?d+' min after the alert':'the alert';
+    box.append(el('p','margin:0 0 12px;color:'+C.muted,'Rules: buy at '+at(o.delay)+' (close of that minute); sell at +'+o.tp+'% or '+o.sl+'%, whichever comes first, otherwise at the price '+BT_H+' min after the alert. Costs '+o.cost+'% per trade. '+o.noData+' saved call'+(o.noData===1?'':'s')+' had no price data.'
+      +(o.delay?' '+o.entries.find(e=>e.delay===o.delay).dead+' had no trades at '+at(o.delay)+' (dead) and are left out.':'')));
     document.body.append(wrap);
-    if(!a.n){box.append(el('p','color:'+C.amber,'No scored calls yet. Scroll back through the VolTrak channel, then press "Score calls" in the Calls tab.'));return;}
-    const tiles=el('div','display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px'), tile=(label,value,color,sub)=>{
-      const d=el('div','background:'+C.card+';border:1px solid '+C.line+';border-radius:10px;padding:8px 10px');
-      d.append(el('div','color:'+C.muted+';font-size:10.5px;text-transform:uppercase;letter-spacing:.05em',label),el('div','font-size:20px;font-weight:700;color:'+(color||'inherit'),value));
-      if(sub)d.append(el('div','color:'+C.muted+';font-size:11px',sub));tiles.append(d);};
-    tile('Calls scored',String(a.n));
-    tile('Win rate',a.winRate.toFixed(0)+'%',null,'95% range '+a.lo.toFixed(0)+'–'+a.hi.toFixed(0)+'%');
-    tile('Avg per trade',pct(a.ev),a.ev>=0?C.green:C.red,'after '+o.cost+'% costs');
-    tile('Median peak',pct(a.medianPeak),null,'median '+(t.peakMin==null?'—':t.peakMin.toFixed(0)+' min')+' to peak');
-    tile('After 5 / 15 / 60 min',pct(t.r5)+' '+pct(t.r15)+' '+pct(t.r60),null,'median price change');
-    box.append(tiles);
-    if(a.n<30)box.append(el('p','margin:0 0 12px;padding:8px 10px;border-radius:8px;background:#3d3214;color:'+C.amber,'Only '+a.n+' calls scored: too few to trust any pattern. Scroll further back in the channel and score again; 100+ calls gives usable ranges.'));
-    box.append(el('p','margin:0 0 4px;color:'+C.muted,'Peaks: '+t.peakWithin5.toFixed(0)+'% of calls peaked within 5 min, '+t.peakWithin15.toFixed(0)+'% within 15, '+t.peakWithin60.toFixed(0)+'% within 60.'));
-    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Win = target hit before the stop. A bucket only "stands out" (green or red) when it has at least 15 calls and its whole 95% range sits above or below the all-calls win rate. Past calls only: a filter is worth using only if it keeps working on new calls.'));
+    if(!o.rows.length){box.append(el('p','color:'+C.amber,'No scored calls yet. Scroll back through the VolTrak channel, then press "Score calls" in the Calls tab.'));return;}
     const widths=['22%','10%','26%','14%','14%','14%'];
+    const table=(first,rows)=>{
+      const tb=el('table','border-collapse:collapse;width:100%;max-width:900px;table-layout:fixed'), cg=el('colgroup');
+      widths.forEach(w=>{const c=el('col');c.style.width=w;cg.append(c);});tb.append(cg);
+      const hr=el('tr');[first,'Calls','Win rate (95% range)','Avg per trade','Median peak',''].forEach(h=>hr.append(el('th','text-align:left;color:'+C.muted+';font-weight:600;padding:4px 8px;border-bottom:1px solid '+C.line,h)));tb.append(hr);
+      for(const [cells,color] of rows){const tr=el('tr',color?'color:'+color:'');cells.forEach(v=>tr.append(el('td','padding:4px 8px;border-bottom:1px solid #1b2531',v)));tb.append(tr);}
+      box.append(tb);
+    };
+    if(a.n){
+      const tiles=el('div','display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:12px'), tile=(label,value,color,sub)=>{
+        const d=el('div','background:'+C.card+';border:1px solid '+C.line+';border-radius:10px;padding:8px 10px');
+        d.append(el('div','color:'+C.muted+';font-size:10.5px;text-transform:uppercase;letter-spacing:.05em',label),el('div','font-size:20px;font-weight:700;color:'+(color||'inherit'),value));
+        if(sub)d.append(el('div','color:'+C.muted+';font-size:11px',sub));tiles.append(d);};
+      tile('Calls scored',String(a.n));
+      tile('Win rate',a.winRate.toFixed(0)+'%',null,'95% range '+a.lo.toFixed(0)+'–'+a.hi.toFixed(0)+'%');
+      tile('Avg per trade',pct(a.ev),a.ev>=0?C.green:C.red,'after '+o.cost+'% costs');
+      tile('Median peak',pct(a.medianPeak),null,'median '+(t.peakMin==null?'—':t.peakMin.toFixed(0)+' min')+' to peak');
+      tile('After 5 / 15 / 60 min',pct(t.r5)+' '+pct(t.r15)+' '+pct(t.r60),null,'median change from entry');
+      box.append(tiles);
+      if(a.n<30)box.append(el('p','margin:0 0 12px;padding:8px 10px;border-radius:8px;background:#3d3214;color:'+C.amber,'Only '+a.n+' calls scored: too few to trust any pattern. Scroll further back in the channel and score again; 100+ calls gives usable ranges.'));
+    }
+    // Same calls bought at the alert, +10 and +30 min: does waiting for the first dump help?
+    box.append(el('h3','margin:4px 0 4px;font-size:14px','When to buy: same calls, same target and stop'));
+    table('Buy at',o.entries.map(e=>[[e.delay?'+'+e.delay+' min':'Alert',String(e.n),rate(e),pct(e.ev),pct(e.medianPeak),
+      [e.delay===o.delay?'this report':'',e.dead?e.dead+' dead by then':''].filter(Boolean).join(' · ')],e.delay===o.delay?'':'#9aa7b6']));
+    box.append(el('p','margin:4px 0 12px;color:'+C.muted,'"Dead" = no trades within 5 min of the entry time, so there was nothing to buy. Change "Buy at" in the Calls tab to see the splits below for another entry time.'));
+    // Late-check grades replayed on past calls: does BUY at +10/+30 beat the rest?
+    box.append(el('h3','margin:4px 0 4px;font-size:14px','Late-check grades: buying at the check, by grade'));
+    table('Grade',o.grades.map(g=>[['+'+g.delay+' min '+g.grade,String(g.n),rate(g),pct(g.ev),pct(g.medianPeak),g.total>g.n?(g.total-g.n)+' had nothing to buy':''],'']));
+    box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Same rule as the live check in the Calls tab: BUY = at or above the alert price and traded in the last 5 min; WAIT = down 0–'+(-VTCore.LATE.fade)+'%; FADE = down '+(-VTCore.LATE.fade)+'%+ or a cluster ≥'+VTCore.LATE.cluster+'%; DEAD = no trades for 5 min. The grade is only useful if BUY clearly beats the other rows once there are enough calls.'));
+    // Per-call view, last in the report because it is long.
+    const eachCall=()=>{
+      box.append(el('h3','margin:16px 0 4px;font-size:14px','Each call at +10 and +30 min (newest first)'));
+      const tb=el('table','border-collapse:collapse;width:100%;max-width:900px;table-layout:fixed'), gc={BUY:C.green,WAIT:C.amber,FADE:C.red}, oc={win:C.green,loss:C.red}, cg=el('colgroup');
+      ['28%',...LATE_AT.flatMap(()=>['14%','22%'])].forEach(w=>{const c=el('col');c.style.width=w;cg.append(c);});tb.append(cg);
+      const hr=el('tr');['Call',...LATE_AT.flatMap(d=>['+'+d+' check','Bought at +'+d])].forEach(h=>hr.append(el('th','text-align:left;color:'+C.muted+';font-weight:600;padding:4px 8px;border-bottom:1px solid '+C.line,h)));tb.append(hr);
+      const td=(text,color)=>el('td','padding:4px 8px;border-bottom:1px solid #1b2531;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'+(color?';color:'+color:''),text);
+      for(const r of o.rows.slice().sort((x,y)=>y.call.messageAt-x.call.messageAt).slice(0,100)){
+        const tr=el('tr');tr.append(td(r.call.name+' · '+new Date(r.call.messageAt).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})));
+        for(const d of LATE_AT){
+          const s=r.by[d];tr.append(td(r.late[d]==='DEAD'?'DEAD':r.late[d]+' '+pct(r.by[0]['r'+d]),gc[r.late[d]]||C.muted));
+          tr.append(td(s.status!=='scored'?'—':s.outcome+' '+pct(s.ret)+' · peak '+pct(s.peakPct),oc[s.outcome]||C.muted));
+        }
+        tb.append(tr);
+      }
+      box.append(tb);
+      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Check = grade and price vs the alert at that time. Bought = result of buying right then with your target and stop (window ends '+BT_H+' min after the alert).'));
+    };
+    if(!a.n){box.append(el('p','color:'+C.amber,'None of these calls still traded '+at(o.delay)+'. Pick an earlier "Buy at" time.'));eachCall();return;}
+    box.append(el('p','margin:0 0 4px;color:'+C.muted,'Peaks (from entry): '+t.peakWithin5.toFixed(0)+'% of calls peaked within 5 min, '+t.peakWithin15.toFixed(0)+'% within 15, '+t.peakWithin60.toFixed(0)+'% within 60.'));
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Win = target hit before the stop. A bucket only "stands out" (green or red) when it has at least 15 calls and its whole 95% range sits above or below the all-calls win rate. Past calls only: a filter is worth using only if it keeps working on new calls.'));
     for(const f of rep.features){
       box.append(el('h3','margin:16px 0 4px;font-size:14px',f.name));
-      const table=el('table','border-collapse:collapse;width:100%;max-width:900px;table-layout:fixed'), cg=el('colgroup');
-      widths.forEach(w=>{const c=el('col');c.style.width=w;cg.append(c);});table.append(cg);
-      const hr=el('tr');['Bucket','Calls','Win rate (95% range)','Avg per trade','Median peak',''].forEach(h=>hr.append(el('th','text-align:left;color:'+C.muted+';font-weight:600;padding:4px 8px;border-bottom:1px solid '+C.line,h)));table.append(hr);
-      for(const r of f.rows){
-        const color=r.standsOut==='above'?C.green:r.standsOut==='below'?C.red:r.few?'#6f7d8d':'', tr=el('tr',color?'color:'+color:'');
-        [r.label,String(r.n),rate(r),pct(r.ev),pct(r.medianPeak),r.standsOut==='above'?'better than average':r.standsOut==='below'?'worse than average':r.few?'too few calls':''].forEach(v=>tr.append(el('td','padding:4px 8px;border-bottom:1px solid #1b2531',v)));
-        table.append(tr);
-      }
-      box.append(table);
+      table('Bucket',f.rows.map(r=>[[r.label,String(r.n),rate(r),pct(r.ev),pct(r.medianPeak),r.standsOut==='above'?'better than average':r.standsOut==='below'?'worse than average':r.few?'too few calls':''],
+        r.standsOut==='above'?C.green:r.standsOut==='below'?C.red:r.few?'#6f7d8d':'']));
     }
+    eachCall();
   }
   async function ownReceiver(force=false){
     return locked('receiver',()=>{const r=receiver();if(force||!receiverAlive(r)||r.id===TAB){set('receiver',{id:TAB,at:Date.now()});return true;}return false;});
@@ -890,6 +1024,8 @@ function start() {
   GM_addValueChangeListener(PREFIX+'manual',()=>{callsCache=null;render();});
   GM_addValueChangeListener(PREFIX+'marketSnap',()=>{if(!(GMGN&&isReceiver))renderMarket();});
   GM_addValueChangeListener(PREFIX+'bt.done',()=>renderBt());
+  GM_addValueChangeListener(PREFIX+'late',()=>renderLate());
+  every(5000,lateChecks);every(15000,renderLate);
   if(GMGN){
     GM_addValueChangeListener(PREFIX+'latest',()=>receiveLatest());
     VTLive.on(frame=>{

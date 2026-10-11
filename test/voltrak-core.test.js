@@ -266,6 +266,30 @@ test('scoreCall: neither hit is open at the horizon; no trades near the alert is
   assert.equal(next.entry, 2); // no candle in the alert minute: next traded minute's open
 });
 
+test('scoreCall: a delayed entry buys later in the same window; a dead coin at entry time is unscored', () => {
+  // Pumps to 3 in the first minutes, dumps to 0.5 by minute 9, then runs to 1.2.
+  const cs = VTCore.candles([k(0, 1, 1, 1, 1), k(2, 1, 3, 1, 3), k(9, 0.6, 0.6, 0.5, 0.5), k(10, 0.5, 0.55, 0.5, 0.5), k(25, 0.5, 1.2, 0.5, 1.2), k(100, 1.2, 1.2, 1.2, 1.2), k(130, 5, 5, 5, 5)]);
+  const now = VTCore.scoreCall(cs, T, {tp: 100, sl: -50, horizon: 120});
+  assert.deepEqual([now.outcome, now.ret, now.r10], ['win', 100, -50]);
+  const d10 = VTCore.scoreCall(cs, T, {tp: 100, sl: -50, horizon: 120, delay: 10});
+  assert.equal(d10.entry, 0.5);
+  assert.deepEqual([d10.outcome, d10.ret], ['win', 100]);
+  assert.ok(Math.abs(d10.peakMin - 15) < 0.4); // relative to the entry, not the alert
+  const d30 = VTCore.scoreCall(cs, T, {tp: 100, sl: -50, horizon: 120, delay: 30});
+  assert.equal(d30.status, 'no-trades'); // nothing traded between +30 and +35 min
+  const late = VTCore.scoreCall(VTCore.candles([k(0, 1, 1, 1, 1), k(30, 1, 1, 1, 1), k(118, 1.5, 1.5, 1.5, 1.5), k(125, 9, 9, 9, 9)]), T, {horizon: 120, delay: 30});
+  assert.deepEqual([late.outcome, Math.round(late.ret)], ['open', 50]); // the window still ends 120 min after the alert
+});
+
+test('lateGrade: dead, fade on a big drop or a big cluster, buy at or above the call price', () => {
+  assert.equal(VTCore.lateGrade(50, false, 5), 'DEAD');
+  assert.equal(VTCore.lateGrade(-30, true, 5), 'FADE');
+  assert.equal(VTCore.lateGrade(80, true, 35), 'FADE');
+  assert.equal(VTCore.lateGrade(-12, true, 5), 'WAIT');
+  assert.equal(VTCore.lateGrade(0, true, null), 'BUY');
+  assert.equal(VTCore.lateGrade(null, true, 5), 'WAIT');
+});
+
 test('wilson and backtestReport: buckets, ranges and "stands out" need enough calls', () => {
   const [lo, hi] = VTCore.wilson(5, 10);
   assert.ok(lo > 23 && lo < 24 && hi > 76 && hi < 77);
