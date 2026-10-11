@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VolTrak Steroids
 // @namespace    voltrak-alert
-// @version      3.4.0
+// @version      3.4.1
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -381,7 +381,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.4.0';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.4.1';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -643,13 +643,17 @@ function start() {
   // Backtest: score saved calls against GeckoTerminal 1m candles. Candles are cached per call, so changing the
   // target, stop or costs re-scores instantly without refetching.
   const BT_H=120, sleep=ms=>new Promise(r=>setTimeout(r,ms));
-  let btRunning=false, btStop=false, btNote='', gtLast=0;
+  let btRunning=false, btStop=false, btNote='', gtLast=0, gtGap=3000;
+  // GeckoTerminal's free tier allows ~30 requests/min per IP, shared by every tab. Start at 20/min; after a rate limit,
+  // pause 60s and double the gap (up to 15s), then ease back by 10% per successful request. While scoring runs, the
+  // GMGN tab's GeckoTerminal fallback stays quiet (bt.busy) so the two do not compete.
   async function gtGet(url){
     for(;;){
-      const wait=gtLast+2200-Date.now();if(wait>0)await sleep(wait);
-      gtLast=Date.now();const r=await http(url);
-      if(r.status!==429||btStop)return r;
-      btNote='GeckoTerminal rate limit: waiting 60s';renderBt();await sleep(60000);
+      const wait=gtLast+gtGap-Date.now();if(wait>0)await sleep(wait);
+      gtLast=Date.now();set('bt.busy',gtLast);const r=await http(url);
+      if(r.status!==429){gtGap=Math.max(3000,gtGap*0.9);return r;}
+      if(btStop)return r;
+      gtGap=Math.min(15000,gtGap*2);btNote='GeckoTerminal rate limit: pausing 60s, then continuing slower (automatic)';renderBt();await sleep(60000);
     }
   }
   // 'ok' | 'no-data' | 'no-trades', or null to retry on a later run.
@@ -677,8 +681,8 @@ function start() {
     const oldest=all.reduce((m,c)=>Math.min(m,c.messageAt),Infinity), when=t=>new Date(t).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
     $('bt-run').textContent=btRunning?'Stop':'Score calls';$('bt-history').textContent=histRunning?'Stop loading':'Load channel history';
     $('history-row').hidden=!DISCORD;
-    $('bt-help').textContent=DISCORD?'1) Load channel history: scrolls the VolTrak channel back for you and saves every alert. 2) Score calls: fetches 2h of 1m prices per call from GeckoTerminal (about 7s per call; you can stop and resume). 3) Open report.'
-      :'Open the VolTrak channel in Discord and press "Load channel history" there first. Then score calls (about 7s per call; stop and resume any time).';
+    $('bt-help').textContent=DISCORD?'1) Load channel history: scrolls the VolTrak channel back for you and saves every alert. 2) Score calls: fetches 2h of 1m prices per call from GeckoTerminal (about 7–10s per call; slows down automatically if GeckoTerminal rate-limits; you can stop and resume). 3) Open report.'
+      :'Open the VolTrak channel in Discord and press "Load channel history" there first. Then score calls (about 7–10s per call; stop and resume any time).';
     $('bt-status').textContent=[histNote,btNote].filter(Boolean).join(' · ')+(histNote||btNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+': '+ok+' scored, '+none+' without price data, '+left+' waiting to be scored, '+young+' too recent (under '+(BT_H+5)+' min old).';
   }
   // Discord: load older messages by scrolling the channel to the top until Discord stops loading more.
@@ -710,7 +714,7 @@ function start() {
       const todo=btCandidates().filter(c=>!done[c.id]&&now-c.messageAt>(BT_H+5)*60000).sort((a,b)=>b.messageAt-a.messageAt);
       if(!todo.length){btNote='Nothing new to score';return;}
       for(let i=0;i<todo.length&&!btStop;i++){
-        btNote='Scoring '+(i+1)+' of '+todo.length+' (about '+Math.ceil((todo.length-i)*7/60)+' min left)';renderBt();
+        btNote='Scoring '+(i+1)+' of '+todo.length+' (about '+Math.ceil((todo.length-i)*2.3*gtGap/60000)+' min left)';renderBt();
         const status=await fetchCandles(todo[i]);
         if(status){const d=get('bt.done',{});d[todo[i].id]=status;set('bt.done',d);}
       }
@@ -834,7 +838,7 @@ function start() {
     }finally{polling=false;}
   }
   async function pollFlow(force=false){
-    if(!GMGN||flowing||!current||!get('trades',true)||liveFresh())return;
+    if(!GMGN||flowing||!current||!get('trades',true)||liveFresh()||Date.now()-get('bt.busy',0)<30000)return;
     const now=Date.now(), mint=current, dexPair=snapshot?.pair;
     if(!force&&(now<flowPause||now-lastFlow<FLOW_MS||(document.hidden&&!isReceiver)))return;
     if(!dexPair)return;
