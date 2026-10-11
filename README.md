@@ -59,6 +59,11 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 - **Helius (optional):** paste a Helius API key (the free plan works) in Settings, then press "Add volume bots to past calls". This reads every trade from 5 minutes before to 3 minutes after each past alert. The report and CSV gain volume-bot splits (`bots_pre_*`, `bots_2m_*`).
 - **Late checks reworded:** ABOVE / BELOW / DOWN 30%+ / NO TRADES. They describe the price; they are not BUY/FADE verdicts. On 95 past calls, no late-check group made money. Notifications are now off by default and say "not a buy signal".
 - **Market tab:** launches and graduations with pace vs the 30-minute average, and connection diagnostics. PumpPortal's trade stream now needs a funded API key, so the script no longer asks for it.
+- **Backtest follows the 95-call analysis:**
+  - Buying every call at the alert won 24% (break-even about 35%), and the filters from the first 22 calls failed on 73 newer calls. So the setup card shows "No proven setup" with your own win rate vs break-even.
+  - The cluster and top-holder warnings are gone.
+  - New options: a +1 min entry, "sell at 5 min if not up", and cautious fills.
+  - The report has a verdict line, an exit-rules table (paired against target/stop only) and a forward test on calls after Oct 11 03:30 UTC.
 - **Data checks:**
   - "Copy GMGN feed report" (Settings) lists the fields GMGN's live feed sends.
   - On Photon (tinyastro.io), a "VolTrak: copy Photon report" button records the shape of Photon's data, with tokens and keys redacted. This is the first step toward showing Photon's volume-bot number in the GMGN panel.

@@ -53,7 +53,7 @@ test('parseAlert reads a real VolTrak alert', () => {
   assert.deepEqual([a.topHolder, a.clusters, a.holders, a.experienced, a.bots, a.fresh, a.snipers], [4.2, [30.53], 215, 4, 85, 72, 0]);
   const r = VTCore.assess(a, null, Date.now(), '');
   assert.ok(r.reasons.includes('33% fresh-wallet and 40% bot/high-risk labels of 215 holders at call; categories can overlap'));
-  assert.ok(r.flags.some(x => /cluster/.test(x)) && !r.flags.some(x => /top holder/.test(x)));
+  assert.ok(!r.flags.some(x => /cluster|top holder/.test(x))); // neither predicted outcomes on 73 held-out calls
 });
 
 test('parseAlert falls back to the first address and keeps single-unit ages', () => {
@@ -149,7 +149,7 @@ test('assess: call-time flags no longer hide the live state', () => {
   assert.equal(a.state, 'WATCH BUY SETUP');
   assert.equal(a.basis, 'DEX Screener 5m swap count');
   assert.equal(a.risks.length, 0);
-  assert.ok(a.flags.some(x => /cluster/.test(x)) && a.flags.some(x => /top holder/.test(x)));
+  assert.ok(!a.flags.some(x => /cluster|top holder/.test(x)));
 });
 
 test('assess: real data problems still force CAUTION', () => {
@@ -409,4 +409,24 @@ test('txTrades: a buy and a sell by two signers in one transaction give two rows
   const transfer = ptx({keys: [{pubkey: 'A', signer: true}, {pubkey: 'B'}], pre: [1e9, 0], post: [1e9 - 5000, 0], preTok: [tb(2, 'A', MINTX, 5e12)], postTok: [tb(2, 'A', MINTX, 0), tb(3, 'B', MINTX, 5e12)]});
   assert.deepEqual(VTCore.txTrades(transfer, MINTX, 200), []);
   assert.deepEqual(VTCore.txTrades({...transfer, meta: {...transfer.meta, err: {x: 1}}}, MINTX, 200), []);
+});
+
+test('scoreCall: early exit sells at the 5-min close when not up; cautious fills; breakeven', () => {
+  // Flat-to-down for 6 minutes, then a spike to +150% at minute 20.
+  const cs = VTCore.candles([k(0, 1, 1, 1, 1), k(1, 1, 1.05, 0.9, 0.95), k(3, 0.95, 0.97, 0.85, 0.9), k(5, 0.9, 0.92, 0.8, 0.85), k(20, 1, 2.5, 1, 2.4)]);
+  const plain = VTCore.scoreCall(cs, T, {tp: 100, sl: -50});
+  assert.equal(plain.outcome, 'win');
+  const early = VTCore.scoreCall(cs, T, {tp: 100, sl: -50, earlyExit: 5});
+  assert.deepEqual([early.outcome, Math.round(early.ret)], ['exit', -15]);
+  // Up at 5 min: keep holding.
+  const up = VTCore.candles([k(0, 1, 1, 1, 1), k(5, 1, 1.2, 1, 1.1), k(20, 1, 2.5, 1, 2.4)]);
+  assert.equal(VTCore.scoreCall(up, T, {tp: 100, sl: -50, earlyExit: 5}).outcome, 'win');
+  // Cautious: a one-candle wick to +105% is not a fill; a stop candle closing at -70% fills there.
+  const wick = VTCore.candles([k(0, 1, 1, 1, 1), k(2, 1, 2.05, 0.9, 1.1)]);
+  assert.equal(VTCore.scoreCall(wick, T, {tp: 100, sl: -50, fill: 'cautious'}).outcome, 'open');
+  const dump = VTCore.candles([k(0, 1, 1, 1, 1), k(2, 0.9, 0.95, 0.25, 0.3)]);
+  assert.equal(Math.round(VTCore.scoreCall(dump, T, {tp: 100, sl: -50, fill: 'cautious'}).ret), -70);
+  assert.equal(Math.round(VTCore.scoreCall(dump, T, {tp: 100, sl: -50}).ret), -50);
+  assert.ok(Math.abs(VTCore.breakeven(100, -50, 3) - 35.33) < 0.01);
+  assert.ok(Math.abs(plain.troughMin - (5 * 60000 - 20000) / 60000) < 1e-9);
 });
