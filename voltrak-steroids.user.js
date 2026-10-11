@@ -1017,7 +1017,12 @@ const PANEL_CSS = String.raw`/* ================================================
 }
 @media (prefers-reduced-motion:reduce){
   #vts-root .flash{outline:2px solid var(--text);outline-offset:-2px}
-}`;
+}
+/* review fixes: late pills ellipsis instead of clipping; setup note wraps; 4-column late grid keeps its row borders */
+#vts-root .mkt.late .gp{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+#vts-root .grade .gn{white-space:normal;line-height:1.3}
+#vts-root .grade strong{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+#vts-root .mkt.late>:nth-last-child(5){border-bottom:1px solid var(--line)}`;
 const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusable="false">
 <symbol id="vts-i-up" viewBox="0 0 16 16"><path d="M8 2.2 15.2 13.8H.8z"/></symbol>
 <symbol id="vts-i-down" viewBox="0 0 16 16"><path d="M8 13.8.8 2.2h14.4z"/></symbol>
@@ -1211,7 +1216,7 @@ function start() {
   root.innerHTML='<style>'+PANEL_CSS+'</style>'+PANEL_HTML;
   document.body.appendChild(root);
   const $=key=>root.querySelector('[data-vts="'+key+'"]');
-  $('discord').hidden=!DISCORD; $('gmgn').hidden=!GMGN; $('foot-gmgn').hidden=!GMGN; $('history-row').hidden=!DISCORD;
+  $('discord').hidden=!DISCORD; $('gmgn').hidden=!GMGN; $('foot-gmgn').hidden=!GMGN; $('history-row').hidden=!DISCORD; $('census-copy').parentElement.hidden=!GMGN;
   root.dataset.site=GMGN?'gmgn':'discord';
   // Tabs: Live is GMGN-only; the last tab used is remembered per site.
   const tabKey='tab.'+(GMGN?'gmgn':'discord');
@@ -1266,7 +1271,7 @@ function start() {
   const node=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;};
   const signed=(v,d=0)=>(v>=0?'+':'−')+Math.abs(v).toLocaleString('en-US',{maximumFractionDigits:d,minimumFractionDigits:d});
   // Trend lines: buy share over the last 60s and market cap since the alert, sampled while this token is on screen.
-  let sparkMint=null, shareHist=[], mcHist=[], mcSrc='', lastTone='', lastShown=null;
+  let sparkMint=null, shareHist=[], shareSrc='', mcHist=[], mcSrc='', lastTone='', lastShown=null;
   function drawSpark(el,pts,o){
     const svg=el.querySelector('svg'), cap=el.querySelector('.cap.l'), pk=el.querySelector('.cap.pk'), cl=el.querySelector('.cap.cl');
     if(cap)cap.textContent=o.cap||'';
@@ -1294,7 +1299,7 @@ function start() {
     cell.className='cell grade '+(b?.n?'few':'none');
     $('grade-letter').textContent='—';
     $('grade-text').textContent='No proven setup';
-    $('grade-note').textContent=b?.n?Math.round(b.winRate)+'% won · need '+Math.round(b.be)+'%':'open a backtest report';
+    $('grade-note').textContent=b?.n?Math.round(b.winRate)+'% won · '+Math.round(b.be)+'% needed':'open a backtest report';
     cell.title=b?.n?'Your backtest ('+b.n+' calls, +'+b.tp+'%/'+b.sl+'%, '+b.cost+'% costs): '+Math.round(b.winRate)+'% won, average '+(b.ev>=0?'+':'')+b.ev.toFixed(1)+'% per trade; break-even needs '+b.be.toFixed(0)+'%. Filters from the first 22 calls failed on 73 newer calls, so no setup is graded.':'No setup is graded: the filters from the first 22 calls failed on 73 newer calls.';
   }
   let botCache={key:'',vb:null};
@@ -1359,6 +1364,7 @@ function start() {
     const share=a.share, mc=Lf?.marketCap??snapshot?.marketCap, move=mc>0&&c?.callMc>0?(mc/c.callMc-1)*100:null;
     // One price source per trend line: live and DEX market caps can differ, so a source switch restarts the line.
     const mcFrom=Lf?.marketCap?'live':'dex';if(mc>0&&mcFrom!==mcSrc){mcSrc=mcFrom;mcHist=[];}
+    const shareFrom=(a.basis||'').split(' ')[0];if(share!=null&&shareFrom!==shareSrc){shareSrc=shareFrom;shareHist=[];}
     if(share!=null&&(!shareHist.length||now-shareHist[shareHist.length-1].t>=2000))shareHist.push({t:now,v:share});
     shareHist=shareHist.filter(q=>now-q.t<=60000);
     if(mc>0&&(!mcHist.length||now-mcHist[mcHist.length-1].t>=5000)){mcHist.push({t:now,v:mc});if(mcHist.length>360)mcHist=mcHist.filter((_,i)=>i%2===0||i===mcHist.length-1);}
@@ -1366,7 +1372,7 @@ function start() {
     const side=$('side');side.hidden=share==null;side.textContent=share>=60?'▲ Buy side':share<=40?'▼ Sell side':'≈ Mixed';side.className='side'+(share>=60?' pos':share<=40?' neg':'');
     const mv=$('move');mv.className='big r'+(move==null?' na':move>=0?' pos up':' neg down')+(move!=null&&Math.abs(move)>=1000?' long':'');mv.replaceChildren(...(move==null?['—']:[signed(move),node('small','','%')]));
     $('mc-line').replaceChildren(...(mc>0&&c?.callMc>0?[node('b','',usd(mc)),' from '+usd(c.callMc)]:mc>0?['MC ',node('b','',usd(mc))]:['no call MC']));
-    drawSpark($('share-spark'),shareHist,{lo:0,hi:100,ref:50,cls:share==null?'mix':share>=60?'pos':share<=40?'neg':'mix',cap:shareHist.length>=3?'60s':Lf?'60s · filling':'60s · needs live trades'});
+    drawSpark($('share-spark'),shareHist,{lo:0,hi:100,ref:50,cls:share==null?'mix':share>=60?'pos':share<=40?'neg':'mix',cap:shareHist.length>=3?'60s':'60s · filling'});
     drawSpark($('mc-spark'),mcHist,{ref:c?.callMc>0?c.callMc:null,cls:move==null?'mix':move>=0?'pos':'neg',peak:v=>c?.callMc>0?'peak '+signed((v/c.callMc-1)*100)+'%':''});
     // Meter: 20 cells, one per 5% of buy share.
     const meter=$('meter');meter.classList.toggle('empty',share==null);[...meter.children].forEach((e,i)=>e.classList.toggle('on',share!=null&&i<Math.round(share/5)));
@@ -1629,7 +1635,7 @@ function start() {
     const late=get('late',{}), now=Date.now(), list=calls().filter(c=>!c.historical&&!c.manual).sort((a,b)=>b.messageAt-a.messageAt).slice(0,20);
     const cell=(c,d)=>{
       const L=late[c.id]?.[d], due=c.messageAt+d*60000;
-      if(L?.grade){const [k,t]=lateView(L);return [t+(L.change==null||lateQuiet(L)?'':' '+(L.change>=0?'+':'−')+Math.abs(L.change).toFixed(0)+'%'),k];}
+      if(L?.grade){const [k,t]=lateView(L);return [lateQuiet(L)||L.change==null?t.toLowerCase():(L.change>=0?'+':'−')+Math.abs(L.change).toFixed(0)+'%',k,t];}
       return [L?.missed||now>due+5*60000?'missed':now<due?'in '+Math.ceil((due-now)/60000)+'m':'checking…',null];
     };
     const age=t=>{const m=Math.floor((now-t)/60000);return m<60?m+'m':m<2880?Math.floor(m/60)+'h':Math.floor(m/1440)+'d';};
@@ -1642,7 +1648,7 @@ function start() {
     for(const [c,time,...cells] of data){
       add(c.name,'go',()=>GMGN?(VTCore.mintFromURL(location.href)!==c.mint&&openToken(c.mint)):GM_openInTab(VTCore.gmgnURL(c.mint),{active:true,insert:true}));add(time,'l muted');
       // Graded cells are pills (class gp + grade); pending/missed cells are muted text.
-      for(const [t,k] of cells){if(!k){add(t,'pend');continue;}const d=document.createElement('span'),b=document.createElement('b');b.className='gp '+k;b.textContent=t;d.append(b);box.append(d);}
+      for(const [t,k,full] of cells){if(!k){add(t,'pend');continue;}const d=document.createElement('span'),b=document.createElement('b');b.className='gp '+k;b.textContent=t;b.title=full+' '+t;d.append(b);box.append(d);}
     }
     $('late').replaceChildren(box);
   }
@@ -1696,7 +1702,7 @@ function start() {
     try{
       await refreshSol();
       const done=get('bt.done',{}), todo=btCandidates().filter(c=>done[c.id]==='ok'&&!get('hb.'+c.id,null)).sort((a,b)=>b.messageAt-a.messageAt);
-      if(!todo.length){hbNote='Volume bots: every scored call already has a reading';return;}
+      if(!todo.length){hbNote=btCandidates().some(c=>done[c.id]==='ok')?'Volume bots: every scored call already has a reading':'Score calls first: volume bots are added to scored calls';return;}
       for(let i=0;i<todo.length&&!hbStop;i++){
         hbNote='Volume bots: '+(i+1)+' of '+todo.length;renderBt();
         const r=await backfillOne(todo[i]);
