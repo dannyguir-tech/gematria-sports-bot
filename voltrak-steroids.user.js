@@ -1827,7 +1827,8 @@ function start() {
     box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Same check as the Calls tab: price at +10/+30 min vs the alert price (down '+(-VTCore.LATE.down)+'%+ is its own group); "no trades" = nothing traded in the 5 min before the check. These are descriptions, not signals: a group is only worth acting on if its average stays above zero on new calls.'));
     // Volume bots on past calls: Helius backfill, or the live GMGN reading saved when the call arrived.
     // Only complete readings: a partial window (feed started late, receiver left early, history cut short) is not comparable.
-    const postOf=r=>r.hb?.post?.n>0&&r.hb.post.complete?r.hb.post:r.ft?.vb120?.n>0&&r.ft.vb120.complete?r.ft.vb120:null;
+    // The live GMGN reading wins over Helius: it sees each leg directly, while Helius in-transaction legs are priced by estimate.
+    const postOf=r=>r.ft?.vb120?.n>0&&r.ft.vb120.complete?r.ft.vb120:r.hb?.post?.n>0&&r.hb.post.complete?r.hb.post:null;
     const preR=o.rows.filter(r=>r.hb?.pre?.n>0&&r.hb.pre.complete), postR=o.rows.filter(postOf);
     if(preR.length||postR.length){
       box.append(el('h3','margin:4px 0 4px;font-size:14px','Volume bots on past calls'));
