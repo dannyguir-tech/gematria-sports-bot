@@ -1,0 +1,1016 @@
+<title>Iron Jiyu Tracker</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800&family=Hanken+Grotesk:wght@400;500;600;700&family=Martian+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a punch clock column (timer, totals, projects) beside the week chart and time card log; one column under 880px. */
+:root {
+  --bg: #e9ecf0;          /* cold-rolled steel */
+  --panel: #f8f9fb;
+  --sunk: #dfe3e9;
+  --ink: #1a1f26;         /* graphite */
+  --muted: #5a6370;
+  --line: #cfd5dd;
+  --accent: #2b4a8a;      /* indigo */
+  --accent-ink: #ffffff;
+  --accent-soft: #dbe3f3;
+  --hot: #d9580b;         /* heated iron */
+  --hot-ink: #ffffff;
+  --hot-soft: #fbe2cf;
+  --ok: #2c7a4b;
+  --danger: #b3261e;
+  --shadow: 0 1px 0 rgba(255,255,255,.7) inset, 0 1px 2px rgba(20,28,40,.08);
+  --display: "Big Shoulders Display", "Arial Narrow", "Roboto Condensed", Impact, sans-serif;
+  --body: "Hanken Grotesk", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "Martian Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --r: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111418; --panel: #191d23; --sunk: #0d1013; --ink: #e6e9ee; --muted: #98a1ad; --line: #2a3039;
+    --accent: #93acea; --accent-ink: #0d1730; --accent-soft: #1e2a45;
+    --hot: #ff8a3d; --hot-ink: #1d0d02; --hot-soft: #3a2010;
+    --ok: #63c28b; --danger: #ff7b72;
+    --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 1px 2px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111418; --panel: #191d23; --sunk: #0d1013; --ink: #e6e9ee; --muted: #98a1ad; --line: #2a3039;
+  --accent: #93acea; --accent-ink: #0d1730; --accent-soft: #1e2a45;
+  --hot: #ff8a3d; --hot-ink: #1d0d02; --hot-soft: #3a2010;
+  --ok: #63c28b; --danger: #ff7b72;
+  --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 1px 2px rgba(0,0,0,.4);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { background: var(--bg); }
+body {
+  color: var(--ink); font-family: var(--body); font-size: 15px; line-height: 1.45;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 48px;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* Header */
+.top { max-width: 1180px; margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-block: 20px 18px; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand svg { width: 34px; height: 34px; flex: none; }
+.wordmark { font-family: var(--display); font-weight: 800; font-size: 30px; line-height: .9; letter-spacing: .02em; text-transform: uppercase; }
+.wordmark small { display: block; font-family: var(--mono); font-weight: 400; font-size: 10px; letter-spacing: .28em; color: var(--muted); margin-top: 5px; }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); font-size: 12.5px; color: var(--muted); }
+.pill i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.pill[data-mode="db"] i { background: var(--ok); }
+.pill[data-mode="local"] i { background: var(--hot); }
+
+/* Grid */
+.app { max-width: 1180px; margin: 0 auto; display: grid; gap: 18px; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); align-items: start; }
+.col-left, .col-right { display: grid; gap: 18px; min-width: 0; }
+.col-left > *, .col-right > * { min-width: 0; }
+@media (max-width: 880px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .col-left, .col-right { display: contents; }
+  #clock { order: 1; } #stats { order: 2; } #weekCard { order: 3; } #logCard { order: 4; } #projectsCard { order: 5; }
+}
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); padding: 18px; }
+.card h2 { margin: 0; font-family: var(--display); font-weight: 700; font-size: 22px; letter-spacing: .03em; text-transform: uppercase; line-height: 1; }
+.eyebrow { font-family: var(--mono); font-size: 10.5px; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.spacer { flex: 1; }
+
+/* Buttons */
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 7px 12px; font-size: 13.5px; font-weight: 600; line-height: 1.2; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.danger { color: var(--danger); }
+.btn.danger.solid { background: var(--danger); border-color: var(--danger); color: var(--panel); }
+.icon-btn { border: 1px solid transparent; background: transparent; border-radius: 7px; width: 32px; height: 32px; display: inline-grid; place-items: center; color: var(--muted); }
+.icon-btn:hover { border-color: var(--line); color: var(--ink); background: var(--bg); }
+.icon-btn svg { width: 16px; height: 16px; }
+
+/* Punch clock */
+#clock { padding: 0; overflow: hidden; }
+.dial { padding: 18px 18px 16px; background: var(--sunk); border-bottom: 1px solid var(--line); position: relative; transition: background .4s; }
+.dial-status { display: flex; align-items: center; gap: 8px; }
+.lamp { width: 9px; height: 9px; border-radius: 50%; background: var(--line); border: 1px solid var(--muted); }
+.readout { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 500; font-size: clamp(40px, 11vw, 54px); letter-spacing: -.02em; line-height: 1.05; margin: 10px 0 4px; color: var(--muted); white-space: nowrap; }
+.since { font-size: 13px; color: var(--muted); min-height: 1.45em; }
+.is-running .dial { background: radial-gradient(120% 140% at 0% 0%, var(--hot-soft), var(--sunk) 70%); }
+.is-running .lamp { background: var(--hot); border-color: var(--hot); box-shadow: 0 0 0 4px color-mix(in srgb, var(--hot) 22%, transparent); animation: pulse 1.6s ease-in-out infinite; }
+.is-running .readout { color: var(--hot); }
+.is-running .dial-status .eyebrow { color: var(--hot); }
+@keyframes pulse { 50% { box-shadow: 0 0 0 7px color-mix(in srgb, var(--hot) 6%, transparent); } }
+.clock-body { padding: 16px 18px 18px; display: grid; gap: 14px; }
+.field label, .lbl { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+.text { width: 100%; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 10px 12px; font-size: 15px; }
+.text:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.chips { display: flex; flex-wrap: wrap; gap: 7px; }
+.chip { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 6px 12px; font-size: 13.5px; font-weight: 500; }
+.chip .sw { width: 9px; height: 9px; border-radius: 3px; background: var(--muted); }
+.chip[aria-pressed="true"] { border-color: var(--ink); background: var(--ink); color: var(--panel); }
+.chip.suggest { border-style: dashed; color: var(--muted); }
+.chip.add { color: var(--accent); border-style: dashed; }
+.newproj { display: flex; gap: 7px; flex-wrap: wrap; width: 100%; }
+.newproj .text { flex: 1 1 160px; min-width: 0; padding: 7px 10px; font-size: 14px; }
+.punch { width: 100%; border: 0; border-radius: 9px; padding: 15px 16px; font-family: var(--display); font-weight: 800; font-size: 24px; letter-spacing: .06em; text-transform: uppercase; background: var(--accent); color: var(--accent-ink); display: flex; align-items: center; justify-content: center; gap: 10px; box-shadow: 0 2px 0 color-mix(in srgb, var(--accent) 60%, #000); transition: transform .06s; }
+.punch:active { transform: translateY(1px); box-shadow: none; }
+.is-running .punch { background: var(--hot); color: var(--hot-ink); box-shadow: 0 2px 0 color-mix(in srgb, var(--hot) 60%, #000); }
+.punch kbd { font-family: var(--mono); font-size: 10px; font-weight: 400; letter-spacing: .1em; opacity: .7; border: 1px solid currentColor; border-radius: 4px; padding: 2px 5px; }
+@media (hover: none) { .punch kbd { display: none; } }
+.is-running .punch kbd { display: none; }
+
+/* Stats */
+#stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0; padding: 0; }
+.stat { padding: 16px 18px; min-width: 0; }
+.stat + .stat { border-left: 1px solid var(--line); }
+.stat .big { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 26px; font-weight: 500; letter-spacing: -.02em; margin-top: 6px; }
+.stat .sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.gauge { grid-column: 1 / -1; border-top: 1px solid var(--line); padding: 14px 18px 16px; }
+.track { height: 10px; border-radius: 3px; background: var(--sunk); border: 1px solid var(--line); overflow: hidden; margin-top: 8px; display: flex; }
+.track > span { display: block; height: 100%; }
+.gauge-note { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; color: var(--muted); margin-top: 7px; flex-wrap: wrap; }
+
+/* Week chart */
+.weeknav { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.weeknav .range { font-weight: 600; font-size: 14px; min-width: 0; padding: 0 4px; }
+.plot { position: relative; height: 170px; margin-top: 34px; border-bottom: 1px solid var(--muted); display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.col { position: relative; height: 100%; }
+.bar { position: absolute; bottom: 0; left: 18%; right: 18%; display: flex; flex-direction: column-reverse; border-radius: 3px 3px 0 0; overflow: hidden; min-height: 0; }
+.bar span { display: block; width: 100%; }
+.bar span + span { border-top: 1px solid var(--panel); }
+.val { position: absolute; left: 0; right: 0; text-align: center; font-family: var(--mono); font-size: 10.5px; color: var(--ink); font-variant-numeric: tabular-nums; z-index: 2; }
+.val span { background: var(--panel); padding: 0 3px; border-radius: 3px; }
+.target { position: absolute; left: 0; right: 0; border-top: 1.5px dashed var(--hot); pointer-events: none; z-index: 1; }
+.target b { position: absolute; right: 0; top: -19px; font-family: var(--mono); font-size: 10px; font-weight: 400; color: var(--hot); background: var(--panel); padding: 0 0 0 4px; }
+.days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); margin-top: 6px; }
+.days div { text-align: center; font-size: 12px; color: var(--muted); line-height: 1.25; }
+.days div b { display: block; font-family: var(--mono); font-weight: 400; font-size: 11px; }
+.days div.today { color: var(--accent); font-weight: 700; }
+.breakdown { margin-top: 18px; display: grid; gap: 9px; }
+.brow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 4px 14px; align-items: center; font-size: 14px; }
+.brow .name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.brow .name span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.brow .sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.brow .h { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.brow .d { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; min-width: 6ch; }
+.brow .mini { grid-column: 1 / -1; height: 4px; background: var(--sunk); border-radius: 2px; overflow: hidden; }
+.brow .mini span { display: block; height: 100%; }
+
+/* Log */
+.log-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.day { margin-top: 18px; }
+.day-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding-bottom: 7px; border-bottom: 2px solid var(--ink); }
+.day-head h3 { margin: 0; font-family: var(--display); font-weight: 700; font-size: 18px; letter-spacing: .04em; text-transform: uppercase; }
+.day-head .tot { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.day-head .tot b { color: var(--ink); font-weight: 500; }
+.entry { display: grid; grid-template-columns: 4px minmax(0, 1fr) auto auto; gap: 4px 12px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.entry .stripe { align-self: stretch; border-radius: 2px; background: var(--line); }
+.entry .what { min-width: 0; }
+.entry .desc { font-weight: 600; overflow-wrap: anywhere; }
+.entry .desc.none { color: var(--muted); font-weight: 500; font-style: italic; }
+.entry .meta { font-size: 12.5px; color: var(--muted); display: flex; gap: 6px 10px; flex-wrap: wrap; margin-top: 1px; }
+.entry .meta .num { font-size: 11.5px; }
+.entry .meta .t { white-space: nowrap; }
+.entry .dur { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 14px; }
+.entry .dur small { display: block; font-size: 11px; color: var(--muted); }
+.entry .acts { display: flex; gap: 2px; }
+.entry.live .dur { color: var(--hot); }
+.entry.live .stripe { box-shadow: 0 0 0 2px var(--hot-soft); }
+.tag-live { font-family: var(--mono); font-size: 10px; letter-spacing: .12em; color: var(--hot); text-transform: uppercase; }
+.confirm { grid-column: 2 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13.5px; padding-top: 4px; }
+.empty { border: 1.5px dashed var(--line); border-radius: var(--r); padding: 22px 18px; margin-top: 18px; color: var(--muted); font-size: 14px; }
+.empty strong { display: block; color: var(--ink); font-size: 15px; margin-bottom: 4px; }
+
+/* Editor */
+.editor { margin-top: 14px; border: 1px solid var(--accent); border-radius: var(--r); padding: 14px; background: var(--bg); display: grid; gap: 12px; }
+.entry .editor { grid-column: 1 / -1; margin-top: 4px; }
+.editor .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 520px) { .editor .grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .editor .grid .wide { grid-column: 1 / -1; } }
+.editor .text { background: var(--panel); padding: 8px 10px; font-size: 14px; }
+.editor select.text { appearance: auto; }
+.err { color: var(--danger); font-size: 13px; }
+.csvbox textarea { width: 100%; min-height: 140px; font-family: var(--mono); font-size: 11.5px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); padding: 10px; resize: vertical; }
+
+/* Projects */
+.plist { display: grid; gap: 2px; margin-top: 12px; }
+.prow { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 8px; align-items: center; padding: 5px 0; }
+.prow.archived { opacity: .55; }
+.swbtn { width: 26px; height: 26px; border-radius: 7px; border: 2px solid var(--panel); box-shadow: 0 0 0 1px var(--line); }
+.prow .text { padding: 6px 9px; font-size: 14px; background: transparent; border-color: transparent; }
+.prow .text:hover { border-color: var(--line); }
+.prow .text:focus { background: var(--bg); }
+.prow .h { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.settings { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+.settings input { width: 80px; padding: 6px 9px; }
+.hint { font-size: 12.5px; color: var(--muted); margin: 6px 0 0; }
+
+/* Toast */
+.toast { position: fixed; left: 50%; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%) translateY(20px); opacity: 0; pointer-events: none; background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 8px; font-size: 14px; max-width: calc(100vw - 32px); transition: opacity .2s, transform .2s; z-index: 10; }
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="17" fill="none" stroke="var(--ink)" stroke-width="3"></circle>
+      <circle cx="20" cy="20" r="11.5" fill="var(--sunk)" stroke="var(--line)" stroke-width="1"></circle>
+      <g stroke="var(--ink)" stroke-width="2" stroke-linecap="round">
+        <line x1="20" y1="6.5" x2="20" y2="9"></line><line x1="33.5" y1="20" x2="31" y2="20"></line>
+        <line x1="20" y1="33.5" x2="20" y2="31"></line><line x1="6.5" y1="20" x2="9" y2="20"></line>
+      </g>
+      <line x1="20" y1="20" x2="20" y2="12" stroke="var(--ink)" stroke-width="2.4" stroke-linecap="round"></line>
+      <line x1="20" y1="20" x2="25.5" y2="23" stroke="var(--hot)" stroke-width="2.4" stroke-linecap="round"></line>
+      <circle cx="20" cy="20" r="2" fill="var(--ink)"></circle>
+    </svg>
+    <div class="wordmark">Iron Jiyu<small>Work time tracker</small></div>
+  </div>
+  <span class="pill" id="syncPill" data-mode="loading" title=""><i></i><span id="syncText">Opening your time card…</span></span>
+</header>
+
+<main class="app" id="app">
+  <div class="col-left">
+  <section class="card" id="clock" aria-label="Punch clock">
+    <div class="dial">
+      <div class="dial-status"><span class="lamp"></span><span class="eyebrow" id="clockState">Off the clock</span></div>
+      <div class="readout" id="readout" aria-live="off">00:00:00</div>
+      <div class="since" id="since">Type what you're working on, then punch in.</div>
+    </div>
+    <div class="clock-body">
+      <div class="field">
+        <label for="task">What are you working on?</label>
+        <input class="text" id="task" type="text" autocomplete="off" maxlength="200" placeholder="e.g. Edit Eli reel, client call, invoices">
+      </div>
+      <div>
+        <span class="lbl" id="projLbl">Project</span>
+        <div class="chips" id="projChips" role="group" aria-labelledby="projLbl"></div>
+      </div>
+      <button class="punch" id="punchBtn" type="button"><span id="punchLabel">Punch in</span><kbd>Enter</kbd></button>
+    </div>
+  </section>
+
+  <section class="card" id="stats" aria-label="Totals">
+    <div class="stat">
+      <div class="eyebrow">Today</div>
+      <div class="big" id="todayHm">0:00</div>
+      <div class="sub" id="todayDec">0.00 h</div>
+    </div>
+    <div class="stat">
+      <div class="eyebrow">This week</div>
+      <div class="big" id="weekHm">0:00</div>
+      <div class="sub" id="weekDec">0.00 h</div>
+    </div>
+    <div class="gauge">
+      <div class="eyebrow" id="goalLabel">Weekly goal · 40 h</div>
+      <div class="track" id="goalTrack" role="img" aria-label="Progress toward weekly goal"></div>
+      <div class="gauge-note"><span id="goalLeft">40:00 to go</span><span id="goalPct" class="num">0%</span></div>
+    </div>
+  </section>
+  <section class="card" id="projectsCard" aria-label="Projects and settings">
+    <h2>Projects</h2>
+    <div class="plist" id="plist"></div>
+    <div class="settings">
+      <label for="goal">Weekly goal</label>
+      <input class="text num" id="goal" type="number" min="0" max="168" step="0.5" inputmode="decimal" value="40">
+      <span>hours</span>
+    </div>
+    <p class="hint">Tap a color square to change a project's color. Archived projects keep their past entries.</p>
+  </section>
+  </div>
+
+  <div class="col-right">
+  <section class="card" id="weekCard" aria-label="Week">
+    <div class="row">
+      <h2>The week</h2>
+      <span class="spacer"></span>
+      <div class="weeknav">
+        <button class="icon-btn" type="button" data-action="week-prev" aria-label="Previous week"><svg viewBox="0 0 16 16"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <span class="range" id="weekRange">This week</span>
+        <button class="icon-btn" type="button" data-action="week-next" aria-label="Next week"><svg viewBox="0 0 16 16"><path d="m6 3 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <button class="btn" type="button" data-action="week-now" id="weekNowBtn" hidden>Back to this week</button>
+      </div>
+    </div>
+    <div class="plot" id="plot"></div>
+    <div class="days" id="days"></div>
+    <div class="breakdown" id="breakdown"></div>
+  </section>
+
+  <section class="card" id="logCard" aria-label="Time card">
+    <div class="log-head">
+      <h2>Time card</h2>
+      <span class="spacer"></span>
+      <button class="btn" type="button" data-action="add-entry">+ Add time</button>
+      <button class="btn" type="button" data-action="export" id="exportBtn" title="Export this week as a CSV timesheet">Export CSV</button>
+    </div>
+    <div id="csvPanel"></div>
+    <div id="newEditor"></div>
+    <div id="log"><div class="empty"><strong>Opening your time card…</strong>Your entries will show here, grouped by day.</div></div>
+  </section>
+  </div>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const PALETTE = ["#3b6fd4", "#d9572b", "#2f9e6e", "#b9468f", "#c2951a", "#6a5fd0", "#1f97ad", "#8c6b4f"];
+  const NO_PROJECT_COLOR = "var(--muted)";
+  const HOUR = 3600000, DAY = 86400000;
+  const LOCAL_KEY = "iron-jiyu-tracker.v1";
+  const SUGGESTED = ["Iron Paws", "JIYU", "Admin"];
+
+  const state = {
+    ready: false,
+    entries: [],
+    projects: [],
+    settings: {},
+    weekOffset: 0,
+    selectedProject: "",
+    editing: null,
+    confirmDelete: null,
+    addingProject: false,
+    csv: null,
+  };
+
+  let store = null;
+  let downloads = null;
+  let descTimer = null;
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const newId = (p) => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const strip = (o) => { const c = Object.assign({}, o); delete c.id; return c; };
+
+  /* ---------- time helpers ---------- */
+  const pad = (n) => String(n).padStart(2, "0");
+  function hms(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s / 60) % 60) + ":" + pad(s % 60); }
+  function hm(ms) { const m = Math.max(0, Math.floor(ms / 60000)); return Math.floor(m / 60) + ":" + pad(m % 60); }
+  function dec(ms) { return (Math.max(0, ms) / HOUR).toFixed(2); }
+  function clockTime(t) { return new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); }
+  function ymd(d) { return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()); }
+  function hhmm(d) { return pad(d.getHours()) + ":" + pad(d.getMinutes()); }
+  function dayStart(t) { const d = new Date(t); d.setHours(0, 0, 0, 0); return d; }
+  function weekStart(offset) { const d = dayStart(Date.now()); d.setDate(d.getDate() - ((d.getDay() + 6) % 7) + 7 * (offset || 0)); return d; }
+  function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+  function sameDay(a, b) { return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate(); }
+  function dur(e, now) { return Math.max(0, (e.end == null ? now : e.end) - e.start); }
+  function parseLocal(dateStr, timeStr) {
+    const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr || ""), tm = /^(\d{1,2}):(\d{2})/.exec(timeStr || "");
+    if (!dm || !tm) return NaN;
+    return new Date(+dm[1], +dm[2] - 1, +dm[3], +tm[1], +tm[2], 0, 0).getTime();
+  }
+
+  /* ---------- data helpers ---------- */
+  function running() { let r = null; for (const e of state.entries) if (e.end == null && (!r || e.start > r.start)) r = e; return r; }
+  function projectById(id) { return state.projects.find((p) => p.id === id) || null; }
+  function projColor(id) { const p = projectById(id); return p ? p.color : NO_PROJECT_COLOR; }
+  function projName(id) { const p = projectById(id); return p ? p.name : "No project"; }
+  function activeProjects() { return state.projects.filter((p) => !p.archived).sort((a, b) => (a.created || 0) - (b.created || 0)); }
+  function weekGoal() { const g = Number(state.settings.weeklyGoal); return isFinite(g) && g >= 0 ? g : 40; }
+  function entriesBetween(a, b) { return state.entries.filter((e) => e.start >= a && e.start < b); }
+  function totalBetween(a, b, now) { return entriesBetween(a, b).reduce((s, e) => s + dur(e, now), 0); }
+
+  /* ---------- stores ---------- */
+  function applyData(d) {
+    state.entries = d.entries.filter((e) => e && typeof e.start === "number").sort((a, b) => b.start - a.start);
+    state.projects = d.projects.filter((p) => p && p.name);
+    state.settings = d.settings || {};
+    state.ready = true;
+    renderAll();
+  }
+
+  function makeLocalStore(carry) {
+    let data = { entries: {}, projects: {}, settings: {} };
+    let persistent = true;
+    try {
+      const raw = localStorage.getItem(LOCAL_KEY);
+      if (raw) { const p = JSON.parse(raw); data = { entries: p.entries || {}, projects: p.projects || {}, settings: p.settings || {} }; }
+      localStorage.setItem(LOCAL_KEY + ".probe", "1"); localStorage.removeItem(LOCAL_KEY + ".probe");
+    } catch (e) { persistent = false; }
+    if (carry) {
+      carry.entries.forEach((e) => { data.entries[e.id] = strip(e); });
+      carry.projects.forEach((p) => { data.projects[p.id] = strip(p); });
+      if (carry.settings && Object.keys(carry.settings).length) data.settings = Object.assign({}, carry.settings);
+    }
+    const save = () => { try { localStorage.setItem(LOCAL_KEY, JSON.stringify(data)); } catch (e) { persistent = false; setMode("local"); } };
+    const toList = (m) => Object.keys(m).map((id) => Object.assign({ id }, m[id]));
+    const emit = () => applyData({ entries: toList(data.entries), projects: toList(data.projects), settings: data.settings });
+    if (carry) save();
+    return {
+      kind: "local",
+      get persistent() { return persistent; },
+      start() { emit(); },
+      stop() {},
+      putEntry(id, body) { data.entries[id] = body; save(); emit(); return Promise.resolve(); },
+      deleteEntry(id) { delete data.entries[id]; save(); emit(); return Promise.resolve(); },
+      putProject(id, body) { data.projects[id] = body; save(); emit(); return Promise.resolve(); },
+      putSettings(body) { data.settings = body; save(); emit(); return Promise.resolve(); },
+    };
+  }
+
+  function makeDbStore(db, uid) {
+    const root = db.doc("data/users/" + uid + "/tracker");
+    const entriesCol = root.collection("entries");
+    const projectsCol = root.collection("projects");
+    const queues = new Map();
+    let unsubs = [];
+    let ents = null, projs = [], sets = {};
+    let restarts = 0;
+    const push = () => { if (ents) applyData({ entries: ents, projects: projs, settings: sets }); };
+
+    function onSubError(err) {
+      const code = err && err.code;
+      if (code === "unavailable" && restarts < 3) {
+        restarts++;
+        stop();
+        setTimeout(start, 1500 + Math.random() * 2500);
+        return;
+      }
+      fallBackToLocal();
+    }
+    function start() {
+      unsubs.push(entriesCol.orderBy("start", "desc").limit(1000).onSnapshot((s) => {
+        ents = s.docs.map((d) => Object.assign({ id: d.id }, d.data()));
+        push();
+      }, onSubError));
+      unsubs.push(projectsCol.onSnapshot((s) => {
+        projs = s.docs.map((d) => Object.assign({ id: d.id }, d.data()));
+        push();
+      }, onSubError));
+      unsubs.push(root.onSnapshot((s) => {
+        sets = s.exists ? Object.assign({}, s.data()) : {};
+        push();
+      }, onSubError));
+    }
+    function stop() { unsubs.forEach((u) => { try { u(); } catch (e) {} }); unsubs = []; }
+
+    // One write at a time per document; a transient failure gets one retry.
+    function write(key, op) {
+      const prev = queues.get(key) || Promise.resolve();
+      const next = prev.catch(() => {}).then(async () => {
+        try { await op(); }
+        catch (e) {
+          if (e && e.code === "unavailable") { await sleep(400 + Math.random() * 900); await op(); }
+          else throw e;
+        }
+      });
+      queues.set(key, next);
+      return next;
+    }
+    return {
+      kind: "db",
+      persistent: true,
+      start, stop,
+      putEntry(id, body) { return write("e/" + id, () => entriesCol.doc(id).set(body)); },
+      deleteEntry(id) { return write("e/" + id, () => entriesCol.doc(id).delete()); },
+      putProject(id, body) { return write("p/" + id, () => projectsCol.doc(id).set(body)); },
+      putSettings(body) { return write("settings", () => root.set(body)); },
+    };
+  }
+
+  function fallBackToLocal() {
+    if (store && store.kind === "local") return;
+    const carry = state.ready ? { entries: state.entries, projects: state.projects, settings: state.settings } : null;
+    try { store && store.stop(); } catch (e) {}
+    store = makeLocalStore(carry);
+    setMode("local");
+    store.start();
+    toast("Your account storage isn't available here, so entries now save in this browser.");
+  }
+
+  function persist(method, ...args) {
+    if (!store) return;
+    return store[method](...args).catch((err) => {
+      const code = err && err.code;
+      if (code === "quota_exceeded") { toast("Storage is full. Delete some old entries, then try again."); return; }
+      if (code === "resource_exhausted") { toast("Saving too fast. Wait a moment and try again."); return; }
+      if (store.kind === "db") { fallBackToLocal(); return store[method](...args); }
+      toast("Couldn't save that change.");
+    });
+  }
+  const saveEntry = (id, body) => persist("putEntry", id, body);
+  const removeEntry = (id) => persist("deleteEntry", id);
+  const saveProject = (id, body) => persist("putProject", id, body);
+  const saveSettings = (body) => persist("putSettings", body);
+
+  function setMode(mode) {
+    const pill = $("syncPill"), text = $("syncText");
+    pill.dataset.mode = mode;
+    if (mode === "db") { text.textContent = "Saved to your account"; pill.title = "Entries sync wherever you open this page signed in. Only you can see them."; }
+    else if (store && !store.persistent) { text.textContent = "Not saved after you leave"; pill.title = "This browser is blocking storage, so entries last only while the page is open."; }
+    else { text.textContent = "Saved in this browser"; pill.title = "Open this page signed in to claude.ai to keep entries in your account."; }
+  }
+
+  /* ---------- actions ---------- */
+  function punchIn() {
+    const now = Date.now();
+    closeRunning(now);
+    const desc = $("task").value.trim();
+    const id = newId("e_");
+    saveEntry(id, { desc, projectId: state.selectedProject || "", start: now, end: null, updated: now });
+  }
+  function closeRunning(now) {
+    clearTimeout(descTimer); descTimer = null;
+    const cur = running();
+    state.entries.filter((e) => e.end == null).forEach((e) => {
+      const body = strip(e);
+      if (e === cur) body.desc = $("task").value.trim();
+      body.end = Math.max(now, e.start); body.updated = now;
+      saveEntry(e.id, body);
+    });
+  }
+  function punchOut() {
+    const r = running();
+    const now = Date.now();
+    closeRunning(now);
+    $("task").value = "";
+    if (r) toast("Punched out · " + hm(now - r.start) + " logged");
+  }
+  function continueEntry(id) {
+    const e = state.entries.find((x) => x.id === id);
+    if (!e) return;
+    const now = Date.now();
+    closeRunning(now);
+    state.selectedProject = e.projectId || "";
+    $("task").value = e.desc || "";
+    saveEntry(newId("e_"), { desc: e.desc || "", projectId: e.projectId || "", start: now, end: null, updated: now });
+    window.scrollTo({ top: 0, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  }
+  function selectProject(pid) {
+    state.selectedProject = pid;
+    const r = running();
+    if (r && (r.projectId || "") !== pid) saveEntry(r.id, Object.assign(strip(r), { projectId: pid, updated: Date.now() }));
+    renderChips();
+  }
+  function addProject(name) {
+    name = (name || "").trim().slice(0, 60);
+    if (!name) return null;
+    const existing = state.projects.find((p) => p.name.toLowerCase() === name.toLowerCase());
+    if (existing) {
+      if (existing.archived) saveProject(existing.id, Object.assign(strip(existing), { archived: false }));
+      return existing.id;
+    }
+    const used = new Set(state.projects.map((p) => p.color));
+    const color = PALETTE.find((c) => !used.has(c)) || PALETTE[state.projects.length % PALETTE.length];
+    const id = newId("p_");
+    saveProject(id, { name, color, archived: false, created: Date.now() });
+    return id;
+  }
+
+  function openEditor(id) {
+    const now = Date.now();
+    let draft, isNew = !id, live = false;
+    if (id) {
+      const e = state.entries.find((x) => x.id === id);
+      if (!e) return;
+      live = e.end == null;
+      const s = new Date(e.start);
+      draft = { desc: e.desc || "", projectId: e.projectId || "", date: ymd(s), start: hhmm(s), end: live ? "" : hhmm(new Date(e.end)) };
+    } else {
+      const ws = weekStart(state.weekOffset);
+      let s, en;
+      if (state.weekOffset === 0) {
+        const q = 15 * 60000;
+        en = new Date(Math.round(now / q) * q);
+        s = new Date(en.getTime() - HOUR);
+      } else { s = new Date(ws); s.setHours(9, 0, 0, 0); en = new Date(ws); en.setHours(10, 0, 0, 0); }
+      draft = { desc: "", projectId: state.selectedProject || "", date: ymd(s), start: hhmm(s), end: hhmm(en) };
+    }
+    state.editing = { id: id || null, isNew, live, draft, error: "" };
+    state.confirmDelete = null;
+    renderLog();
+    const f = $("ed-desc"); if (f) f.focus();
+  }
+  function saveEditor() {
+    const ed = state.editing; if (!ed) return;
+    const d = ed.draft, now = Date.now();
+    const start = parseLocal(d.date, d.start);
+    if (!isFinite(start)) { ed.error = "Enter a date and a start time."; return renderLog(); }
+    let end = null;
+    if (!ed.live) {
+      end = parseLocal(d.date, d.end);
+      if (!isFinite(end)) { ed.error = "Enter an end time."; return renderLog(); }
+      if (end <= start) end = addDays(new Date(end), 1).getTime(); // past midnight
+      if (end - start > DAY) { ed.error = "An entry can't be longer than 24 hours."; return renderLog(); }
+    }
+    if (start > now) { ed.error = "The start time is in the future."; return renderLog(); }
+    const existing = ed.id ? state.entries.find((x) => x.id === ed.id) : null;
+    const body = Object.assign(existing ? strip(existing) : {}, { desc: d.desc.trim().slice(0, 200), projectId: d.projectId || "", start, end, updated: now });
+    const id = ed.id || newId("e_");
+    state.editing = null;
+    // Jump to the week the entry landed in.
+    const ws0 = weekStart(0).getTime();
+    state.weekOffset = Math.floor((weekStartOf(start) - ws0) / (7 * DAY) + 0.5);
+    saveEntry(id, body);
+    if (!existing) toast("Added " + hm((end == null ? now : end) - start) + " to " + new Date(start).toLocaleDateString([], { weekday: "long" }));
+    renderAll();
+  }
+  function weekStartOf(t) { const d = dayStart(t); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return d.getTime(); }
+
+  function buildCsv() {
+    const ws = weekStart(state.weekOffset), we = addDays(ws, 7), now = Date.now();
+    const rows = entriesBetween(ws.getTime(), we.getTime()).slice().sort((a, b) => a.start - b.start);
+    const q = (v) => { const s = String(v == null ? "" : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const lines = [["Date", "Start", "End", "Hours", "Duration", "Project", "Description"].join(",")];
+    let total = 0;
+    rows.forEach((e) => {
+      const d = dur(e, now); total += d;
+      lines.push([ymd(new Date(e.start)), hhmm(new Date(e.start)), e.end == null ? "running" : hhmm(new Date(e.end)), dec(d), hm(d), projName(e.projectId), e.desc || ""].map(q).join(","));
+    });
+    lines.push(["Total", "", "", dec(total), hm(total), "", ""].join(","));
+    return { csv: lines.join("\n") + "\n", filename: "iron-jiyu-week-" + ymd(ws) + ".csv", count: rows.length };
+  }
+  function exportWeek() {
+    const out = buildCsv();
+    if (!out.count) { toast("No entries in this week to export."); return; }
+    if (downloads) {
+      downloads.save({ filename: out.filename, data: out.csv }).then(
+        () => toast("Saved " + out.filename),
+        (err) => { if (err && err.code === "declined") return; showCsv(out.csv); }
+      );
+      return;
+    }
+    let p = null;
+    try { p = navigator.clipboard && navigator.clipboard.writeText(out.csv); } catch (e) { p = null; }
+    if (p && p.then) p.then(() => toast("Copied the week as CSV. Paste it into a spreadsheet."), () => showCsv(out.csv));
+    else showCsv(out.csv);
+  }
+  function showCsv(csv) { state.csv = csv; renderCsv(); const t = $("csvText"); if (t) { t.focus(); t.select(); } }
+
+  /* ---------- rendering ---------- */
+  function renderAll() { renderClock(); renderChips(); renderStats(); renderWeek(); renderLog(); renderProjects(); }
+
+  function renderClock() {
+    const r = running(), now = Date.now();
+    $("clock").classList.toggle("is-running", !!r);
+    $("clockState").textContent = r ? "On the clock" : "Off the clock";
+    $("readout").textContent = hms(r ? now - r.start : 0);
+    $("punchLabel").textContent = r ? "Punch out" : "Punch in";
+    if (r) {
+      $("since").textContent = "Since " + clockTime(r.start) + " · " + projName(r.projectId);
+      if (document.activeElement !== $("task") && !descTimer) $("task").value = r.desc || "";
+      state.selectedProject = r.projectId || "";
+    } else {
+      const last = state.entries[0];
+      $("since").textContent = !state.ready ? "Opening your time card…"
+        : last && last.end ? "Last punched out " + relDay(last.end) + " at " + clockTime(last.end)
+        : "Type what you're working on, then punch in.";
+    }
+  }
+  function relDay(t) {
+    const d = new Date(t), today = new Date();
+    if (sameDay(d, today)) return "today";
+    if (sameDay(d, addDays(dayStart(Date.now()), -1))) return "yesterday";
+    return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  }
+
+  function renderChips() {
+    const el = $("projChips");
+    const sel = state.selectedProject || "";
+    let h = '<button type="button" class="chip" data-action="pick" data-pid="" aria-pressed="' + (sel === "" ? "true" : "false") + '"><span class="sw" style="background:' + NO_PROJECT_COLOR + '"></span>No project</button>';
+    activeProjects().forEach((p) => {
+      h += '<button type="button" class="chip" data-action="pick" data-pid="' + esc(p.id) + '" aria-pressed="' + (sel === p.id ? "true" : "false") + '"><span class="sw" style="background:' + esc(p.color) + '"></span>' + esc(p.name) + "</button>";
+    });
+    if (state.addingProject) {
+      h += '<form class="newproj" data-form="newproj"><input class="text" id="newProjName" maxlength="60" placeholder="Project name" autocomplete="off"><button class="btn primary" type="submit">Add</button><button class="btn" type="button" data-action="cancel-proj">Cancel</button></form>';
+    } else {
+      if (state.ready && !state.projects.length) {
+        SUGGESTED.forEach((n) => { h += '<button type="button" class="chip suggest" data-action="suggest" data-name="' + esc(n) + '">+ ' + esc(n) + "</button>"; });
+      }
+      h += '<button type="button" class="chip add" data-action="new-proj">+ New project</button>';
+    }
+    const hadFocus = document.activeElement && document.activeElement.id === "newProjName";
+    const val = hadFocus ? document.activeElement.value : "";
+    el.innerHTML = h;
+    if (hadFocus && $("newProjName")) { $("newProjName").value = val; $("newProjName").focus(); }
+  }
+
+  function renderStats() {
+    const now = Date.now();
+    const t0 = dayStart(now).getTime(), t1 = addDays(new Date(t0), 1).getTime();
+    const w0 = weekStart(0).getTime(), w1 = addDays(weekStart(0), 7).getTime();
+    const today = totalBetween(t0, t1, now), week = totalBetween(w0, w1, now);
+    $("todayHm").textContent = hm(today); $("todayDec").textContent = dec(today) + " h";
+    $("weekHm").textContent = hm(week); $("weekDec").textContent = dec(week) + " h";
+    const goal = weekGoal() * HOUR;
+    $("goalLabel").textContent = "Weekly goal · " + fmtGoal(weekGoal()) + " h";
+    // Segmented by project so the gauge reads like a stacked time card.
+    const byProj = new Map();
+    entriesBetween(w0, w1).forEach((e) => byProj.set(e.projectId || "", (byProj.get(e.projectId || "") || 0) + dur(e, now)));
+    const denom = Math.max(goal, week, 1);
+    let segs = "";
+    [...byProj.entries()].sort((a, b) => b[1] - a[1]).forEach(([pid, ms]) => { segs += '<span style="width:' + (ms / denom * 100).toFixed(2) + "%;background:" + esc(projColor(pid)) + '"></span>'; });
+    $("goalTrack").innerHTML = segs;
+    if (!goal) { $("goalLeft").textContent = "No weekly goal set"; $("goalPct").textContent = ""; }
+    else if (week >= goal) { $("goalLeft").textContent = "Goal met · +" + hm(week - goal) + " over"; $("goalPct").textContent = Math.round(week / goal * 100) + "%"; }
+    else { $("goalLeft").textContent = hm(goal - week) + " to go"; $("goalPct").textContent = Math.floor(week / goal * 100) + "%"; }
+    $("goalTrack").setAttribute("aria-label", hm(week) + " of " + fmtGoal(weekGoal()) + " hours this week");
+  }
+  function fmtGoal(g) { return Number.isInteger(g) ? String(g) : g.toFixed(1); }
+
+  function renderWeek() {
+    const now = Date.now(), ws = weekStart(state.weekOffset), we = addDays(ws, 7);
+    const off = state.weekOffset;
+    const fmt = (d, o) => d.toLocaleDateString([], o);
+    const last = addDays(ws, 6);
+    const range = ws.getMonth() === last.getMonth() ? fmt(ws, { month: "short", day: "numeric" }) + "–" + last.getDate() : fmt(ws, { month: "short", day: "numeric" }) + " – " + fmt(last, { month: "short", day: "numeric" });
+    $("weekRange").textContent = (off === 0 ? "This week · " : off === -1 ? "Last week · " : "") + range;
+    $("weekNowBtn").hidden = off === 0;
+
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const d0 = addDays(ws, i), d1 = addDays(ws, i + 1);
+      const list = entriesBetween(d0.getTime(), d1.getTime());
+      const by = new Map();
+      list.forEach((e) => by.set(e.projectId || "", (by.get(e.projectId || "") || 0) + dur(e, now)));
+      days.push({ d: d0, total: list.reduce((s, e) => s + dur(e, now), 0), by });
+    }
+    const target = weekGoal() / 5;
+    const maxH = Math.max(1, Math.ceil(Math.max(target, ...days.map((x) => x.total / HOUR)) * 1.12)); // headroom for labels
+    let plot = "";
+    if (target > 0) plot += '<div class="target" style="bottom:' + (target / maxH * 100).toFixed(2) + '%"><b>' + fmtGoal(target) + "h/day</b></div>";
+    days.forEach((x) => {
+      const hPct = x.total / HOUR / maxH * 100;
+      let segs = "";
+      [...x.by.entries()].sort((a, b) => b[1] - a[1]).forEach(([pid, ms]) => { segs += '<span style="height:' + (x.total ? ms / x.total * 100 : 0).toFixed(2) + "%;background:" + esc(projColor(pid)) + '"></span>'; });
+      plot += '<div class="col">' + (x.total ? '<div class="bar" style="height:' + hPct.toFixed(2) + '%">' + segs + "</div>" : "") +
+        (x.total ? '<div class="val" style="bottom:calc(' + hPct.toFixed(2) + '% + 4px)"><span>' + hm(x.total) + "</span></div>" : "") + "</div>";
+    });
+    $("plot").innerHTML = plot;
+    $("plot").setAttribute("role", "img");
+    $("plot").setAttribute("aria-label", "Hours per day: " + days.map((x) => fmt(x.d, { weekday: "short" }) + " " + hm(x.total)).join(", "));
+    const today = new Date();
+    $("days").innerHTML = days.map((x) => '<div class="' + (sameDay(x.d, today) ? "today" : "") + '">' + fmt(x.d, { weekday: "short" }) + "<b>" + x.d.getDate() + "</b></div>").join("");
+
+    const tot = new Map();
+    let all = 0;
+    entriesBetween(ws.getTime(), we.getTime()).forEach((e) => { const ms = dur(e, now); all += ms; tot.set(e.projectId || "", (tot.get(e.projectId || "") || 0) + ms); });
+    if (!all) { $("breakdown").innerHTML = '<p class="hint">No hours logged ' + (off === 0 ? "yet this week." : "this week.") + "</p>"; return; }
+    $("breakdown").innerHTML = '<div class="eyebrow">By project · ' + hm(all) + " total</div>" + [...tot.entries()].sort((a, b) => b[1] - a[1]).map(([pid, ms]) => {
+      const pct = ms / all * 100;
+      return '<div class="brow"><span class="name"><span class="sw" style="background:' + esc(projColor(pid)) + '"></span><span>' + esc(projName(pid)) + '</span></span><span class="h">' + hm(ms) + '</span><span class="d">' + dec(ms) + ' h</span><div class="mini"><span style="width:' + pct.toFixed(1) + "%;background:" + esc(projColor(pid)) + '"></span></div></div>';
+    }).join("");
+  }
+
+  function editorHtml(ed) {
+    const d = ed.draft;
+    const opts = ['<option value="">No project</option>'].concat(
+      state.projects.filter((p) => !p.archived || p.id === d.projectId).map((p) => '<option value="' + esc(p.id) + '"' + (p.id === d.projectId ? " selected" : "") + ">" + esc(p.name) + "</option>")
+    ).join("");
+    return '<form class="editor" data-form="editor">' +
+      '<div class="field"><label for="ed-desc">Description</label><input class="text" id="ed-desc" data-draft="desc" maxlength="200" autocomplete="off" value="' + esc(d.desc) + '" placeholder="What did you work on?"></div>' +
+      '<div class="grid">' +
+        '<div class="field wide"><label for="ed-proj">Project</label><select class="text" id="ed-proj" data-draft="projectId">' + opts + "</select></div>" +
+        '<div class="field wide"><label for="ed-date">Date</label><input class="text" id="ed-date" type="date" data-draft="date" value="' + esc(d.date) + '"></div>' +
+        '<div class="field"><label for="ed-start">Start</label><input class="text" id="ed-start" type="time" data-draft="start" value="' + esc(d.start) + '"></div>' +
+        (ed.live ? '<div class="field"><span class="lbl">End</span><div class="tag-live" style="padding-top:10px">Still running</div></div>'
+                 : '<div class="field"><label for="ed-end">End</label><input class="text" id="ed-end" type="time" data-draft="end" value="' + esc(d.end) + '"></div>') +
+      "</div>" +
+      (ed.error ? '<div class="err" role="alert">' + esc(ed.error) + "</div>" : "") +
+      '<div class="row"><button class="btn primary" type="submit">' + (ed.isNew ? "Add entry" : "Save") + '</button><button class="btn" type="button" data-action="cancel-edit">Cancel</button>' +
+      (ed.isNew ? "" : '<span class="spacer"></span><span class="hint" style="margin:0">An end before the start counts as past midnight.</span>') + "</div>" +
+      "</form>";
+  }
+
+  function renderLog() {
+    const active = document.activeElement, activeId = active && active.id && active.id.indexOf("ed-") === 0 ? active.id : null;
+    let sel = null;
+    try { if (activeId && typeof active.selectionStart === "number") sel = [active.selectionStart, active.selectionEnd]; } catch (e) {}
+    const ed = state.editing;
+    $("newEditor").innerHTML = ed && ed.isNew ? editorHtml(ed) : "";
+    if (!state.ready) return;
+    const now = Date.now(), ws = weekStart(state.weekOffset);
+    const list = entriesBetween(ws.getTime(), addDays(ws, 7).getTime());
+    let h = "";
+    if (!list.length) {
+      h = '<div class="empty"><strong>' + (state.weekOffset === 0 ? "Nothing on the card this week yet." : "No time logged this week.") + "</strong>" +
+        (state.weekOffset === 0 ? "Punch in to start the clock, or use + Add time for work you forgot to track." : "Use + Add time to fill in hours for this week.") + "</div>";
+    } else {
+      const groups = new Map();
+      list.forEach((e) => { const k = ymd(new Date(e.start)); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(e); });
+      groups.forEach((items, k) => {
+        const d = new Date(items[0].start);
+        const tot = items.reduce((s, e) => s + dur(e, now), 0);
+        const isToday = sameDay(d, new Date());
+        h += '<div class="day"><div class="day-head"><h3>' + (isToday ? "Today · " : "") + esc(d.toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" })) + '</h3><span class="tot"><b>' + hm(tot) + "</b> · " + dec(tot) + " h</span></div>";
+        items.forEach((e) => {
+          const live = e.end == null;
+          const editingThis = ed && !ed.isNew && ed.id === e.id;
+          h += '<div class="entry' + (live ? " live" : "") + '" data-id="' + esc(e.id) + '">' +
+            '<span class="stripe" style="background:' + esc(projColor(e.projectId)) + '"></span>' +
+            '<div class="what"><div class="desc' + (e.desc ? "" : " none") + '">' + (e.desc ? esc(e.desc) : "No description") + "</div>" +
+              '<div class="meta"><span>' + esc(projName(e.projectId)) + '</span><span class="num"><span class="t">' + clockTime(e.start) + "</span> – " + (live ? '<span class="tag-live">now</span>' : '<span class="t">' + clockTime(e.end) + "</span>") + "</span></div></div>" +
+            '<div class="dur"><span' + (live ? ' data-live="' + e.start + '"' : "") + ">" + hm(dur(e, now)) + '</span><small>' + dec(dur(e, now)) + " h</small></div>" +
+            '<div class="acts">' +
+              (live ? "" : '<button class="icon-btn" type="button" data-action="continue" data-id="' + esc(e.id) + '" aria-label="Start this task again" title="Start again"><svg viewBox="0 0 16 16"><path d="M5 3.5v9l7-4.5z" fill="currentColor"/></svg></button>') +
+              '<button class="icon-btn" type="button" data-action="edit" data-id="' + esc(e.id) + '" aria-label="Edit entry" title="Edit"><svg viewBox="0 0 16 16"><path d="M3 11.5V13h1.5l7.3-7.3-1.5-1.5zM12.6 4.9l-1.5-1.5 1-1 1.5 1.5z" fill="currentColor"/></svg></button>' +
+              '<button class="icon-btn" type="button" data-action="ask-delete" data-id="' + esc(e.id) + '" aria-label="Delete entry" title="Delete"><svg viewBox="0 0 16 16"><path d="M4 4.5h8M6.5 4.5V3h3v1.5M5 4.5l.6 8.5h4.8l.6-8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg></button>' +
+            "</div>" +
+            (state.confirmDelete === e.id ? '<div class="confirm"><span>Delete this entry' + (live ? " and stop the clock" : "") + '?</span><button class="btn danger solid" type="button" data-action="delete" data-id="' + esc(e.id) + '">Delete</button><button class="btn" type="button" data-action="keep">Keep</button></div>' : "") +
+            (editingThis ? editorHtml(ed) : "") +
+            "</div>";
+        });
+        h += "</div>";
+      });
+    }
+    $("log").innerHTML = h;
+    const back = activeId && $(activeId);
+    if (back) { back.focus(); if (sel) try { back.setSelectionRange(sel[0], sel[1]); } catch (e) {} }
+  }
+
+  function renderCsv() {
+    $("csvPanel").innerHTML = state.csv == null ? "" :
+      '<div class="editor csvbox"><label class="lbl" for="csvText">This week as CSV. Select all and copy it into a spreadsheet.</label><textarea id="csvText" readonly>' + esc(state.csv) + '</textarea><div class="row"><button class="btn primary" type="button" data-action="copy-csv">Copy</button><button class="btn" type="button" data-action="close-csv">Close</button></div></div>';
+  }
+
+  function renderProjects() {
+    const el = $("plist");
+    if (document.activeElement && document.activeElement.closest && document.activeElement.closest("#plist")) return; // don't yank a name being typed
+    const now = Date.now(), w0 = weekStart(0).getTime(), w1 = addDays(weekStart(0), 7).getTime();
+    if (!state.projects.length) {
+      el.innerHTML = '<p class="hint">' + (state.ready ? "No projects yet. Add one from the punch clock with + New project." : "Loading…") + "</p>";
+    } else {
+      const sorted = state.projects.slice().sort((a, b) => (a.archived ? 1 : 0) - (b.archived ? 1 : 0) || (a.created || 0) - (b.created || 0));
+      el.innerHTML = sorted.map((p) => {
+        const wk = entriesBetween(w0, w1).filter((e) => e.projectId === p.id).reduce((s, e) => s + dur(e, now), 0);
+        return '<div class="prow' + (p.archived ? " archived" : "") + '">' +
+          '<button class="swbtn" type="button" data-action="recolor" data-pid="' + esc(p.id) + '" style="background:' + esc(p.color) + '" aria-label="Change color of ' + esc(p.name) + '"></button>' +
+          '<input class="text" id="pname-' + esc(p.id) + '" data-pname="' + esc(p.id) + '" value="' + esc(p.name) + '" maxlength="60" aria-label="Project name">' +
+          '<span class="h" title="This week">' + hm(wk) + "</span>" +
+          '<button class="btn" type="button" data-action="archive" data-pid="' + esc(p.id) + '">' + (p.archived ? "Restore" : "Archive") + "</button></div>";
+      }).join("");
+    }
+    if (document.activeElement !== $("goal")) $("goal").value = fmtGoal(weekGoal());
+  }
+
+  /* ---------- tick ---------- */
+  let lastMinute = -1;
+  setInterval(() => {
+    if (!state.ready) return;
+    const r = running(), now = Date.now();
+    if (r) {
+      $("readout").textContent = hms(now - r.start);
+      document.querySelectorAll("[data-live]").forEach((s) => {
+        const ms = now - Number(s.dataset.live);
+        s.textContent = hm(ms);
+        if (s.nextElementSibling) s.nextElementSibling.textContent = dec(ms) + " h";
+      });
+      renderStats();
+    }
+    const m = Math.floor(now / 60000);
+    if (m !== lastMinute) {
+      const dayChanged = lastMinute !== -1 && !sameDay(new Date(lastMinute * 60000), new Date(now));
+      lastMinute = m;
+      if (r) renderWeek();
+      if (dayChanged) renderAll();
+    }
+  }, 1000);
+
+  /* ---------- events ---------- */
+  document.addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-action]");
+    if (!b) return;
+    const a = b.dataset.action, id = b.dataset.id, pid = b.dataset.pid;
+    switch (a) {
+      case "pick": selectProject(pid || ""); break;
+      case "suggest": { const nid = addProject(b.dataset.name); if (nid) selectProject(nid); break; }
+      case "new-proj": state.addingProject = true; renderChips(); $("newProjName") && $("newProjName").focus(); break;
+      case "cancel-proj": state.addingProject = false; renderChips(); break;
+      case "week-prev": state.weekOffset--; state.editing = state.editing && state.editing.isNew ? null : state.editing; renderWeek(); renderLog(); break;
+      case "week-next": state.weekOffset++; renderWeek(); renderLog(); break;
+      case "week-now": state.weekOffset = 0; renderWeek(); renderLog(); break;
+      case "add-entry": openEditor(null); break;
+      case "edit": openEditor(id); break;
+      case "cancel-edit": state.editing = null; renderLog(); break;
+      case "continue": continueEntry(id); break;
+      case "ask-delete": state.confirmDelete = id; renderLog(); break;
+      case "keep": state.confirmDelete = null; renderLog(); break;
+      case "delete": {
+        const e = state.entries.find((x) => x.id === id);
+        state.confirmDelete = null;
+        if (state.editing && state.editing.id === id) state.editing = null;
+        if (e && e.end == null) { $("task").value = ""; clearTimeout(descTimer); descTimer = null; }
+        removeEntry(id);
+        toast("Entry deleted");
+        break;
+      }
+      case "export": exportWeek(); break;
+      case "copy-csv": {
+        const t = $("csvText"); if (!t) break;
+        t.select();
+        let p = null;
+        try { p = navigator.clipboard && navigator.clipboard.writeText(t.value); } catch (e) { p = null; }
+        if (p && p.then) p.then(() => toast("Copied"), () => toast("Press Ctrl+C or Cmd+C to copy the selected text."));
+        else toast("Press Ctrl+C or Cmd+C to copy the selected text.");
+        break;
+      }
+      case "close-csv": state.csv = null; renderCsv(); break;
+      case "recolor": {
+        const p = projectById(pid); if (!p) break;
+        const i = PALETTE.indexOf(p.color);
+        saveProject(p.id, Object.assign(strip(p), { color: PALETTE[(i + 1) % PALETTE.length] }));
+        break;
+      }
+      case "archive": {
+        const p = projectById(pid); if (!p) break;
+        saveProject(p.id, Object.assign(strip(p), { archived: !p.archived }));
+        if (!p.archived && state.selectedProject === p.id && !running()) state.selectedProject = "";
+        break;
+      }
+    }
+  });
+
+  $("punchBtn").addEventListener("click", () => { if (!state.ready) return; running() ? punchOut() : punchIn(); });
+  $("task").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.isComposing) { ev.preventDefault(); if (!state.ready) return; if (!running()) punchIn(); else $("task").blur(); } });
+  $("task").addEventListener("input", () => {
+    const r = running(); if (!r) return;
+    clearTimeout(descTimer);
+    descTimer = setTimeout(() => {
+      descTimer = null;
+      const cur = running(); if (!cur) return;
+      const v = $("task").value.trim();
+      if (v !== (cur.desc || "")) saveEntry(cur.id, Object.assign(strip(cur), { desc: v, updated: Date.now() }));
+    }, 700);
+  });
+
+  document.addEventListener("submit", (ev) => {
+    const f = ev.target.closest("[data-form]");
+    if (!f) return;
+    ev.preventDefault();
+    if (f.dataset.form === "newproj") {
+      const nid = addProject($("newProjName").value);
+      state.addingProject = false;
+      if (nid) selectProject(nid); else renderChips();
+    } else if (f.dataset.form === "editor") saveEditor();
+  });
+
+  document.addEventListener("input", (ev) => {
+    const k = ev.target.dataset && ev.target.dataset.draft;
+    if (k && state.editing) { state.editing.draft[k] = ev.target.value; if (state.editing.error) state.editing.error = ""; }
+  });
+  document.addEventListener("change", (ev) => {
+    const t = ev.target;
+    if (t.dataset && t.dataset.draft && state.editing) state.editing.draft[t.dataset.draft] = t.value;
+    if (t.dataset && t.dataset.pname) {
+      const p = projectById(t.dataset.pname), name = t.value.trim().slice(0, 60);
+      if (p && name && name !== p.name) saveProject(p.id, Object.assign(strip(p), { name }));
+      else if (p) t.value = p.name;
+    }
+    if (t.id === "goal") {
+      const g = Math.min(168, Math.max(0, Math.round(Number(t.value) * 2) / 2));
+      if (isFinite(g) && g !== weekGoal()) saveSettings(Object.assign({}, state.settings, { weeklyGoal: g }));
+      else t.value = fmtGoal(weekGoal());
+    }
+  });
+  document.addEventListener("focusout", (ev) => {
+    if (ev.target.dataset && ev.target.dataset.pname) setTimeout(renderProjects, 0);
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (state.editing) { state.editing = null; renderLog(); }
+    else if (state.addingProject) { state.addingProject = false; renderChips(); }
+    else if (state.confirmDelete) { state.confirmDelete = null; renderLog(); }
+  });
+
+  let toastTimer = null;
+  function toast(msg) {
+    const t = $("toast");
+    t.textContent = msg; t.classList.add("show");
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+  }
+
+  /* ---------- boot ---------- */
+  renderAll();
+  (async () => {
+    let db = null, user = null, uid = null;
+    const c = window.claude;
+    if (c && typeof c.use === "function") {
+      try { [db, user, downloads] = await Promise.all([c.use("db"), c.use("user"), c.use("downloads")]); } catch (e) {}
+      if (user) { try { uid = await user.id(); } catch (e) { uid = null; } }
+    }
+    if (db && uid) {
+      try { store = makeDbStore(db, uid); setMode("db"); store.start(); return; }
+      catch (e) { store = null; }
+    }
+    store = makeLocalStore(null);
+    setMode("local");
+    store.start();
+  })();
+})();
+</script>
