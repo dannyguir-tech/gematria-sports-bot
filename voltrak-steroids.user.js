@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VolTrak Steroids
 // @namespace    voltrak-alert
-// @version      3.6.0
+// @version      3.7.0
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -145,12 +145,14 @@ const VTCore = (() => {
     return {at, mint: addrOf(x), price: number(x.p) ?? number(x.pu) ?? number(x.price), m1: w('1m'), m5: w('5m'), h1: w('1h')};
   }
   // Live GMGN view for assess(): trades seen since the first live message (`since`) plus GMGN's token_stat rollup.
-  function liveView(trades, stat, at, now, since) {
+  // bots (optional): botFlow() over the last 5 min; its organic trades give a bot-free flow window.
+  function liveView(trades, stat, at, now, since, bots) {
     if (!at) return null;
     const last = trades.reduce((a, b) => !a || b.at >= a.at ? b : a, null), price = stat?.price ?? last?.price ?? null;
     // pump.fun tokens have a fixed 1B supply, so market cap = price × 1e9.
     const marketCap = price > 0 && /pump/i.test(last?.ex || '') ? price * 1e9 : null;
-    return {at, stat, flow: trades.length ? windows(trades, now, ms => since <= now - ms) : null, price, marketCap, last};
+    return {at, stat, flow: trades.length ? windows(trades, now, ms => since <= now - ms) : null, price, marketCap, last,
+      organic: bots?.organic?.length ? windows(bots.organic, now, ms => since <= now - ms) : null, botShare: bots?.botShare ?? null};
   }
   function assess(call, s, now, error, flow, live) {
     // risks block the state (CAUTION); flags are call-time review notes shown next to the live state.
@@ -160,7 +162,7 @@ const VTCore = (() => {
     if (call?.holders > 0 && (call.fresh != null || call.bots != null)) reasons.push([call.fresh != null && Math.round(call.fresh/call.holders*100) + '% fresh-wallet', call.bots != null && Math.round(call.bots/call.holders*100) + '% bot/high-risk'].filter(Boolean).join(' and ') + ' labels of ' + call.holders + ' holders at call; categories can overlap');
     if (!call?.clusters?.length) missing.push('Call-time wallet clusters missing');
     const fresh = (x, ms) => !!x && now - x.at <= ms && x.at <= now + 1000;
-    const L = fresh(live, 15000) ? live : null, st = L && fresh(L.stat, 15000) ? L.stat : null, lf = L?.flow || null;
+    const L = fresh(live, 15000) ? live : null, st = L && fresh(L.stat, 15000) ? L.stat : null, lf = L?.flow || null, lo = L?.organic || null;
     const f = fresh(flow, 30000) ? flow : null, dex = !error && fresh(s, 30000) ? s : null;
     if (!st && !lf && !f) missing.push('1m trade flow unavailable');
     if (!lf && !f) missing.push('Unique trading wallets unavailable');
@@ -169,10 +171,13 @@ const VTCore = (() => {
         reasons:[error || (s ? 'Snapshot fetch is stale' : 'No live or indexed data yet'), ...reasons]};
     }
     if (error) missing.push(error);
-    // Gauge source, best first: GMGN's own 1m rollup, live trades, GeckoTerminal 1m, GMGN 5m, DEX Screener 5m counts.
+    // Gauge source, best first: bot-free live trades, GMGN's own 1m rollup, live trades, GeckoTerminal 1m, GMGN 5m,
+    // DEX Screener 5m counts. Wash trades are ~50/50 buy/sell by construction, so every source after the first is
+    // pulled toward 50% (and its trade count padded) when volume bots are active.
     const usdShare = (w, min) => w && (w.buys || 0) + (w.sells || 0) >= min && (w.buyUsd || 0) + (w.sellUsd || 0) > 0 ? 100 * (w.buyUsd || 0) / ((w.buyUsd || 0) + (w.sellUsd || 0)) : null;
     const dexWindow = dex && {buys: dex.buys5m, sells: dex.sells5m};
     const pick = [
+      [lo ? usdShare(lo.m1, 10) : null, lo?.m1.complete ? 'organic 1m trades ($, bots excluded)' : 'organic trades since open ($, bots excluded)', 1, lo?.m1],
       [st ? usdShare(st.m1, 10) : null, 'GMGN 1m $ volume', 1, st?.m1],
       // Right after the alert the 1m window is not full yet, but those trades are the ones that matter most.
       [lf ? usdShare(lf.m1, 10) : null, lf?.m1.complete ? 'live 1m trades ($)' : 'live trades since open ($)', 1, lf?.m1],
@@ -184,11 +189,15 @@ const VTCore = (() => {
     const side = share === null ? 'UNKNOWN' : share >= 60 ? 'BUY SIDE' : share <= 40 ? 'SELL SIDE' : 'MIXED';
     if (share != null) reasons.push(Math.round(share) + '% of ' + basis + ' is buys; not a win probability');
     if (pick?.[2] === 5 && (pick[3].buys || 0) + (pick[3].sells || 0) < 20) risks.push('Fewer than 20 swaps in the 5m window; weak sample');
-    const price = L?.price ?? dex?.price ?? null, change = ago => price > 0 && ago > 0 ? (price/ago - 1) * 100 : null, pct = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
+    // token_stat p1m/p5m are read as the price then. A value nowhere near today's price (50× off, e.g. a % change in that
+    // field) is ignored rather than turned into a fake momentum reading.
+    const price = L?.price ?? dex?.price ?? null, change = ago => price > 0 && ago > 0 && price / ago < 50 && ago / price < 50 ? (price/ago - 1) * 100 : null, pct = v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%';
     const m1Change = change(st?.m1.priceAgo), m5Change = change(st?.m5.priceAgo) ?? dex?.priceChange5m ?? null;
     const momentum = pick?.[2] === 1 && m1Change != null ? m1Change : m5Change;
     if (m1Change != null) reasons.push('1m price change ' + pct(m1Change));
     if (m5Change != null) reasons.push('5m price change ' + pct(m5Change));
+    if (lo) reasons.push('Organic (bot-like trades excluded): ' + lo.m1.buys + ' buys / ' + lo.m1.sells + ' sells from ' + lo.m1.wallets + ' wallets in 1m');
+    if (L?.botShare >= 40) flags.push('Bot-like trades are ' + Math.round(L.botShare) + '% of recent $ volume: volume and trade counts overstate demand');
     if (lf) reasons.push('Live trades: ' + lf.m1.buys + ' buys / ' + lf.m1.sells + ' sells from ' + lf.m1.wallets + ' wallets in 1m' + (lf.m1.complete ? '' : ' (listening under 1m)'));
     else if (f) reasons.push('1m trades: ' + f.m1.buys + ' buys / ' + f.m1.sells + ' sells from ' + f.m1.wallets + ' wallets' + (f.m1.complete ? '' : ' (partial: feed returns latest 300)'));
     const lastAt = lf?.lastTradeAt ?? f?.lastTradeAt;
@@ -225,9 +234,11 @@ const VTCore = (() => {
   // opt.earlyExit (minutes): if still holding at the first candle close that many minutes after entry and the price is
   // not above entry, sell at that close. opt.fill 'cautious': a stop fills at the worse of the stop and the candle's
   // close (or a gap open); a target needs a close above it, or a high 10% beyond it (one thin wick is not a fill).
+  // opt.trail {arm, drop} (%): once the price has traded `arm`% above entry, also sell `drop`% below the highest high
+  // so far. The level only uses highs of earlier candles, because inside one candle the order of high and low is unknown.
   function scoreCall(cs, alertAt, opt = {}) {
     const tp = opt.tp ?? 100, sl = opt.sl ?? -50, horizon = opt.horizon ?? 120, at = alertAt + (opt.delay ?? 0) * 60000;
-    const early = opt.earlyExit ?? null, cautious = opt.fill === 'cautious';
+    const early = opt.earlyExit ?? null, cautious = opt.fill === 'cautious', trail = opt.trail ?? null;
     const minute = Math.floor(at / 60000) * 60000, end = alertAt + horizon * 60000, i0 = cs.findIndex(k => k.t >= minute);
     // No swap within 5 min of the entry time (e.g. a dead coin at +30 min): nothing to buy.
     if (i0 < 0 || cs[i0].t - at > 5 * 60000) return {status: 'no-trades'};
@@ -235,21 +246,32 @@ const VTCore = (() => {
     // skipped because they may come from before the entry.
     const own = cs[i0].t === minute, entry = own ? cs[i0].c : cs[i0].o, path = cs.slice(own ? i0 + 1 : i0).filter(k => k.t < end);
     const pct = p => (p / entry - 1) * 100, stop = entry * (1 + sl / 100), target = entry * (1 + tp / 100);
-    let peak = entry, peakAt = at, trough = entry, troughAt = at, outcome = 'open', ret = null, outcomeAt = null, checked = early == null;
+    let peak = entry, peakAt = at, trough = entry, troughAt = at, outcome = 'open', ret = null, outcomeAt = null, checked = early == null, held = entry;
     for (const k of path) {
       if (k.h > peak) { peak = k.h; peakAt = k.t; }
       if (k.l < trough) { trough = k.l; troughAt = k.t; }
       if (outcome !== 'open') continue;
+      const floor = trail && pct(held) >= trail.arm ? Math.max(stop, held * (1 - trail.drop / 100)) : stop;
       // Stop and target inside one candle count as the stop (the order is unknown); a gap through the stop fills at the open.
-      if (k.l <= stop) { outcome = 'loss'; ret = pct(cautious ? Math.min(stop, k.o, k.c) : Math.min(stop, k.o)); outcomeAt = k.t; }
+      if (k.l <= floor) { outcome = floor > stop ? 'exit' : 'loss'; ret = pct(cautious ? Math.min(floor, k.o, k.c) : Math.min(floor, k.o)); outcomeAt = k.t; }
       else if (cautious ? k.c >= target || k.h >= target * 1.1 : k.h >= target) { outcome = 'win'; ret = tp; outcomeAt = k.t; }
       else if (!checked && k.t + 60000 >= at + early * 60000) { checked = true; if (k.c <= entry) { outcome = 'exit'; ret = pct(k.c); outcomeAt = k.t; } }
+      held = Math.max(held, k.h);
     }
     const priceAt = min => { let p = entry; for (const k of path) { if (k.t + 60000 <= at + min * 60000) p = k.c; else break; } return pct(p); };
     const rEnd = priceAt((end - at) / 60000);
     return {status: 'scored', entry, outcome, ret: ret ?? rEnd, outcomeMin: outcomeAt == null ? null : (outcomeAt - at) / 60000,
       peakPct: pct(peak), peakMin: (peakAt - at) / 60000, troughPct: pct(trough), troughMin: (troughAt - at) / 60000,
       r1: priceAt(1), r2: priceAt(2), r3: priceAt(3), r5: priceAt(5), r10: priceAt(10), r15: priceAt(15), r30: priceAt(30), r60: priceAt(60), rEnd};
+  }
+  // The price path into an alert, from the same candles; all of it is known before any entry fills. close = last close
+  // before the alert's minute (the price the call went out at). runUp15 = that close vs the first open in the 15 min
+  // before (since launch, if younger); it needs candles reaching back 15 min (`covered`), which caches before 3.7 lack.
+  function preAlert(cs, alertAt, covered) {
+    const minute = Math.floor(alertAt / 60000) * 60000, before = cs.filter(k => k.t < minute), last = before[before.length - 1];
+    if (!last) return {close: null, runUp15: null};
+    const first = covered ? before.find(k => k.t >= minute - 15 * 60000) : null;
+    return {close: last.c, runUp15: first ? (last.c / first.o - 1) * 100 : null};
   }
   // Win rate needed to break even when every trade ends at +tp or sl (sl negative), after a round-trip cost in %.
   const breakeven = (tp, sl, cost = 0) => 100 * (cost - sl) / (tp - sl);
@@ -264,8 +286,21 @@ const VTCore = (() => {
     const n = scores.length, wins = scores.filter(s => s.outcome === 'win').length, losses = scores.filter(s => s.outcome === 'loss').length, [lo, hi] = wilson(wins, n);
     const ev = n ? scores.reduce((t, s) => t + s.ret, 0) / n - cost : null, sd = n > 1 ? Math.sqrt(scores.reduce((t, s) => t + (s.ret - cost - ev) ** 2, 0) / (n - 1)) : null;
     // evLo/evHi: rough 95% range of the average per trade (normal approximation; wide when n is small).
-    return {n, wins, losses, open: n - wins - losses, winRate: n ? 100 * wins / n : null, lo, hi, ev,
+    return {n, wins, losses, open: n - wins - losses, winRate: n ? 100 * wins / n : null, lo, hi, ev, sd,
       evLo: sd == null ? null : ev - 1.96 * sd / Math.sqrt(n), evHi: sd == null ? null : ev + 1.96 * sd / Math.sqrt(n), medianPeak: median(scores.map(s => s.peakPct))};
+  }
+  // z with P(Z > z) = p for a standard normal (bisection on the Abramowitz–Stegun erf; error < 1e-6).
+  function zFor(p) {
+    const erf = x => { const t = 1 / (1 + 0.3275911 * Math.abs(x)), y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x); return x < 0 ? -y : y; };
+    let lo = 0, hi = 10;
+    for (let i = 0; i < 60; i++) { const m = (lo + hi) / 2; if (0.5 * (1 - erf(m / Math.SQRT2)) > p) lo = m; else hi = m; }
+    return (lo + hi) / 2;
+  }
+  // Same for Student's t with df degrees of freedom (Cornish–Fisher expansion; within ~2% for df ≥ 10). A 15-call bucket
+  // needs a clearly higher bar than z, or small buckets "stand out" too often.
+  function tFor(p, df) {
+    const z = zFor(p), z3 = z ** 3, z5 = z ** 5, z7 = z ** 7;
+    return z + (z3 + z) / (4 * df) + (5 * z5 + 16 * z3 + 3 * z) / (96 * df * df) + (3 * z7 + 19 * z5 + 17 * z3 - 15 * z) / (384 * df ** 3);
   }
   // Alert fields to split calls by: [name, value from the call, bucket edges, unit].
   const FEATURES = [
@@ -278,26 +313,48 @@ const VTCore = (() => {
     ['Holders', c => c.holders, [100, 300, 1000], ''],
     ['Experienced traders', c => c.experienced, [1, 5], ''],
     ['Sniper wallets', c => c.snipers, [1], ''],
+    ['Migrated at call', c => c.migrated == null ? null : +c.migrated, [1], 'bool'],
+    ['Hour of call (UTC)', c => Number.isFinite(c.messageAt) ? new Date(c.messageAt).getUTCHours() : null, [6, 12, 18], ':00'],
+    // Price path into the trade (set on each call by the report from its candles; known before the fill, no lookahead).
+    // Move into entry = fill price vs the price the call went out at: how far the call's own crowd had already pushed it.
+    ['Move into entry', c => c.entryMove, [0, 10, 25], '%'],
+    ['Run-up in the 15 min before the alert', c => c.runUp15, [0, 50, 200], '%'],
   ];
   const edgeLabel = (v, unit) => unit === '$' ? '$' + (v >= 1000 ? v / 1000 + 'K' : v) : v + unit;
   function bucketOf(v, cuts, unit) {
+    if (unit === 'bool') return v >= cuts[0] ? 'yes' : 'no';
     const i = cuts.findIndex(x => v < x);
     if (i === 0) return unit === '' && cuts[0] === 1 ? '0' : '<' + edgeLabel(cuts[0], unit);
     if (i < 0) return '≥' + edgeLabel(cuts[cuts.length - 1], unit);
     return edgeLabel(cuts[i - 1], unit) + '–' + edgeLabel(cuts[i], unit);
   }
-  // items [{call, score}] (scored only) → baseline, per-field buckets and timing. A bucket "stands out" when it has at
-  // least 15 calls and its whole 95% range sits above or below the baseline win rate.
+  // items [{call, score}] (scored only) → baseline, per-field buckets and timing. Each bucket is compared with the rest
+  // of the calls on the average per trade (Welch t). With dozens of buckets some differ by chance (the old rule, CI vs
+  // baseline win rate, flagged at least one bucket in about a third of reports on data with no effect at all), so a
+  // bucket only "stands out" when it and the rest each have 15+ calls and |t| clears the Bonferroni bar for every
+  // bucket tested: about a 5% chance per report of any false find.
   function backtestReport(items, cost = 0) {
     const scores = items.map(i => i.score), all = summarize(scores, cost);
+    const sums = list => list.reduce((a, s) => [a[0] + s.ret, a[1] + s.ret * s.ret], [0, 0]), T = sums(scores);
     const features = FEATURES.map(([name, get, cuts, unit]) => {
       const order = [bucketOf(-Infinity, cuts, unit), ...cuts.map(x => bucketOf(x, cuts, unit)), 'unknown'], groups = new Map(order.map(l => [l, []]));
       for (const i of items) { const v = get(i.call); groups.get(v == null || !Number.isFinite(v) ? 'unknown' : bucketOf(v, cuts, unit)).push(i.score); }
-      return {name, rows: order.map(label => ({label, ...summarize(groups.get(label), cost)})).filter(r => r.n)
-        .map(r => ({...r, few: r.n < 15, standsOut: r.n >= 15 && all.n > 0 ? r.lo > all.winRate ? 'above' : r.hi < all.winRate ? 'below' : null : null}))};
+      return {name, rows: order.map(label => ({label, list: groups.get(label), ...summarize(groups.get(label), cost)})).filter(r => r.n)};
+    });
+    const testable = r => r.label !== 'unknown' && r.n >= 15 && all.n - r.n >= 15;
+    const tested = features.reduce((n, f) => n + f.rows.filter(testable).length, 0), p = 0.025 / Math.max(1, tested);
+    for (const f of features) f.rows = f.rows.map(({list, ...r}) => {
+      let diff = null, t = null, bar = null;
+      if (testable(r)) {
+        const [s, q] = sums(list), n2 = all.n - r.n, m1 = s / r.n, m2 = (T[0] - s) / n2;
+        const a = Math.max(0, q - r.n * m1 * m1) / (r.n - 1) / r.n, b = Math.max(0, T[1] - q - n2 * m2 * m2) / (n2 - 1) / n2, se = Math.sqrt(a + b);
+        const df = a + b > 0 ? (a + b) ** 2 / (a * a / (r.n - 1) + b * b / (n2 - 1)) : r.n + n2 - 2;
+        diff = m1 - m2; t = se > 0 ? diff / se : diff ? Math.sign(diff) * Infinity : 0; bar = tFor(p, Math.max(2, df));
+      }
+      return {...r, few: r.n < 15, diff, t, bar, standsOut: t != null && Math.abs(t) > bar ? t > 0 ? 'above' : 'below' : null};
     });
     const within = m => scores.length ? 100 * scores.filter(s => s.peakMin <= m).length / scores.length : null;
-    return {all, features, timing: {r5: median(scores.map(s => s.r5)), r15: median(scores.map(s => s.r15)), r60: median(scores.map(s => s.r60)),
+    return {all, features, tested, timing: {r5: median(scores.map(s => s.r5)), r15: median(scores.map(s => s.r15)), r60: median(scores.map(s => s.r60)),
       peakMin: median(scores.map(s => s.peakMin)), peakWithin5: within(5), peakWithin15: within(15), peakWithin60: within(60)}};
   }
   // ---- Volume bots: wash-trading patterns in per-trade rows {at, side, usd, amount, wallet, hash, ex} ----
@@ -358,9 +415,12 @@ const VTCore = (() => {
       const net = b.some(t => tokens(t)) ? b.reduce((x, t) => x + (tokens(t) ?? 0), 0) - s.reduce((x, t) => x + (tokens(t) ?? 0), 0) : bUsd - sUsd;
       if (bUsd >= o.buyerUsd && net > 0) { buyers++; buyersNet += bUsd - sUsd; }
     }
+    // Organic flow: every trade not flagged and not an arbitrage leg (both are ~50/50 buy/sell and carry no direction).
+    const organic = rows.filter(t => !rule.has(t) && !arbLegs.has(t)), orgUsd = organic.reduce((x, t) => x + (t.usd || 0), 0);
+    const orgBuyUsd = organic.reduce((x, t) => x + (t.side === 'buy' ? t.usd || 0 : 0), 0);
     return {n: rows.length, usd, botUsd, botShare: usd > 0 ? 100 * botUsd / usd : null, botTradeShare: rows.length ? 100 * flagged.length / rows.length : null,
       wallets: byWallet.size, botWallets: botWallets.size, byRule, arb, suspectShare: usd > 0 ? 100 * suspectUsd / usd : null,
-      buyers, buyersNet, first: rows[0]?.at ?? null, last: rows[rows.length - 1]?.at ?? null,
+      buyers, buyersNet, organic, orgN: organic.length, orgShare: orgUsd > 0 ? 100 * orgBuyUsd / orgUsd : null, first: rows[0]?.at ?? null, last: rows[rows.length - 1]?.at ?? null,
       flagged: flagged.slice(-50).map(t => ({wallet: t.wallet, hash: t.hash, rule: rule.get(t)}))};
   }
   // ---- Solana transactions (getTransactionsForAddress, jsonParsed) → per-trade rows for one mint ----
@@ -468,7 +528,7 @@ const VTCore = (() => {
     return current === call.mint ? 'already-open' : 'navigate';
   }
   return {MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
-    candles,mergeCandles,scoreCall,breakeven,wilson,summarize,backtestReport,VB,botFlow,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff};
+    candles,mergeCandles,scoreCall,preAlert,breakeven,wilson,summarize,zFor,tFor,backtestReport,VB,botFlow,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff};
 })();
 /* CORE END */
 
@@ -1150,7 +1210,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.6.0';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.7.0';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -1184,7 +1244,7 @@ function start() {
   // complete = the feed was on this coin within 15s of the alert and stayed until the end of the window.
   const packBots=(r,complete)=>({n:r.n,usd:Math.round(r.usd),share:r.botShare==null?null:+r.botShare.toFixed(1),tradeShare:r.botTradeShare==null?null:+r.botTradeShare.toFixed(1),
     wallets:r.wallets,bots:r.botWallets,buyers:r.buyers,buyersNet:Math.round(r.buyersNet),arb:r.arb,suspect:r.suspectShare==null?null:+r.suspectShare.toFixed(1),
-    rules:[r.byRule.txWash,r.byRule.fastTrip,r.byRule.churn,r.byRule.micro],complete});
+    org:r.orgShare==null?null:+r.orgShare.toFixed(1),orgN:r.orgN,rules:[r.byRule.txWash,r.byRule.fastTrip,r.byRule.churn,r.byRule.micro],complete});
   function recordBots(leaving=false){
     if(!GMGN||!isReceiver||!live?.mint)return;
     const now=Date.now();
@@ -1209,7 +1269,7 @@ function start() {
   const switchLive=mint=>{try{recordBots(true);}catch(_){}resetLive(mint);};
   const tradeKey=t=>t.hash?t.hash+':'+t.side+':'+t.wallet+':'+t.amount:null;
   const liveFresh=()=>!!live&&live.mint===current&&Date.now()-live.at<20000;
-  const liveNow=()=>live&&live.mint===current?VTCore.liveView(live.trades,live.stat,live.at,Date.now(),live.first||Infinity):null;
+  const liveNow=bots=>live&&live.mint===current?VTCore.liveView(live.trades,live.stat,live.at,Date.now(),live.first||Infinity,bots):null;
   let renderQueued=false;
   const soon=()=>{if(renderQueued)return;renderQueued=true;setTimeout(()=>{renderQueued=false;render();},250);};
   try{if(typeof GM_listValues==='function'&&!get('cleaned',false)){for(const k of GM_listValues())if(k.startsWith(PREFIX+'mint-alert.'))GM_deleteValue(k);set('cleaned',true);}}catch(_){}
@@ -1250,7 +1310,9 @@ function start() {
   $('rpc-sample').onclick=()=>{if(rpcSample){GM_setClipboard(JSON.stringify(rpcSample,null,1).slice(0,40000),'text');$('rpc-status').textContent='Sample transaction copied: paste it to Claude.';}};
   $('hb-run').onclick=()=>runBackfill();
   $('mint-copy').onclick=()=>{if(current){GM_setClipboard(current,'text');notice('Contract copied');render();}};
-  {const o=get('bt.opt',{tp:100,sl:-50,cost:3});$('bt-tp').value=o.tp;$('bt-sl').value=Math.abs(o.sl);$('bt-cost').value=o.cost;$('bt-delay').value=String(o.delay||0);$('bt-exit').value=String(o.exit||0);$('bt-fill').value=o.fill||'touch';}
+  // Default round-trip cost 5%: about 1% pump.fun/PumpSwap + 1% GMGN per side, plus priority fee/tip and price impact
+  // (roughly 2–3% round trip for 1 SOL on a sub-$50K bonding curve). Saved settings keep whatever was entered.
+  {const o=get('bt.opt',{tp:100,sl:-50,cost:5});$('bt-tp').value=o.tp;$('bt-sl').value=Math.abs(o.sl);$('bt-cost').value=o.cost;$('bt-delay').value=String(o.delay||0);$('bt-exit').value=String(o.exit||0);$('bt-fill').value=o.fill||'touch';}
   // Collapsed = the header alone, as a scoreboard (state, buy share, time since the alert).
   const setCollapsed=on=>{root.classList.toggle('vts-collapsed',on);set('collapsed',on);};
   setCollapsed(get('collapsed',false));
@@ -1308,9 +1370,10 @@ function start() {
   let botCache={key:'',vb:null};
   function renderBots(now){
     const cell=$('vol-bots'), on=live&&live.mint===current&&live.trades.length>0&&now-live.at<60000;
-    // botFlow pairs trades per wallet; with thousands of trades, recompute at most every 3s and only when it is on screen.
+    // botFlow pairs trades per wallet; with thousands of trades, recompute at most every 3s and only while the panel is
+    // visible. Every view needs it (the collapsed scoreboard shows the organic gauge too), not just the Live tab.
     const key=on?live.mint+'|'+live.trades.length+'|'+Math.floor(now/3000):'';
-    if(on&&key!==botCache.key&&!root.hidden&&!root.classList.contains('vts-collapsed')&&root.dataset.tab==='live'&&!document.hidden)botCache={key,vb:VTCore.botFlow(live.trades,now-300000,now)};
+    if(on&&key!==botCache.key&&!root.hidden&&!document.hidden)botCache={key,vb:VTCore.botFlow(live.trades,now-300000,now)};
     const vb=on&&botCache.key.startsWith(live.mint+'|')?botCache.vb:null;
     if(!vb||!vb.n||vb.botShare==null){
       cell.className='cell bots na';$('bots-pct').textContent='—';$('bots-level').textContent='No data';$('bots-level').className='tag';$('bots-bar').style.setProperty('--p','0%');
@@ -1341,8 +1404,9 @@ function start() {
       $('mini-text').textContent=alive?'receiver connected':'no GMGN receiver';$('mini-text').className='m-text '+(alive?'pos':'warnc');
       return;
     }
-    const now=Date.now(), c=all.find(x=>x.mint===current)||null, f=freshFlow(), L=liveNow(), a=VTCore.assess(c,snapshot,now,fetchError,f,L);
-    const Lf=L&&now-L.at<=15000?L:null, st=Lf?.stat&&now-Lf.stat.at<=15000?Lf.stat:null, lf=Lf?.flow||null;
+    // Bots first: the gauge reads the organic (bot-free) flow when there is enough of it.
+    const now=Date.now(), c=all.find(x=>x.mint===current)||null, f=freshFlow(), vb=renderBots(now), L=liveNow(vb), a=VTCore.assess(c,snapshot,now,fetchError,f,L);
+    const Lf=L&&now-L.at<=15000?L:null, st=Lf?.stat&&now-Lf.stat.at<=15000?Lf.stat:null, lf=Lf?.flow||null, lo=Lf?.organic||null;
     const [tone,label,short]=STATE_UI[a.state]||STATE_UI.UNKNOWN;
     if(lastShown!==null&&(tone!==lastTone||current!==lastShown))flash();
     lastTone=tone;lastShown=current;root.dataset.tone=tone;
@@ -1385,7 +1449,6 @@ function start() {
     $('split-sell').textContent=dexOnly&&snapshot?snapshot.sells5m+' sells ▼':sw?usd(sw.sellUsd)+' · '+(sw.sells??'—')+' sells ▼':'';
     $('basis').textContent=a.basis||'no data yet';$('basis').title=a.basis?'Buy share basis: '+a.basis:'';
     renderGrade();
-    const vb=renderBots(now);
     // KPIs.
     const wl=lf||f, part=w=>w.complete?'':'+', last=Lf?.last, lastAt=last?.at??f?.lastTradeAt, cl=c?.clusters?.length?Math.max(...c.clusters):null;
     const kpi=(lbl,val,sub,cls,icon)=>{const d=node('div','kpi'+(cls==='na'?' na':'')),b=node('b',cls&&cls!=='na'?cls:'');if(icon){b.append(node('span','',icon))}b.append(val);d.append(node('span','lbl',lbl),b,typeof sub==='string'?node('small','',sub):sub);return d;};
@@ -1414,6 +1477,7 @@ function start() {
     add('l','▲ Buys');add('',w1?.buys??'—',w1&&w1.complete===false);add('',m5?.buys??snapshot?.buys5m??'—',m5&&m5.complete===false);
     add('l','▼ Sells');add('',w1?.sells??'—',w1&&w1.complete===false);add('',m5?.sells??snapshot?.sells5m??'—',m5&&m5.complete===false);
     add('l','Buy share $');bar(shr(w1),w1&&w1.complete===false);bar(shr(m5),m5&&m5.complete===false);
+    add('l','Organic share $');bar(shr(lo?.m1),lo&&!lo.m1.complete);bar(shr(lo?.m5),lo&&!lo.m5.complete);
     add('l','Wallets');add('',wl?wl.m1.wallets:'—',wl&&!wl.m1.complete);add('',wl?wl.m5.wallets:'—',wl&&!wl.m5.complete);
     add('l','Volume');add('',usd(st?.m1.volume??(w1?(w1.buyUsd||0)+(w1.sellUsd||0):null)));add('',usd(st?.m5.volume??(m5?(m5.buyUsd||0)+(m5.sellUsd||0):snapshot?.volume5m)));
     const ft=node('span','ft');for(const [k,v] of [['Liquidity',usd(snapshot?.liquidity)],['1h vol',usd(st?.h1?.volume??snapshot?.volume1h)],['Pool',pool||'—']]){const x=node('span','',k+' ');x.append(node('b','',v));ft.append(x);}
@@ -1501,7 +1565,7 @@ function start() {
   // Backtest: score saved calls against GeckoTerminal 1m candles. Candles are cached per call, so changing the
   // target, stop or costs re-scores instantly without refetching.
   // FORWARD_FROM: calls after the 95-call analysis (Oct 11 2026 03:30 UTC) are a clean forward test of its leads.
-  const BT_H=120, LATE_AT=[10,30], BT_DELAYS=[0,1,...LATE_AT], FORWARD_FROM=Date.parse('2026-10-11T03:30:00Z'), sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  const BT_H=120, BT_PRE=15, LATE_AT=[10,30], BT_DELAYS=[0,1,...LATE_AT], FORWARD_FROM=Date.parse('2026-10-11T03:30:00Z'), sleep=ms=>new Promise(r=>setTimeout(r,ms));
   let btRunning=false, btStop=false, btNote='', gtLast=0, gtGap=3000;
   // GeckoTerminal's free tier allows ~30 requests/min per IP, shared by every tab. Start at 20/min; after a rate limit,
   // pause 60s and double the gap (up to 15s), then ease back by 10% per successful request. While scoring runs, the
@@ -1515,7 +1579,8 @@ function start() {
       gtGap=Math.min(15000,gtGap*2);btNote='GeckoTerminal rate limit: pausing 60s, then continuing slower (automatic)';renderBt();await sleep(60000);
     }
   }
-  // 'ok' | 'no-data' | 'no-trades', or null to retry on a later run.
+  // 'ok' | 'no-data' | 'no-trades', or null to retry on a later run. Keeps BT_PRE min before the alert (for the run-up
+  // split) and volume; 'bt.pre' marks calls whose cache reaches that far back (caches before 3.7 kept only 2 min).
   async function fetchCandles(c){
     const p=await gtGet(GT+'tokens/'+c.mint+'/pools');
     if(p.status===404)return 'no-data';
@@ -1528,12 +1593,15 @@ function start() {
       if(r.status===200)lists.push(VTCore.candles(r.data?.data?.attributes?.ohlcv_list));
     }
     if(!lists.length)return null;
-    const cs=VTCore.mergeCandles(lists).filter(k=>k.t>=c.messageAt-120000&&k.t<=c.messageAt+BT_H*60000);
+    const cs=VTCore.mergeCandles(lists).filter(k=>k.t>=c.messageAt-BT_PRE*60000&&k.t<=c.messageAt+BT_H*60000);
+    if(!cs.length)return 'no-trades';
     const sig=x=>+x.toPrecision(6);
-    set('bt.c.'+c.id,cs.map(k=>[k.t/1000,sig(k.o),sig(k.h),sig(k.l),sig(k.c)]));
-    return cs.length?'ok':'no-trades';
+    set('bt.c.'+c.id,cs.map(k=>[k.t/1000,sig(k.o),sig(k.h),sig(k.l),sig(k.c),sig(k.v)]));
+    const pre=get('bt.pre',{});pre[c.id]=1;set('bt.pre',pre);
+    return 'ok';
   }
   const btCandidates=()=>calls().filter(c=>!c.manual&&VTCore.MINT.test(c.mint)&&Number.isFinite(c.messageAt));
+  const upgradeable=()=>{const done=get('bt.done',{}), pre=get('bt.pre',{});return btCandidates().filter(c=>done[c.id]==='ok'&&!(c.id in pre));};
   function renderBt(){
     const done=get('bt.done',{}), all=btCandidates(), ok=all.filter(c=>done[c.id]==='ok').length, none=all.filter(c=>done[c.id]&&done[c.id]!=='ok').length;
     const young=all.filter(c=>!done[c.id]&&Date.now()-c.messageAt<=(BT_H+5)*60000).length, left=all.length-ok-none-young;
@@ -1549,7 +1617,9 @@ function start() {
     }else $('bt-progress').replaceChildren();
     $('bt-help').textContent=DISCORD?'1) Load channel history: scrolls the VolTrak channel back for you and saves every alert. 2) Score calls: fetches 2h of 1m prices per call from GeckoTerminal (about 7–10s per call; slows down automatically if GeckoTerminal rate-limits; you can stop and resume). 3) Open report.'
       :'Open the VolTrak channel in Discord and press "Load channel history" there first. Then score calls (about 7–10s per call; stop and resume any time).';
-    $('bt-status').textContent=[histNote,btNote,hbNote].filter(Boolean).join(' · ')+(histNote||btNote||hbNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+'. Calls under '+(BT_H+5)+' min old wait until their 2h window is complete.';
+    const up=btRunning?0:upgradeable().length;
+    $('bt-status').textContent=[histNote,btNote,hbNote].filter(Boolean).join(' · ')+(histNote||btNote||hbNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+'. Calls under '+(BT_H+5)+' min old wait until their 2h window is complete.'
+      +(up?' '+up+' older scored call'+(up===1?'':'s')+' will be refetched once on the next "Score calls" to add '+BT_PRE+' min of pre-alert prices (run-up split).':'');
   }
   // Discord: load older messages by scrolling the channel to the top until Discord stops loading more.
   // scan() saves every VolTrak alert as it renders, so this only drives the scrolling.
@@ -1576,12 +1646,16 @@ function start() {
     if(btRunning){btStop=true;btNote='Stopping…';renderBt();return;}
     btRunning=true;btStop=false;
     try{
-      const done=get('bt.done',{}), now=Date.now();
-      const todo=btCandidates().filter(c=>!done[c.id]&&now-c.messageAt>(BT_H+5)*60000).sort((a,b)=>b.messageAt-a.messageAt);
+      const done=get('bt.done',{}), now=Date.now(), byAge=(a,b)=>b.messageAt-a.messageAt;
+      // New calls first, then calls scored before 3.7, refetched once so their cache reaches BT_PRE min before the alert.
+      const fresh=btCandidates().filter(c=>!done[c.id]&&now-c.messageAt>(BT_H+5)*60000).sort(byAge), old=upgradeable().sort(byAge), todo=[...fresh,...old];
       if(!todo.length){btNote='Nothing new to score';return;}
       for(let i=0;i<todo.length&&!btStop;i++){
-        btNote='Scoring '+(i+1)+' of '+todo.length+' (about '+Math.ceil((todo.length-i)*2.3*gtGap/60000)+' min left)';renderBt();
+        const upgrade=i>=fresh.length;
+        btNote=(upgrade?'Adding pre-alert prices to older call '+(i-fresh.length+1)+' of '+old.length:'Scoring '+(i+1)+' of '+fresh.length)+' (about '+Math.ceil((todo.length-i)*2.3*gtGap/60000)+' min left in total)';renderBt();
         const status=await fetchCandles(todo[i]);
+        // A failed refetch keeps the old candles and score; it is marked so it is not retried every run.
+        if(upgrade){if(status&&status!=='ok'){const p=get('bt.pre',{});p[todo[i].id]=0;set('bt.pre',p);}continue;}
         if(status){const d=get('bt.done',{});d[todo[i].id]=status;set('bt.done',d);}
       }
       btNote=btStop?'Stopped; run again to continue':'Done: open the report';
@@ -1734,34 +1808,41 @@ function start() {
     set('bt.opt',{tp,sl,cost,delay,exit,fill});
     const base={tp,sl,horizon:BT_H,fill,earlyExit:exit||null};
     // Every call is scored at each entry delay from the same cached candles (no extra requests).
-    const done=get('bt.done',{}), rows=[];let noData=0;
+    const done=get('bt.done',{}), covered=get('bt.pre',{}), rows=[];let noData=0;
+    // Trailing exit with fixed, untuned settings (arm at half the target, give back 30% from the peak) so it is not fitted to these calls.
+    const trail={arm:tp/2,drop:30};
     for(const c of btCandidates()){
       if(done[c.id]!=='ok'){if(done[c.id])noData++;continue;}
       const cs=VTCore.candles(get('bt.c.'+c.id,[])), by={};
       for(const d of BT_DELAYS)by[d]=VTCore.scoreCall(cs,c.messageAt,{...base,delay:d});
-      // Exit rules compared at the chosen entry: target/stop only, plus a 5-min early exit, and a +50% target.
-      const ex={plain:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,delay}),early5:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:5,delay}),tp50:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,tp:50,delay})};
+      // Exit rules compared at the chosen entry: target/stop only, a 5-min early exit, a +50% target, and a trailing exit.
+      const ex={plain:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,delay}),early5:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:5,delay}),tp50:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,tp:50,delay}),
+        trail:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,delay,trail})};
       if(by[0].status!=='scored'){noData++;continue;}
       // The live late check, replayed: price vs the alert entry and any swap in the 5 min before the check.
       const late={};
       // Only candles that closed inside [check−5 min, check) count as "traded", so nothing after the check leaks in.
       for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t>=at-300000&&k.t+60000<=at));}
-      rows.push({call:c,by,ex,late,hb:get('hb.'+c.id,null),ft:get('feat.'+c.id,null)});
+      rows.push({call:c,by,ex,late,pre:VTCore.preAlert(cs,c.messageAt,covered[c.id]===1),hb:get('hb.'+c.id,null),ft:get('feat.'+c.id,null)});
     }
     const scored=d=>rows.filter(r=>r.by[d].status==='scored');
     const entries=BT_DELAYS.map(d=>({delay:d,dead:rows.length-scored(d).length,...VTCore.summarize(scored(d).map(r=>r.by[d]),cost)}));
     const grades=LATE_AT.flatMap(d=>['ABOVE','BELOW','DOWN30','NOTRADES','NOPRICE'].map(g=>{const all=rows.filter(r=>r.late[d]===g), sc=all.filter(r=>r.by[d].status==='scored');
       return {delay:d,grade:g,total:all.length,...VTCore.summarize(sc.map(r=>r.by[d]),cost)};}).filter(x=>x.total));
-    const items=scored(delay).map(r=>({call:r.call,score:r.by[delay]}));
+    // Price-path features ride on a copy of each call: the fill vs the price the call went out at, and the run-up before it.
+    const moveInto=(r,d)=>r.pre.close>0&&r.by[d].status==='scored'?(r.by[d].entry/r.pre.close-1)*100:null;
+    const items=scored(delay).map(r=>({call:{...r.call,entryMove:moveInto(r,delay),runUp15:r.pre.runUp15},score:r.by[delay]}));
     // Exit rules on the same calls (paired: the difference is per call, so it is tighter than comparing averages).
     const exitRule=(key,label,list)=>{const ok=list.filter(r=>r.ex[key].status==='scored'&&r.ex.plain.status==='scored'), x=VTCore.summarize(ok.map(r=>r.ex[key]),cost), d=ok.map(r=>r.ex[key].ret-r.ex.plain.ret);
       const m=d.length?d.reduce((a,b)=>a+b,0)/d.length:null, sd=d.length>1?Math.sqrt(d.reduce((a,b)=>a+(b-m)**2,0)/(d.length-1)):null;
       return {key,label,...x,diff:m,diffLo:sd==null?null:m-1.96*sd/Math.sqrt(d.length),diffHi:sd==null?null:m+1.96*sd/Math.sqrt(d.length)};};
-    const exitRules=list=>[exitRule('plain','Target +'+tp+'% / stop '+sl+'%',list),exitRule('early5','… and sell at 5 min if not up',list),exitRule('tp50','Target +50% / stop '+sl+'%',list)];
+    const exitRules=list=>[exitRule('plain','Target +'+tp+'% / stop '+sl+'%',list),exitRule('early5','… and sell at 5 min if not up',list),exitRule('tp50','Target +50% / stop '+sl+'%',list),
+      exitRule('trail','… and once up +'+trail.arm+'%, sell '+trail.drop+'% below the peak',list)];
     const fwd=rows.filter(r=>r.call.messageAt>=FORWARD_FROM);
     const all=VTCore.summarize(items.map(i=>i.score),cost);
     set('bt.summary',{n:all.n,winRate:all.winRate,ev:all.ev,evLo:all.evLo,evHi:all.evHi,be:VTCore.breakeven(tp,sl,cost),tp,sl,cost,delay,at:Date.now()});
-    showReport(VTCore.backtestReport(items,cost),items,{tp,sl,cost,noData,delay,exit,fill,entries,grades,rows,exits:exitRules(rows),forward:{n:fwd.length,rules:fwd.length?exitRules(fwd):[]}});
+    showReport(VTCore.backtestReport(items,cost),items,{tp,sl,cost,noData,delay,exit,fill,entries,grades,rows,moveInto,runUps:rows.filter(r=>r.pre.runUp15!=null).length,
+      exits:exitRules(rows),forward:{n:fwd.length,rules:fwd.length?exitRules(fwd):[]}});
   }
   function showReport(rep,items,o){
     document.getElementById('vts-report')?.remove();
@@ -1781,13 +1862,15 @@ function start() {
       const cols=['name','symbol','mint','alert_time','call_mc','age_min','largest_cluster','bot_share','fresh_share','top_holder','holders','outcome','trade_return','peak','peak_min','trough','r5','r10','r15','r30','r60',
         'outcome_min','trough_min','r1','r2','r3','early5_outcome','early5_return','tp50_outcome','tp50_return','set_entry_min','set_tp','set_sl','set_cost','set_fill','set_early_exit',
         ...later.flatMap(d=>['grade','outcome','trade_return','peak','peak_min','r15','r60'].map(x=>'buy'+d+'_'+x)),
-        'bots_pre_share','bots_pre_wallets','bots_pre_buyers','bots_2m_share','bots_2m_wallets','bots_2m_buyers','bots_trades','bots_truncated','live_bots_60s','live_bots_120s','live_buyers_120s','live_bots_complete'];
+        'bots_pre_share','bots_pre_wallets','bots_pre_buyers','bots_2m_share','bots_2m_wallets','bots_2m_buyers','bots_trades','bots_truncated','live_bots_60s','live_bots_120s','live_buyers_120s','live_bots_complete',
+        'entry_move','run_up_15','migrated','trail_outcome','trail_return','bots_2m_organic_share','bots_2m_organic_trades','live_organic_120s'];
       const q=v=>v==null?'':/[",\n]/.test(String(v))?'"'+String(v).replace(/"/g,'""')+'"':String(v);
-      const lines=o.rows.map(({call:c,by,ex,late,hb,ft})=>{const s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
+      const lines=o.rows.map(r=>{const {call:c,by,ex,late,hb,ft}=r, s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
         c.holders>0&&c.bots!=null?(100*c.bots/c.holders).toFixed(1):null,c.holders>0&&c.fresh!=null?(100*c.fresh/c.holders).toFixed(1):null,c.topHolder,c.holders,s.outcome,f(s.ret),f(s.peakPct),f(s.peakMin),f(s.troughPct),f(s.r5),f(s.r10),f(s.r15),f(s.r30),f(s.r60),
         f(s.outcomeMin),f(s.troughMin),f(s.r1),f(s.r2),f(s.r3),ex.early5.outcome,f(ex.early5.ret),ex.tp50.outcome,f(ex.tp50.ret),o.delay,o.tp,o.sl,o.cost,o.fill,o.exit||0,
         ...later.flatMap(d=>{const x=by[d];return [late[d],...(x.status==='scored'?[x.outcome,f(x.ret),f(x.peakPct),f(x.peakMin),f(x.r15),f(x.r60)]:[null,null,null,null,null,null])];}),
-        hb?.pre?.share,hb?.pre?.bots,hb?.pre?.buyers,hb?.post?.share,hb?.post?.bots,hb?.post?.buyers,hb?.trades,hb?hb.truncated:null,ft?.vb60?.share,ft?.vb120?.share,ft?.vb120?.buyers,ft?.vb120?ft.vb120.complete:null].map(q).join(',');});
+        hb?.pre?.share,hb?.pre?.bots,hb?.pre?.buyers,hb?.post?.share,hb?.post?.bots,hb?.post?.buyers,hb?.trades,hb?hb.truncated:null,ft?.vb60?.share,ft?.vb120?.share,ft?.vb120?.buyers,ft?.vb120?ft.vb120.complete:null,
+        f(o.moveInto(r,0)),f(r.pre.runUp15),c.migrated,ex.trail.outcome,f(ex.trail.ret),hb?.post?.org,hb?.post?.orgN,ft?.vb120?.org].map(q).join(',');});
       const url=URL.createObjectURL(new Blob([[cols.join(','),...lines].join('\n')],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='voltrak-backtest-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     };
     const a=rep.all, t=rep.timing;
@@ -1819,6 +1902,9 @@ function start() {
       // Verdict from the 95% range of the average, not the point estimate.
       const verdict=a.evHi!=null&&a.evHi<0?['Losing: the whole 95% range of the average is below zero.',C.red,'#2a0e14']:a.evLo!=null&&a.evLo>0?['Positive on these calls: the whole 95% range is above zero. Check it holds on new calls (forward test below).',C.green,'#0c2318']:['Can’t tell yet: the 95% range of the average includes zero.',C.amber,'#241c07'];
       box.append(el('p','margin:0 0 10px;padding:8px 10px;border-radius:8px;font-weight:600;background:'+verdict[2]+';color:'+verdict[1],verdict[0]));
+      // Calls without price data are mostly coins that died before GeckoTerminal indexed them; leaving them out flatters the average.
+      if(o.noData&&!o.delay)box.append(el('p','margin:0 0 10px;color:'+C.muted,'Survivorship check: '+o.noData+' call'+(o.noData===1?'':'s')+' had no price data and '+(o.noData===1?'is':'are')+' left out above. If '+(o.noData===1?'it':'they all')+' had lost the stop, the average would be '
+        +pct((a.ev*a.n+(o.sl-o.cost)*o.noData)/(a.n+o.noData))+' per trade over '+(a.n+o.noData)+' calls.'));
       if(a.n<30)box.append(el('p','margin:0 0 12px;padding:8px 10px;border-radius:8px;background:#3d3214;color:'+C.amber,'Only '+a.n+' calls scored: too few to trust any pattern. Scroll further back in the channel and score again; 100+ calls gives usable ranges.'));
     }
     // Same calls bought at the alert, +10 and +30 min: does waiting for the first dump help?
@@ -1830,7 +1916,7 @@ function start() {
     const exitRows=list=>list.map(x=>[[x.label,String(x.n),rate(x),pct(x.ev),pct(x.medianPeak),x.key==='plain'||x.diff==null?'baseline':(x.diff>=0?'+':'')+x.diff.toFixed(1)+' pts vs baseline ('+pct(x.diffLo)+' to '+pct(x.diffHi)+')'],'']);
     box.append(el('h3','margin:4px 0 4px;font-size:14px','Exit rules: same calls, buying at '+at(o.delay)));
     table('Exit',exitRows(o.exits));
-    box.append(el('p','margin:4px 0 12px;color:'+C.muted,'The 5-min exit was the most promising lead in an analysis of 95 calls, but it was found on those same calls: treat it as untested until the forward test below agrees.'));
+    box.append(el('p','margin:4px 0 12px;color:'+C.muted,'The 5-min exit was the most promising lead in an analysis of 95 calls, but it was found on those same calls: treat it as untested until the forward test below agrees. The trailing exit (added in 3.7) uses fixed settings and only earlier candles\' highs, so it is a fair forward test from here on.'));
     // Forward test: only calls after that analysis count as a fair test of its leads.
     box.append(el('h3','margin:4px 0 4px;font-size:14px','Forward test: calls after Oct 11 03:30 UTC ('+o.forward.n+')'));
     if(o.forward.n)table('Exit',exitRows(o.forward.rules));
@@ -1844,14 +1930,20 @@ function start() {
     // Only complete readings: a partial window (feed started late, receiver left early, history cut short) is not comparable.
     // The live GMGN reading wins over Helius: it sees each leg directly, while Helius in-transaction legs are priced by estimate.
     const postOf=r=>r.ft?.vb120?.n>0&&r.ft.vb120.complete?r.ft.vb120:r.hb?.post?.n>0&&r.hb.post.complete?r.hb.post:null;
-    const preR=o.rows.filter(r=>r.hb?.pre?.n>0&&r.hb.pre.complete), postR=o.rows.filter(postOf);
+    const preR=o.rows.filter(r=>r.hb?.pre?.n>0&&r.hb.pre.complete), postR=o.rows.filter(postOf), orgR=postR.filter(r=>postOf(r).org!=null&&postOf(r).orgN>=5);
     if(preR.length||postR.length){
-      box.append(el('h3','margin:4px 0 4px;font-size:14px','Volume bots on past calls'));
-      const bands=['under 20%','20–40%','40%+'], band=v=>v==null?null:v<20?bands[0]:v<40?bands[1]:bands[2];
-      const split=(list,val,d)=>bands.map(b=>{const sc=list.filter(r=>band(val(r))===b&&r.by[d].status==='scored').map(r=>r.by[d]), x=VTCore.summarize(sc,o.cost);return [[b,String(x.n),rate(x),pct(x.ev),pct(x.medianPeak),''],''];}).filter(x=>x[0][1]!=='0');
-      if(preR.length){box.append(el('p','margin:4px 0;color:'+C.muted,'Bot-like share of $ volume in the 5 min before the alert → buying at the alert ('+preR.length+' calls with a reading):'));table('Bots before alert',split(preR,r=>r.hb.pre.share,0));}
-      if(postR.length){box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Bot-like share in the first 2 min after the alert → buying at +10 min, when that reading is already known ('+postR.length+' calls):'));table('Bots first 2 min',split(postR,r=>postOf(r).share,10));}
-      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Bot-like = a buy and a sell in one transaction, a flat buy-then-sell within 10s, churn wallets, or dust trades. A rough lower bound from wallet behaviour; exploratory until about 100 calls have a reading.'));
+      box.append(el('h3','margin:4px 0 4px;font-size:14px','Volume bots and organic flow on past calls'));
+      const bands=(cuts,unit)=>v=>{if(v==null)return null;const i=cuts.findIndex(x=>v<x);return i===0?'under '+cuts[0]+unit:i<0?cuts[cuts.length-1]+unit+'+':cuts[i-1]+'–'+cuts[i]+unit;};
+      const split=(list,val,d,band,labels)=>labels.map(b=>{const sc=list.filter(r=>band(val(r))===b&&r.by[d].status==='scored').map(r=>r.by[d]), x=VTCore.summarize(sc,o.cost);return [[b,String(x.n),rate(x),pct(x.ev),pct(x.medianPeak),''],''];}).filter(x=>x[0][1]!=='0');
+      const botB=bands([20,40],'%'), botL=['under 20%','20–40%','40%+'], orgB=bands([40,60],'%'), orgL=['under 40%','40–60%','60%+'], buyB=bands([10,25],''), buyL=['under 10','10–25','25+'];
+      if(preR.length){box.append(el('p','margin:4px 0;color:'+C.muted,'Bot-like share of $ volume in the 5 min before the alert → buying at the alert ('+preR.length+' calls with a reading):'));table('Bots before alert',split(preR,r=>r.hb.pre.share,0,botB,botL));}
+      if(postR.length){box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Bot-like share in the first 2 min after the alert → buying at +10 min, when that reading is already known ('+postR.length+' calls):'));table('Bots first 2 min',split(postR,r=>postOf(r).share,10,botB,botL));}
+      // Readings saved before 3.7 have no organic share; they are left out of these two tables.
+      if(orgR.length){
+        box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Organic (bot-free) buy share of $ volume in the first 2 min → buying at +10 min ('+orgR.length+' calls with 5+ organic trades):'));table('Organic buy share',split(orgR,r=>postOf(r).org,10,orgB,orgL));
+        box.append(el('p','margin:8px 0 4px;color:'+C.muted,'Real buyers (not flagged, $15+ bought, still net long) in the first 2 min → buying at +10 min:'));table('Real buyers',split(orgR,r=>postOf(r).buyers,10,buyB,buyL));
+      }
+      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'Bot-like = a buy and a sell in one transaction, a flat buy-then-sell within 10s, churn wallets, or dust trades. Organic = everything else, minus arbitrage. A rough lower bound from wallet behaviour; exploratory until about 100 calls have a reading.'));
     }
     // Per-call view, last in the report because it is long.
     const eachCall=()=>{
@@ -1873,10 +1965,12 @@ function start() {
     };
     if(!a.n){box.append(el('p','color:'+C.amber,'None of these calls still traded '+at(o.delay)+'. Pick an earlier "Buy at" time.'));eachCall();return;}
     box.append(el('p','margin:0 0 4px;color:'+C.muted,'Peaks (from entry): '+t.peakWithin5.toFixed(0)+'% of calls peaked within 5 min, '+t.peakWithin15.toFixed(0)+'% within 15, '+t.peakWithin60.toFixed(0)+'% within 60.'));
-    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Win = target hit before the stop. A bucket only "stands out" (green or red) when it has at least 15 calls and its whole 95% range sits above or below the all-calls win rate. Past calls only: a filter is worth using only if it keeps working on new calls.'));
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Win = target hit before the stop. Each bucket\'s average per trade is compared with the rest of the calls. With '+rep.tested+' buckets tested, a few always look different by chance, so a bucket only "stands out" (green or red) when it and the rest have 15+ calls each and the gap clears a bar corrected for all '+rep.tested+' tests (about a 5% chance per report of any false find). Past calls only: a filter is worth using only if it keeps working on new calls.'));
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'"Move into entry" = your fill vs the last trade before the alert: how far the call\'s own crowd had already pushed the price (the live panel\'s "vs call MC" number). "Run-up" = the 15 min before the alert; '+o.runUps+' of '+o.rows.length+' calls have those prices so far (older calls get them on the next "Score calls").'));
+    const gap=r=>r.diff==null?'':(r.diff>=0?'+':'')+r.diff.toFixed(0)+' pts vs the rest';
     for(const f of rep.features){
       box.append(el('h3','margin:16px 0 4px;font-size:14px',f.name));
-      table('Bucket',f.rows.map(r=>[[r.label,String(r.n),rate(r),pct(r.ev),pct(r.medianPeak),r.standsOut==='above'?'better than average':r.standsOut==='below'?'worse than average':r.few?'too few calls':''],
+      table('Bucket',f.rows.map(r=>[[r.label,String(r.n),rate(r),pct(r.ev),pct(r.medianPeak),r.standsOut==='above'?'better than the rest ('+gap(r)+')':r.standsOut==='below'?'worse than the rest ('+gap(r)+')':r.few?'too few calls':gap(r)?gap(r)+' (within chance)':''],
         r.standsOut==='above'?C.green:r.standsOut==='below'?C.red:r.few?'#6f7d8d':'']));
     }
     eachCall();
