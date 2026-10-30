@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Flow Batch Video Downloaderuse
 // @namespace    flow.batch.downloader
-// @version      3.7.0
+// @version      3.8.0
 // @description  Flow Studio: Scene queue, conservative result matching, named batch downloads and original-only files.
 // @author       Daniel
 // @match        https://flow.google.com/*
@@ -20,7 +20,7 @@
 // @connect      googlevideo.com
 // ==/UserScript==
 
-/* Flow Studio 3.7.0
+/* Flow Studio 3.8.0
  * Update the existing script; do not run two copies.
  * No external libraries, telemetry, uploads or automatic downloads.
  * Observes Flow’s existing media responses; never sends private RPC requests.
@@ -33,7 +33,7 @@
  * Menu downloads are reported as REQUESTED, not falsely reported as completed.
  * Full prompt text is available only when Flow exposes it. Importing a script alone
  * cannot reliably map every old, generically titled video to a script number.
- * Alt+D: open/minimize to a bottom pill. Minimized state is remembered.
+ * Alt+D: open/minimize to a bottom pill (Option+D on Mac). Esc minimizes. Minimized state is remembered.
  * Pick on grid: show selection tools. Shift-click: range selection. Row pills: select a visual row.
  */
 
@@ -399,6 +399,29 @@
   let writerProject = '', releaseWriter = null, writerRevision = 0;
   const sessionTiles = new Set();
   const ambiguousTokens = new Set();
+  // Hot-path caches. Each rebuilds itself when its source changes.
+  let promptSet = new Set(), promptSetFor = null;
+  function knownPrompt(text) {
+    // state.jobs is always replaced, never mutated in place, and a job's prompt never changes.
+    if (promptSetFor !== state.jobs) { promptSet = new Set(state.jobs.map(j => normalizeText(j.prompt))); promptSetFor = state.jobs; }
+    return promptSet.has(text);
+  }
+  let baselineCache = { keys: null, size: -1, set: null };
+  function baselineHas(key) {
+    const keys = state.baseline?.keys; if (!keys) return false;
+    if (baselineCache.keys !== keys || baselineCache.size !== keys.length) baselineCache = { keys, size: keys.length, set: new Set(keys) };
+    return baselineCache.set.has(key);
+  }
+  const tokenCache = new Map();
+  function cachedToken(url) {
+    let token = tokenCache.get(url);
+    if (token === undefined) { if (tokenCache.size > 4000) tokenCache.clear(); token = assetToken(url); tokenCache.set(url, token); }
+    return token;
+  }
+  // Tile keys are cached for one synchronous pass only; Flow cannot change the DOM mid-pass.
+  let tileKeyCache = null;
+  function resetTileKeys() { tileKeyCache = null; }
+  const scriptCollator = new Intl.Collator(undefined, { numeric: true });
   // Parse only media responses already requested by Flow. Never issue an RPC.
   function parseFlowMedia(text) {
     if (typeof text !== 'string' || text.length > 16000000) return [];
@@ -440,7 +463,8 @@
   }
   function installMediaObserver(page, consume) {
     const relevant = raw => relevantMediaRequest(raw, location.origin);
-    const deliver = text => { try { consume(text); } catch (_) { /* Never affect Flow's request. */ } };
+    // Parse after Flow's own handlers have run, never inside its load event.
+    const deliver = text => setTimeout(() => { try { consume(text); } catch (_) { /* Never affect Flow's request. */ } }, 0);
     const proto = page.XMLHttpRequest?.prototype;
     if (proto) {
       const open = proto.open, send = proto.send, observed = new WeakMap();
@@ -465,15 +489,24 @@
   }
   const mediaCatalog = new Map(), readyProjects = new Set();
   let mediaRefresh;
+  // Most batchexecute responses are unrelated RPCs without media links; skip them before parsing.
+  const MEDIA_HINT = /flow-content\.google|googleusercontent\.com|googlevideo\.com|flow\.google\.com/;
   function ingestMediaResponse(text) {
+    if (typeof text !== 'string' || !MEDIA_HINT.test(text)) return;
     const entries = parseFlowMedia(text).filter(r => r.project === projectIdentity(location.pathname)); if (!entries.length) return;
+    let changed = false;
     for (const incoming of entries) {
       const key = incoming.project + ':' + incoming.key, previous = mediaCatalog.get(key);
-      mediaCatalog.set(key, { ...previous, ...incoming, title: incoming.title || previous?.title || '',
+      const next = { ...previous, ...incoming, title: incoming.title || previous?.title || '',
         poster: incoming.poster || previous?.poster || '', originalUrl: incoming.originalUrl || previous?.originalUrl || '',
-        mediaTokens: [...new Set([...(previous?.mediaTokens || []), ...incoming.mediaTokens])] });
+        mediaTokens: [...new Set([...(previous?.mediaTokens || []), ...incoming.mediaTokens])] };
+      if (!previous || next.mediaTokens.length !== previous.mediaTokens.length ||
+          ['entityId', 'title', 'poster', 'originalUrl', 'prompt', 'duration', 'createdAt'].some(field => next[field] !== previous[field])) changed = true;
+      mediaCatalog.set(key, next);
       readyProjects.add(incoming.project);
     }
+    // Flow re-sends the same media often. Only real changes trigger a reconcile and a save.
+    if (!changed) return;
     state.catalogDirty = true;
     if (ui.panel) {
       clearTimeout(mediaRefresh); mediaRefresh = setTimeout(() => {
@@ -502,7 +535,7 @@
       matches.get(id).push(rec);
     }
     for (const info of entries) {
-      const previous = matches.get(info.key) || [], rec = clips.get(info.key) || { key: info.key, serial: state.serial++, selected: false, downloadState: '', note: '', firstSeen: Date.now(), seenInBatch: isNewRecord(info.key, state.baseline) };
+      const previous = matches.get(info.key) || [], rec = clips.get(info.key) || { key: info.key, serial: state.serial++, selected: false, downloadState: '', note: '', firstSeen: Date.now(), seenInBatch: !!state.baseline && !baselineHas(info.key) };
       const best = mergeDownloadResult(previous), positioned = [...previous].sort((a,b)=>(b.capturedAt || 0)-(a.capturedAt || 0)).find(r=>Number.isFinite(r.y));
       const inherited = previous.find(r => r.selectionCapture);
       if (positioned && !Number.isFinite(rec.y)) Object.assign(rec, {y:positioned.y,x:positioned.x,scrollTop:positioned.scrollTop,capturedAt:positioned.capturedAt});
@@ -518,9 +551,10 @@
       for (const old of previous) if (old.key !== info.key) clips.delete(old.key);
       clips.set(info.key, rec);
       for (const token of [info.key,info.mediaId,...tokens]) addAlias(mediaAliases, token, info.key);
-      for (const old of previous) if (state.baseline?.keys.includes(old.key) && !state.baseline.keys.includes(info.key)) state.baseline.keys.push(info.key);
-      rec.seenInBatch = isNewRecord(info.key, state.baseline);
+      for (const old of previous) if (baselineHas(old.key) && !baselineHas(info.key)) state.baseline.keys.push(info.key);
+      rec.seenInBatch = !!state.baseline && !baselineHas(info.key);
     }
+    resetTileKeys(); // Media aliases changed.
     if (state.downloadBatch) {
       const grouped = new Map();
       for (const item of state.downloadBatch.items) {
@@ -557,6 +591,7 @@
     const result = mergeDownloadResult([old,current]); current.downloadState = result.downloadState; current.note = result.note;
     current.mediaTokens = [...new Set([...(current.mediaTokens || []),old.key,...(old.mediaTokens || [])])];
     for (const token of current.mediaTokens) addAlias(mediaAliases,token,key);
+    resetTileKeys();
     for (const item of state.downloadBatch?.items || []) if(item.key===old.key) { item.key=key;if(item.state==='relink')item.state='pending'; }
     clips.delete(old.key); state.relinkKey = '';
     reconcileMedia(); writeStorage(); renderLibrary(); decorateGrid();
@@ -611,19 +646,36 @@
     if (!state.writable || writerProject !== state.project) throw new Error('This tab does not own the project. Use Enable this tab after closing the other Flow Studio tab.');
   }
 
+  let jobsSaved = { project: '', signature: null };
+  function jobsSignature(jobs) {
+    // Every field a job can change after import. Prompts never change, so they are not read.
+    return jobs.map(j => [j.fingerprint, j.state, j.selected, j.seconds, j.needsDuration, j.durationSuggested, j.note,
+      j.lastAttemptAt, j.attemptCount, j.draftSignature ? hashText(j.draftSignature) : '',
+      j.attemptBaseline?.length, j.pastAttempts?.length].join('\u0001')).join('\u0002');
+  }
   function writeStorage(strict = false) {
     clearTimeout(saveTimer);
     if (!state.project) return;
     if (!state.writable || writerProject !== state.project) { if (strict === true) requireWriter(); return; }
     try {
+      // Jobs carry the full prompt text, so they live in their own key and are written
+      // only when a job changes. submissionHistory stays in the main key below, so the
+      // duplicate-submission guard is still written with every save.
+      const signature = jobsSignature(state.jobs);
+      if (jobsSaved.project !== state.project || jobsSaved.signature !== signature) {
+        GM_setValue('fs3:jobs:' + state.project, state.jobs);
+        jobsSaved = { project: state.project, signature };
+      }
       GM_setValue('fs3:project:' + state.project, { clips: [...clips.values()].map(r => {
-        const { videoUrl, prompt, ...rest } = r;
+        const { videoUrl, prompt, selectionCapture, captureState, domOnly, ...rest } = r;
         // Full unselected prompts arrive again with Flow's catalog. Avoid copying
         // megabytes through extension storage on every checkbox or status change.
         // The short original link is kept so a reload can still save named files.
-        return r.selected || r.legacy || r.sceneFingerprint ? { ...rest, prompt } : rest;
+        // captureState is reset on load; selectionCapture only matters while selected.
+        const kept = r.selected ? { ...rest, selectionCapture } : rest;
+        return r.selected || r.legacy || r.sceneFingerprint ? { ...kept, prompt } : kept;
       }), serial: state.serial, baseline: state.baseline, scanned: state.scanned,
-      jobs: state.jobs, submissionHistory: state.submissionHistory,
+      jobsStored: true, submissionHistory: state.submissionHistory,
       downloadBatch: state.downloadBatch, scanCursor: state.scanCursor, schemaVersion: 4, savedAt: Date.now() });
     } catch (e) {
       toast('Could not save project progress: ' + e.message, true);
@@ -633,10 +685,12 @@
   function saveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(writeStorage, 250); }
   function restoreProject() {
     state.promptImportRevision = (state.promptImportRevision || 0) + 1;
-    clips.clear(); mediaAliases.clear(); sessionTiles.clear(); ambiguousTokens.clear(); tileIdentities = new WeakMap();
+    clips.clear(); mediaAliases.clear(); sessionTiles.clear(); ambiguousTokens.clear(); tileIdentities = new WeakMap(); resetTileKeys();
     const data = state.project ? GM_getValue('fs3:project:' + state.project, {}) : {};
+    // 3.8 keeps jobs in their own key. Data last saved by 3.7 still carries them inline.
+    const savedJobs = data?.jobsStored ? GM_getValue('fs3:jobs:' + state.project, []) : data?.jobs;
     if (!data || typeof data !== 'object' || Array.isArray(data) ||
-        (data.clips != null && !Array.isArray(data.clips)) || (data.jobs != null && !Array.isArray(data.jobs)))
+        (data.clips != null && !Array.isArray(data.clips)) || (savedJobs != null && !Array.isArray(savedJobs)))
       throw new Error('Saved project data is malformed. Restore a backup before editing; nothing was overwritten.');
     if (state.writable && data.clips?.length && data.schemaVersion !== 4 && !GM_getValue('fs3:before-stable-ids:' + state.project, null)) GM_setValue('fs3:before-stable-ids:' + state.project, data);
     state.mediaReady = readyProjects.has(state.project);
@@ -666,7 +720,8 @@
     for (const rec of clips.values()) if (rec.downloadState === 'failed' && /^Paused by you\./.test(rec.note || '')) {
       rec.downloadState = 'pending'; rec.note = '';
     }
-    state.jobs = recoverJobs(Array.isArray(data.jobs) ? data.jobs : []);
+    state.jobs = recoverJobs(Array.isArray(savedJobs) ? savedJobs : []);
+    jobsSaved = { project: state.project, signature: data.jobsStored && Array.isArray(savedJobs) ? jobsSignature(savedJobs) : null };
     state.sceneFilter = ''; state.activeScene = '';
     for (const job of state.jobs) {
       const saved = data.submissionHistory?.[job.fingerprint];
@@ -701,9 +756,15 @@
   function tileTokens(tile) {
     const image = tile.querySelector('img'), video = tile.querySelector('video');
     return [...new Set([image?.src, image?.currentSrc, video?.getAttribute('src'), video?.currentSrc,
-      video?.poster, video?.querySelector('source')?.src].filter(Boolean).map(assetToken).filter(Boolean))];
+      video?.poster, video?.querySelector('source')?.src].filter(Boolean).map(cachedToken).filter(Boolean))];
   }
   function tileKey(tile) {
+    if (!tileKeyCache) { tileKeyCache = new Map(); queueMicrotask(resetTileKeys); }
+    let key = tileKeyCache.get(tile);
+    if (key === undefined) { key = computeTileKey(tile); tileKeyCache.set(tile, key); }
+    return key;
+  }
+  function computeTileKey(tile) {
     if (tile.matches('flow-image-tile')) {
       const id = tile.querySelector('img[data-media-id]')?.getAttribute('data-media-id') || '';
       if (/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(id)) return 'image:' + id.toLowerCase();
@@ -729,6 +790,7 @@
       if (owners.has(token) && owners.get(token) !== tile) ambiguousTokens.add(token);
       else owners.set(token, tile);
     }
+    resetTileKeys(); // Ambiguous tokens changed.
     for (const tile of tiles) {
       const key = tileKey(tile); if (!key) continue;
       if (key.startsWith('tile:')) {
@@ -741,7 +803,7 @@
           if (rec && !clips.has(key)) {
             clips.delete(previous.key); rec.key = key; clips.set(key, rec);
             for (const item of state.downloadBatch?.items || []) if (item.key === previous.key) item.key = key;
-            if (state.baseline?.keys.includes(previous.key)) state.baseline.keys.push(key);
+            if (baselineHas(previous.key)) state.baseline.keys.push(key);
           }
         }
         tileIdentities.set(tile, { key, tokens });
@@ -752,13 +814,14 @@
     const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
     let n, parts = [];
     while ((n = walker.nextNode())) {
-      if (own(n.parentElement) || n.parentElement?.closest('mat-icon,button')) continue;
+      if (n.parentElement?.closest('mat-icon,button')) continue;
       const s = normalizeText(n.nodeValue);
       if (s && !/^(play_circle|image|favorite|redo|more_vert|\d+%)$/.test(s)) parts.push(s);
     }
     return parts.sort((a, b) => b.length - a.length)[0] || '';
   }
   function harvest(render = true) {
+    state.lastHarvest = Date.now();
     if (!state.project || !isGrid() || projectIdentity(location.pathname) !== state.project) return;
     refreshTileIdentities();
     const sc = scroller(), scRect = sc.getBoundingClientRect();
@@ -766,7 +829,7 @@
     document.querySelectorAll(TILE).forEach(tile => {
       const scope = tile.closest(SCOPE) || tile;
       const text = cleanTileText(scope);
-      const exposedPrompt = /SCRIPT|DIALOGUE|PERFORMANCE|Animate the supplied/i.test(text) || state.jobs.some(j => normalizeText(j.prompt) === normalizeText(text)) ? text : '';
+      const exposedPrompt = /SCRIPT|DIALOGUE|PERFORMANCE|Animate the supplied/i.test(text) || knownPrompt(text) ? text : '';
       const key = tileKey(tile); if (!key) return;
       const kind = tile.matches('flow-image-tile') ? 'image' : 'video';
       const image = tile.querySelector('img');
@@ -775,7 +838,7 @@
       let rec = clips.get(key);
       if (!rec) {
         rec = { key, serial: state.serial++, title: '', prompt: '', scriptId: '', selected: false,
-          downloadState: '', note: '', firstSeen: Date.now(), seenInBatch: !!state.baseline && !state.baseline.keys.includes(key) };
+          downloadState: '', note: '', firstSeen: Date.now(), seenInBatch: !!state.baseline && !baselineHas(key) };
         clips.set(key, rec); changed = true;
       }
       rec.kind = kind;
@@ -787,7 +850,6 @@
       const poster = image?.currentSrc || image?.src || tile.querySelector('video')?.poster;
       if (poster && poster !== rec.poster) { rec.poster = poster; changed = true; }
       rec.mediaTokens = [...new Set([...(rec.mediaTokens || []), ...tileTokens(tile)])];
-      rec.domOnly = key.startsWith('tile:');
       if (key.startsWith('media:')) { rec.mediaId = key.slice(6); state.mediaReady = true; }
       if (key.startsWith('image:')) rec.mediaId = key.slice(6);
       rec.y = sc.scrollTop + rect.top - scRect.top;
@@ -799,7 +861,6 @@
       if (rec.captureState !== captureState) { rec.captureState = captureState; changed = true; }
       const video = tile.querySelector('video');
       if (video) {
-        const src = video.currentSrc || video.src;
         // Never infer an original-download URL from a hover preview.
         if (Number.isFinite(video.duration)) rec.duration = video.duration;
         if (video.readyState >= 1 && video.duration > 0) rec.resultReady = true;
@@ -815,7 +876,7 @@
     return [...clips.values()].filter(r => state.view === 'legacy' ? r.legacy && r.selected : !r.legacy).sort((a, b) => {
       if (state.sort === 'script' && (a.scriptId || b.scriptId)) {
         if (!a.scriptId) return 1; if (!b.scriptId) return -1;
-        const c = a.scriptId.localeCompare(b.scriptId, undefined, { numeric: true }); if (c) return c;
+        const c = scriptCollator.compare(a.scriptId, b.scriptId); if (c) return c;
       }
       return (a.gridRank ?? a.y ?? a.serial) - (b.gridRank ?? b.y ?? b.serial) || (a.x || 0) - (b.x || 0) || a.serial - b.serial;
     });
@@ -848,7 +909,7 @@
     for (const item of state.downloadBatch?.items || []) {
       if (keys.includes(item.key) && /^(pending|skipped)$/.test(item.state)) item.state = selected ? 'pending' : 'skipped';
     }
-    writeStorage(); renderLibrary(); decorateGrid();
+    saveSoon(); renderLibrary(); decorateGrid();
     if (message) {
       const missing = selected ? keys.filter(key => clips.get(key)?.captureState !== 'captured').length : 0;
       toast(message + (selected ? (missing ? ' ' + missing + ' need a loaded tile; the queue will verify them before downloading.' : ' Video identities and download controls captured.') : ''));
@@ -862,7 +923,7 @@
       if (selected.has(item.key) && /^(pending|skipped)$/.test(item.state)) item.state = 'skipped';
     }
     state.anchor = ''; state.gridAnchor = ''; state.relinkKey = '';
-    writeStorage(); renderLibrary(); decorateGrid();
+    saveSoon(); renderLibrary(); decorateGrid();
     toast('Unchecked ' + selected.size + ' videos. Download history kept.');
   }
   function selectClip(key, shift, grid = false) {
@@ -953,6 +1014,15 @@
       }
     }
   }
+  // Wait until the grid stops changing (Flow has rendered the new rows), capped at the
+  // old fixed delay. Most scroll steps settle well before the cap.
+  async function gridQuiet(project, quiet = 250, max = 650) {
+    const start = Date.now(); let last = start;
+    const watcher = new MutationObserver(() => { last = Date.now(); });
+    watcher.observe(scroller(), { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'poster', 'data-media-id'] });
+    try { while (Date.now() - start < max && Date.now() - last < quiet) await interruptibleDelay(50, project); }
+    finally { watcher.disconnect(); }
+  }
   async function scanAll(markBaseline = false, fresh = false) {
     if (busy()) { toast('Pause the current operation first.'); return; }
     if (!isGrid()) { toast('Open the project grid to scan.', true); return; }
@@ -985,9 +1055,10 @@
       for (let n = 0; n < 600; n++) {
         sameProject(project);
         const before = sc.scrollTop, count = found.size;
-        sc.scrollTop += Math.max(200, sc.clientHeight * 0.7);
-        await interruptibleDelay(650, project); await collectSettled();
-        cursor.top = sc.scrollTop; cursor.found = [...found]; writeStorage(true);
+        sc.scrollTop += Math.max(200, sc.clientHeight * 0.85);
+        await gridQuiet(project); await collectSettled();
+        // Save the resume point every few steps instead of after every scroll.
+        cursor.top = sc.scrollTop; cursor.found = [...found]; if (n % 5 === 4) writeStorage(true);
         toast('Scanning the grid · ' + found.size + ' media items');
         if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 5 || sc.scrollTop <= before + 2) {
           await interruptibleDelay(700, project); await collectSettled();
@@ -1090,7 +1161,7 @@
       tile = await downloadWaitFor(() => { harvest(false); const t = find(); return usable(t) ? t : null; }, project, 1500);
       if (tile) return tile;
     }
-    throw new Error('Saved video is not at its last position. Select it again on the grid or run Scan all once, then Retry failed downloads.');
+    throw new Error('Saved video is not at its last position. Select it again on the grid or run Scan grid once, then Retry failed downloads.');
   }
 
   async function menuDownload(rec, item, project) {
@@ -1136,7 +1207,7 @@
       preset: preset === 'custom' || NAME_PRESETS[preset] ? preset : 'order_id',
       custom: String(GM_getValue('fs3:name-custom', '{n}_{id}') || '{n}_{id}'),
       method: GM_getValue('fs3:save-method', 'direct') === 'menu' ? 'menu' : 'direct',
-      parallel: Math.max(1, Math.min(4, +GM_getValue('fs3:parallel', 3) || 3)) };
+      parallel: Math.max(1, Math.min(6, +GM_getValue('fs3:parallel', 3) || 3)) };
   }
   let saveCfg = loadSaveSettings();
   function namePattern() { return saveCfg.preset === 'custom' ? saveCfg.custom : NAME_PRESETS[saveCfg.preset]; }
@@ -1241,7 +1312,7 @@
           // Journal first: a reload mid-file reports “check this file”, never a silent re-save.
           item.state = rec.downloadState = 'issuing'; item.method = 'Named file'; item.name = name; item.attempts++;
           item.requestedAt = rec.lastRequestedAt = Date.now(); item.note = rec.note = 'Saving as ' + name;
-          writeStorage(true); renderLibrary(); updateCounts();
+          writeStorage(true); scheduleRender();
         } catch (e) {
           item.state = rec.downloadState = 'pending'; item.note = rec.note = ''; stopReason = e.message; return;
         }
@@ -1257,10 +1328,11 @@
             if (++failures >= 3) stopReason = 'Paused after 3 failed downloads in a row. ' + e.message;
           }
         }
-        item.finishedAt = Date.now(); done++;
-        if (!stopReason) toast('Saving named files · ' + done + ' of ' + total + ' · ' + name.split('/').pop());
+        item.finishedAt = Date.now(); done++; if (state.downloadStats) state.downloadStats.done++;
+        const eta = downloadEta();
+        if (!stopReason) toast('Saving named files · ' + done + ' of ' + total + (eta ? ' · ' + eta : '') + ' · ' + name.split('/').pop());
         try { writeStorage(true); } catch (e) { stopReason = e.message; }
-        renderLibrary(); updateCounts();
+        scheduleRender();
       }
     }
     const results = await Promise.allSettled(Array.from({ length: Math.min(saveCfg.parallel, total) }, worker));
@@ -1293,6 +1365,7 @@
         item.state = rec.downloadState = e instanceof UncertainDownload || item.state === 'issuing' ? 'uncertain' : 'failed';
         item.note = rec.note = e.message; item.finishedAt = Date.now(); consecutiveFailures++;
       } finally { closeMenus(); }
+      if (state.downloadStats) state.downloadStats.done++;
       writeStorage(true); renderLibrary(); updateCounts();
       if (item.state === 'requested' && !batch.deliveryChecked) {
         batch.phase = 'awaiting-check'; batch.checkKey = item.key;
@@ -1328,6 +1401,7 @@
     }
     const batch = state.downloadBatch, project = state.project;
     state.downloading = true; state.stop = false; batch.phase = 'running';
+    state.downloadStats = { start: Date.now(), done: 0 };
     let pauseReason = '';
     try {
       writeStorage(true); updateCounts();
@@ -1371,6 +1445,14 @@
     if (state.downloadBatch) { state.downloadBatch.phase = 'paused'; state.downloadBatch.deliveryChecked = false; }
     writeStorage(); renderLibrary(); updateCounts();
     toast('Missing files re-queued. Click Resume / Download when ready.');
+  }
+  function downloadEta() {
+    const stats = state.downloadStats; if (!stats?.done) return '';
+    const c = batchCounts(state.downloadBatch), left = c.pending + c.active;
+    if (!left) return '';
+    // Time per finished file so far, which already accounts for parallel saves.
+    const seconds = Math.ceil((Date.now() - stats.start) / stats.done * left / 1000);
+    return seconds < 60 ? '~' + seconds + 's left' : '~' + Math.ceil(seconds / 60) + ' min left';
   }
   function downloadSummary() {
     const c = batchCounts(state.downloadBatch);
@@ -1576,6 +1658,7 @@
         } catch (_) { state.stop = true; }
       }, 2000);
       const selected = jobs.slice(0, limit);
+      let lastClickAt = 0;
       for (const job of selected) {
         if (state.stop || projectIdentity(location.pathname) !== project) break;
         if (!queueable(job, state.submissionHistory)) continue;
@@ -1584,7 +1667,15 @@
         writeStorage(); renderQueue();
         let clicked = false, boundaryCreated = false, clickedAt = 0;
         try {
-          const generate = ownsPreparedDraft(job) ? await readyGenerateButton(project) : await prepareJob(job, project);
+          if (!ownsPreparedDraft(job)) await prepareJob(job, project);
+          // Prepare during the minimum gap instead of after it. The gap still applies
+          // between Generate clicks; only the waiting overlaps with preparation.
+          const sendAt = lastClickAt + gap * 1000;
+          while (Date.now() < sendAt && !state.stop) {
+            state.activeScene = 'Prepared ' + job.id + ' · sending in ' + Math.ceil((sendAt - Date.now()) / 1000) + 's'; updateCounts();
+            await sleep(Math.min(250, sendAt - Date.now()));
+          }
+          const generate = await readyGenerateButton(project);
           sameProject(project);
           if (!generate.isConnected || generate !== appButton('Start generation') || !radioEnabled(generate) || !editorMatchesPrompt(editor(), job.prompt))
             throw new Error('The prepared draft or Generate control changed. Nothing was sent.');
@@ -1598,7 +1689,7 @@
           sameProject(project);
           if (!generate.isConnected || generate !== appButton('Start generation') || !radioEnabled(generate) || !editorMatchesPrompt(editor(), job.prompt))
             throw new Error('The prepared draft or Generate control changed before submission. Nothing was sent.');
-          clicked = true; generate.click();
+          clicked = true; generate.click(); lastClickAt = clickedAt;
           job.attemptCount = (job.attemptCount || 0) + 1;
           state.activeScene = 'Sent ' + job.id + ' · waiting for the composer'; renderQueue();
           const reset = await waitForComposerReset(job, project);
@@ -1609,6 +1700,13 @@
           job.draftSignature = ''; job.selected = false;
           state.submissionHistory[job.fingerprint].state = job.state; sent++;
         } catch (e) {
+          if (!clicked && !boundaryCreated && state.stop && e.message === 'Paused by you.') {
+            // Paused while preparing or waiting out the gap. Nothing was sent; a prepared
+            // draft stays in Flow and is reused by the next Start queue.
+            job.state = 'ready'; job.note = 'Paused before sending. Nothing was submitted.';
+            processed++; writeStorage(); renderQueue();
+            break;
+          }
           if (job.state !== 'completed') job.state = clicked ? 'uncertain' : 'blocked';
           job.note = e.message;
           if (clicked) {
@@ -1624,13 +1722,6 @@
         }
         processed++; writeStorage(); renderQueue(); setProgress(processed, selected.length);
         if (state.stop) break;
-        if (processed < selected.length) {
-          const until = clickedAt + gap * 1000;
-          state.activeScene = 'Next scene ' + selected[processed].id + ' · waiting for the minimum gap'; updateCounts();
-          // The gap includes the time spent observing submission, and there is
-          // no unnecessary delay after the last scene in a run.
-          while (Date.now() < until && !state.stop) await sleep(Math.min(250, until - Date.now()));
-        }
       }
     } catch (e) { stopReason = e.message; }
     finally {
@@ -1974,6 +2065,21 @@
     .fs-badge.saved{color:#86e3b6;background:#86e3b612}
     .fs-card.selected .fs-file:not(.saved):not(.menu){color:#e2d0ff}
     #fs-fab{font-variant-numeric:tabular-nums}
+
+    /* 3.8: lighter rendering, readable small text, More menu, resizable panel. */
+    /* Both surfaces are opaque, so the blur was invisible but still redrew whatever played behind. */
+    #fs-panel,#fs-pick-dock{backdrop-filter:none}
+    #fs-panel{resize:both;min-width:320px;min-height:380px;max-height:calc(100vh - 16px)}
+    .fs-card{content-visibility:auto;contain-intrinsic-size:auto 72px}
+    .fs-job{contain-intrinsic-size:auto 170px}
+    .fs-eyebrow{font-size:9px}
+    .fs-badge,.fs-small-note,.fs-hint,.fs-job-note,.fs-caption,.fs-detail,.fs-id{font-size:10.5px}
+    .fs-link{font-size:10.5px!important}
+    .fs-status{font-size:10.5px;max-height:64px}
+    .fs-more>summary{list-style:none;display:inline-block;cursor:pointer;user-select:none}
+    .fs-more>summary::-webkit-details-marker{display:none}
+    .fs-more[open]{flex-basis:100%}
+    .fs-more-menu{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px;padding:6px;border:1px solid #b18bff2e;border-radius:6px;background:#0e0a15cc}
   `);
 
   }
@@ -1981,7 +2087,11 @@
   let libraryProject = '', libraryOrder = '';
   function renderLibrary() {
     if (!ui.list) return;
+    // A hidden list is not worth rendering; it is rebuilt when the panel or tab opens.
+    if (ui.panel?.hidden || ui.library?.hidden) { state.libraryStale = true; updateCounts(); return; }
+    state.libraryStale = false;
     if (libraryProject !== state.project) { libraryCards.clear(); libraryOrder = ''; libraryProject = state.project; }
+    for (const key of libraryCards.keys()) if (!clips.has(key)) libraryCards.delete(key);
     // Keep existing cards and thumbnails mounted. Updating one status must not
     // rebuild hundreds of rows, restart image loads, or lose checkbox focus.
     const records = filtered(), all = ordered(), ranks = new Map(all.map((rec,i) => [rec.key,i+1]));
@@ -2062,6 +2172,8 @@
   const sceneCards = new Map();
   function renderQueue() {
     if (!ui.queueList) return;
+    if (ui.panel?.hidden || ui.create?.hidden) { state.queueStale = true; updateCounts(); return; }
+    state.queueStale = false;
     const scroll = ui.queueList.scrollTop, locked = busy();
     const search = (ui.sceneSearch?.value || '').trim().toLowerCase();
     const view = ui.sceneView?.value || 'all';
@@ -2070,12 +2182,24 @@
       (view !== 'ready' || queueable(job, state.submissionHistory)) &&
       (view !== 'check' || /^(blocked|uncertain)$/.test(job.state)) &&
       (view !== 'completed' || job.state === 'completed'));
-    const records = [...clips.values()];
+    // One pass over the clips instead of one per scene.
+    const resultsByScene = new Map(), framesByName = new Map();
+    for (const r of clips.values()) {
+      if (r.sceneFingerprint && r.resultReady && !r.legacy) {
+        if (!resultsByScene.has(r.sceneFingerprint)) resultsByScene.set(r.sceneFingerprint, []);
+        resultsByScene.get(r.sceneFingerprint).push(r);
+      }
+      if (r.kind === 'image') {
+        if (!framesByName.has(r.title)) framesByName.set(r.title, []);
+        framesByName.get(r.title).push(r);
+      }
+    }
     const cards = shown.map(job => {
-      const results = sceneResults(job);
-      const poster = sceneFramePoster(job, records);
+      const results = resultsByScene.get(job.fingerprint) || [];
+      const poster = sceneFramePoster(job, framesByName.get(job.frame) || []);
       const index = state.jobs.indexOf(job);
-      const signature = JSON.stringify([job.id,job.frame,job.prompt,job.position,index,job.seconds,job.state,job.note,job.selected,job.durationSuggested,
+      // A job's prompt never changes, so it stays out of this per-render signature.
+      const signature = JSON.stringify([job.id,job.frame,job.position,index,job.seconds,job.state,job.note,job.selected,job.durationSuggested,
         locked,poster,results.map(r=>r.key),!!state.submissionHistory[job.fingerprint]]);
       const old = sceneCards.get(job.fingerprint);
       if (old?.job === job && old.signature === signature) return old.card;
@@ -2122,8 +2246,23 @@
     ui.queueList.scrollTop = scroll; updateCounts();
   }
 
+  function updateFab(selected, c) {
+    ui.fab.dataset.running = String(running());
+    const eta = state.downloading ? downloadEta() : '';
+    const fabText = state.downloading ? 'Saving ' + (c.total - c.pending - c.active) + ' / ' + c.total + (eta ? ' · ' + eta : '') + '  ↑'
+      : state.generating ? 'Scene queue running  ↑' : state.scanning ? 'Scanning grid  ↑'
+      : 'Flow Studio' + (selected ? ' · ' + selected + ' selected' : '') + '  ↑';
+    if (ui.fab.textContent !== fabText) ui.fab.textContent = fabText;
+    ui.fab.title = (running() ? 'Queue or scan active · ' : '') + 'Open Flow Studio · Alt+D';
+  }
   function updateCounts() {
     if (!ui.count) return;
+    const c = batchCounts(state.downloadBatch);
+    if (ui.panel.hidden && ui.dock.hidden) {
+      // Minimized: only the pill is on screen, so skip the sorting and measuring below.
+      let selected = 0; for (const r of clips.values()) if (!r.legacy && r.selected) selected++;
+      updateFab(selected, c); return;
+    }
     const all = [...clips.values()];
     const selected = all.filter(r => !r.legacy && r.selected).length;
     const oldPicks = all.filter(r => r.legacy && r.selected).length;
@@ -2143,10 +2282,14 @@
     }
     ui.total.textContent = 'selected / ' + all.filter(r => !r.legacy).length + ' videos';
     ui.listCount.textContent = filtered().length + ' items';
-    const pending = batchCounts(state.downloadBatch).pending;
-    const eligible = newDownloadCandidates(all).length;
+    const pending = c.pending;
+    const candidates = newDownloadCandidates(all), eligible = candidates.length;
+    // Clips without a captured original link fall back to Flow's menu, one at a time.
+    const slow = saveCfg.method === 'direct' ? candidates.filter(r => !directLink(r)).length : 0;
     const checking = state.downloadBatch?.phase === 'awaiting-check';
-    ui.download.textContent = pending ? '▶  Resume · ' + pending + ' remaining' : '↓  Download ' + eligible + ' new selected';
+    ui.download.textContent = pending ? '▶  Resume · ' + pending + ' remaining'
+      : '↓  Download ' + eligible + ' new selected' + (slow ? ' · ' + slow + ' via Flow menu' : '');
+    ui.download.title = !pending && slow ? slow + ' selected clips have no original link captured yet, so they download one at a time through Flow’s menu. Run Scan grid first to save them all as fast named files.' : '';
     ui.download.disabled = busy() || checking || (!pending && !eligible) || !state.project;
     ui.deliveryCheck.hidden = !checking;
     ui.batchStatus.textContent = downloadSummary();
@@ -2154,20 +2297,15 @@
     ui.addToBatch.disabled = busy();
     const missingSelected = all.some(r => !r.legacy && r.selected && /^(failed|requested|uncertain)$/.test(r.downloadState));
     ui.missing.disabled = busy() || !missingSelected; ui.missing.hidden = !missingSelected;
-    const c = batchCounts(state.downloadBatch); if (!state.generating && !state.scanning) setProgress(c.total - c.pending - c.active, c.total);
+    if (!state.generating && !state.scanning) setProgress(c.total - c.pending - c.active, c.total);
     const failures = retryDownloads(all).length;
     ui.retry.textContent = '↻  Retry failed downloads' + (failures ? ' · ' + failures : '');
     ui.retry.disabled = busy() || checking || !!pending || !failures; ui.retry.hidden = !failures;
     ui.scan.disabled = busy(); ui.baseline.disabled = busy(); ui.freshScan.disabled = busy();
-    ui.scan.textContent = state.scanCursor?.phase === 'paused' ? 'Resume scan' : 'Scan all (optional)';
+    ui.scan.textContent = state.scanCursor?.phase === 'paused' ? 'Resume scan' : 'Scan grid';
     ui.stop.hidden = !running();
     ui.gridLayer.hidden = state.generating || !ui.fab.hidden;
-    ui.fab.dataset.running = String(running());
-    const fabText = state.downloading ? 'Saving ' + (c.total - c.pending - c.active) + ' / ' + c.total + '  ↑'
-      : state.generating ? 'Scene queue running  ↑' : state.scanning ? 'Scanning grid  ↑'
-      : 'Flow Studio' + (selected ? ' · ' + selected + ' selected' : '') + '  ↑';
-    if (ui.fab.textContent !== fabText) ui.fab.textContent = fabText;
-    ui.fab.title = (running() ? 'Queue or scan active · ' : '') + 'Open Flow Studio · Alt+D';
+    updateFab(selected, c);
     ui.panel.dataset.running = String(state.generating);
     ui.jobsCount.textContent = state.jobs.filter(j => j.state === 'completed').length + ' results · ' + eligibleJobs(state.jobs, state.submissionHistory).length + ' selected to run / ' + state.jobs.length;
     if (ui.queueRetry) ui.queueRetry.disabled = busy() || !state.jobs.some(j => j.selected && !j.needsDuration);
@@ -2197,6 +2335,8 @@
     state.tab = name; ui.library.hidden = name !== 'library'; ui.create.hidden = name !== 'create';
     ui.libraryTab.classList.toggle('active', name === 'library'); ui.createTab.classList.toggle('active', name === 'create');
     ui.libraryTab.setAttribute('aria-selected', String(name === 'library')); ui.createTab.setAttribute('aria-selected', String(name === 'create'));
+    if (name === 'library' && state.libraryStale) renderLibrary();
+    if (name === 'create' && state.queueStale) renderQueue();
     if (name === 'create' && !ui.create.scrollTop) revealSceneList();
   }
   function setRowMode(enabled) {
@@ -2233,7 +2373,7 @@
     ui.nameCustom = h('input', { class: 'fs-input', placeholder: '{n}_{id}', 'aria-label': 'Custom file name pattern' });
     ui.nameCustom.value = saveCfg.custom;
     ui.parallel = h('select', { class: 'fs-select', 'aria-label': 'Files saved at once' },
-      ...[1, 2, 3, 4].map(n => h('option', { value: n, text: n + ' at once' })));
+      ...[1, 2, 3, 4, 5, 6].map(n => h('option', { value: n, text: n + ' at once' })));
     ui.parallel.value = String(saveCfg.parallel);
     const methodButton = (method, text, title) => {
       const b = btn(text, () => { if (busy()) return; GM_setValue('fs3:save-method', method); applySaveSettings(); }, 'fs-mode', title);
@@ -2287,7 +2427,7 @@
     ui.savePreview.textContent = direct ? 'Downloads/' + sample : 'Flow menu · Flow names each file';
     ui.savePreview.title = ui.savePreview.textContent;
     ui.saveSetup.hidden = !direct || supported;
-    ui.saveSetup.textContent = 'Named files need the GM_download permission. Paste the full 3.7 script (header included) into Tampermonkey and save, or use Flow menu.';
+    ui.saveSetup.textContent = 'Named files need the GM_download permission. Paste the full 3.8 script (header included) into Tampermonkey and save, or use Flow menu.';
   }
   function selectSceneResults() {
     if (busy()) { toast('Pause the current operation first.'); return; }
@@ -2301,7 +2441,7 @@
   }
   function cleanStorage() {
     if (busy()) { toast('Pause the current operation first.'); return; }
-    if (typeof GM_listValues !== 'function' || typeof GM_deleteValue !== 'function') { toast('Paste the full 3.7 script (header included) to enable cleanup.', true); return; }
+    if (typeof GM_listValues !== 'function' || typeof GM_deleteValue !== 'function') { toast('Paste the full 3.8 script (header included) to enable cleanup.', true); return; }
     // Age comes from the last save. Projects saved by older versions get a first-seen
     // date now and only become removable 30 days later, so nothing recent is lost.
     const now = Date.now(), cutoff = now - 30 * 864e5, seen = GM_getValue('fs3:project-seen', {}) || {}, targets = [];
@@ -2315,7 +2455,7 @@
     GM_setValue('fs3:project-seen', seen);
     if (!targets.length) { toast('Nothing to clean. Only projects not opened for 30+ days are removed.'); return; }
     if (!confirm('Forget Flow Studio data for ' + targets.length + ' projects not opened in 30+ days?\n\nThis removes their selections, download history and scene submission history. If you reopen one, the scene queue will no longer know which scenes were already sent. This project is not touched.')) return;
-    for (const id of targets) { for (const k of ['fs3:project:', 'fs3:before-stable-ids:', 'fs3:lease:']) GM_deleteValue(k + id); delete seen[id]; }
+    for (const id of targets) { for (const k of ['fs3:project:', 'fs3:jobs:', 'fs3:before-stable-ids:', 'fs3:lease:']) GM_deleteValue(k + id); delete seen[id]; }
     GM_setValue('fs3:project-seen', seen);
     toast('Forgot ' + targets.length + ' old projects.');
   }
@@ -2326,7 +2466,7 @@
       ui.uncheckButtons.push(button); return button;
     };
     const head = h('div', { class: 'fs-head' }, h('div', { class: 'fs-logo', text: 'FS' }),
-      h('div', {}, h('div', { class: 'fs-brand' }, 'Flow Studio', h('span', {class: 'fs-brand-version', text: '3.7.0'})), h('div', { class: 'fs-eyebrow', text: 'CHROMA / CONTROL DECK' })));
+      h('div', {}, h('div', { class: 'fs-brand' }, 'Flow Studio', h('span', {class: 'fs-brand-version', text: '3.8.0'})), h('div', { class: 'fs-eyebrow', text: 'CHROMA / CONTROL DECK' })));
     ui.effect = btn('✦', () => {
       state.effect = { rainbow: 'still', still: 'off', off: 'rainbow' }[state.effect];
       GM_setValue('fs3:effect', state.effect); applyEffect();
@@ -2345,15 +2485,22 @@
     const views = h('select', { class: 'fs-select', 'aria-label': 'Clip filter' }, ...[['all', 'All media'], ['videos', 'Videos'], ['images', 'Images'], ['legacy', 'Old picks — relink'], ['selected', 'Selected'], ['new', 'New'], ['failed', 'Failed downloads'], ['requested', 'Sent to Chrome'], ['uncertain', 'Needs checking'], ['downloaded', 'Confirmed saved']].map(([value, text]) => h('option', { value, text })));
     ui.libraryView = views;
     views.onchange = () => { state.sceneFilter = ''; state.view = views.value; renderLibrary(); };
-    ui.scan = btn('Scan all (optional)', () => scanAll(state.scanCursor?.phase === 'paused' ? state.scanCursor.markBaseline : false)); ui.baseline = btn('Mark baseline', () => scanAll(true), 'fs-btn', 'Scan the currently displayed grid, then track newly discovered media. Clear Flow search/filter first for the whole project.');
+    ui.scan = btn('Scan grid', () => scanAll(state.scanCursor?.phase === 'paused' ? state.scanCursor.markBaseline : false), 'fs-btn', 'Scroll the whole grid once so every clip’s original link is captured. Named downloads are much faster than Flow-menu downloads.'); ui.baseline = btn('Mark baseline', () => scanAll(true), 'fs-btn', 'Scan the currently displayed grid, then track newly discovered media. Clear Flow search/filter first for the whole project.');
     ui.freshScan = btn('Scan from top', () => scanAll(false, true), 'fs-btn', 'Start at the top to include new images and videos. Clear Flow search/filter first for the whole project.');
     ui.enableTab = btn('Enable this tab', () => { if (!running()) acquireWriter(); }, 'fs-btn', 'Close the other Flow Studio tab for this project, then enable this one.');
-    const toolbar = h('div', { class: 'fs-toolbar' }, ui.enableTab, ui.scan, ui.freshScan, btn('All', () => applySelection(filtered().map(r => r.key), true)), btn('None', () => applySelection(filtered().map(r => r.key), false)), ui.baseline);
-    toolbar.append(btn('Invert', () => {
+    const invert = btn('Invert', () => {
       const records = filtered(), yes = records.filter(r => !r.selected).map(r => r.key), no = records.filter(r => r.selected).map(r => r.key);
       applySelection(yes, true); applySelection(no, false);
-    }), btn('Copy list', copySelection));
-    toolbar.append(btn('▦ Pick on grid', () => togglePanel(false, true), 'fs-pick-button', 'Show grid selection tools; minimize when finished'));
+    });
+    // Everyday actions stay visible; the rest live under More.
+    const more = h('details', { class: 'fs-more' }, h('summary', { class: 'fs-btn', text: 'More ▾' }),
+      h('div', { class: 'fs-more-menu' }, ui.freshScan, ui.baseline, invert, btn('Copy list', copySelection)));
+    more.addEventListener('click', e => { if (e.target.closest('.fs-more-menu button')) more.open = false; });
+    document.addEventListener('pointerdown', e => { if (more.open && !more.contains(e.target)) more.open = false; }, true);
+    const toolbar = h('div', { class: 'fs-toolbar' }, ui.enableTab,
+      btn('▦ Pick on grid', () => togglePanel(false, true), 'fs-pick-button', 'Show grid selection tools; minimize when finished'),
+      btn('All', () => applySelection(filtered().map(r => r.key), true)), btn('None', () => applySelection(filtered().map(r => r.key), false)),
+      ui.scan, more);
     const sort = h('select', { class: 'fs-select', 'aria-label': 'Sort clips' }, h('option', { value: 'script', text: 'Script order' }), h('option', { value: 'grid', text: 'Grid order' }));
     sort.onchange = () => { state.sort = sort.value; renderLibrary(); };
     ui.identityStatus = h('div', {class:'fs-caption',role:'status'});
@@ -2427,10 +2574,15 @@
     ui.gridLayer = h('div', {id: 'fs-grid-layer', 'data-fs-ui': '', 'aria-label': 'Clip selection controls'});
     document.body.append(ui.gridLayer, ui.panel, ui.fab, ui.dock);
     setRowMode(state.rowPicker); applyEffect();
-    makeDraggable(head); makeDockDraggable();
+    makeDraggable(head); makeDockDraggable(); makePanelResizable();
     // Start unobtrusively on the first run; restore the user's last open/minimized choice.
     togglePanel(!GM_getValue('fs3:minimized', true));
-    document.addEventListener('keydown', e => { if (e.altKey && e.key.toLowerCase() === 'd') { e.preventDefault(); togglePanel(ui.panel.hidden); } });
+    document.addEventListener('keydown', e => {
+      // e.code keeps Option+D working on a Mac, where e.key is '∂'.
+      if (e.altKey && !e.ctrlKey && !e.metaKey && (e.code === 'KeyD' || e.key?.toLowerCase() === 'd')) { e.preventDefault(); togglePanel(ui.panel.hidden); }
+      else if (e.key === 'Escape' && !ui.panel.hidden && ui.panel.contains(document.activeElement) &&
+        !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) togglePanel(false);
+    });
     window.addEventListener('resize', () => { clampPanel(); placeDock(); scheduleOverlays(); });
     document.addEventListener('scroll', scheduleOverlays, { capture: true, passive: true });
     toast('Loading media. Still images are listed separately; use Flow’s image menu to download them.');
@@ -2447,6 +2599,8 @@
     if (minimized) state.relinkKey = '';
     try { GM_setValue('fs3:minimized', !show); } catch (_) { /* The UI still minimizes if storage is unavailable. */ }
     if (show) clampPanel(); else if (picking) placeDock();
+    if (show) { if (state.libraryStale) renderLibrary(); if (state.queueStale) renderQueue(); }
+    if (show || picking) updateCounts();
     if (moveFocus) (show ? ui.libraryTab : picking ? ui.dockGrip : ui.fab).focus({ preventScroll: true });
     scheduleOverlays();
   }
@@ -2499,6 +2653,21 @@
       save();
     });
   }
+  function makePanelResizable() {
+    const size = GM_getValue('fs3:size', null);
+    if (size && Number.isFinite(size.w) && Number.isFinite(size.h)) Object.assign(ui.panel.style, { width: size.w + 'px', height: size.h + 'px' });
+    // Remember sizes you drag with the corner handle, not window-resize clamping.
+    let resizing = false, timer;
+    ui.panel.addEventListener('pointerdown', () => { resizing = true; });
+    for (const type of ['pointerup', 'mouseup']) window.addEventListener(type, () => { setTimeout(() => { resizing = false; }, 400); }, true);
+    new ResizeObserver(() => {
+      if (!resizing || ui.panel.hidden) return;
+      clearTimeout(timer); timer = setTimeout(() => {
+        const r = ui.panel.getBoundingClientRect();
+        if (r.width && r.height) try { GM_setValue('fs3:size', { w: Math.round(r.width), h: Math.round(r.height) }); } catch (_) {}
+      }, 300);
+    }).observe(ui.panel);
+  }
   function clampPanel() {
     const r = ui.panel.getBoundingClientRect(); if (!r.width) return;
     ui.panel.style.left = Math.max(8, Math.min(innerWidth - r.width - 8, r.left)) + 'px';
@@ -2520,6 +2689,10 @@
     });
     handle.addEventListener('pointerup', () => { if (!drag) return; drag = null; const r = ui.panel.getBoundingClientRect(); GM_setValue('fs3:position', { x: r.left, y: r.top }); });
   }
+  let renderFrame = 0;
+  function scheduleRender() {
+    if (!renderFrame) renderFrame = requestAnimationFrame(() => { renderFrame = 0; renderLibrary(); });
+  }
   function scheduleOverlays() { if (!overlayFrame) overlayFrame = requestAnimationFrame(() => { overlayFrame = null; decorateGrid(); }); }
   try { installMediaObserver(typeof unsafeWindow === 'undefined' ? window : unsafeWindow, ingestMediaResponse); }
   catch (_) { /* The UI reports missing media IDs; no URL-based fallback. */ }
@@ -2531,10 +2704,18 @@
   buildUI(); switchTab('library'); renderLibrary(); renderQueue();
   if (restoreError) toast(restoreError, true);
   else { harvest(); acquireWriter(); }
+  // Harvest after Flow changes the grid: 300 ms after things settle, and at most about
+  // one second apart during constant activity. The timer below is only a slow fallback.
+  const scheduleHarvest = () => {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => { if (!busy()) harvest(); }, Date.now() - (state.lastHarvest || 0) > 1000 ? 0 : 300);
+  };
   new MutationObserver(mutations => {
     if (!mutations.some(m => !own(m.target) && [...m.addedNodes, ...m.removedNodes].some(n => !(n.nodeType === 1 && (n.matches?.('[data-fs-ui]') || own(n)))))) return;
-    clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { if (!busy()) harvest(); }, 300);
+    scheduleHarvest();
   }).observe(document.body, { childList: true, subtree: true });
+  // Finished video metadata marks results ready without changing the DOM.
+  document.addEventListener('loadedmetadata', scheduleHarvest, true);
   setInterval(() => {
     const project = projectIdentity(location.pathname);
     if (project !== state.project) {
@@ -2546,7 +2727,7 @@
       toast(project ? 'Project restored. Your selections are saved.' : 'Open a Flow project.');
     }
     if (state.writable && !state.scanning && !state.downloading && state.catalogDirty) reconcileMedia();
-    if (!state.scanning && !state.downloading) harvest(!state.generating);
+    if (!state.scanning && !state.downloading && Date.now() - (state.lastHarvest || 0) >= 5000) harvest(!state.generating);
   }, 1200);
   window.addEventListener('beforeunload', writeStorage);
   window.addEventListener('pagehide', () => { writeStorage(); state.stop = true; if (releaseWriter) releaseWriter(); });
