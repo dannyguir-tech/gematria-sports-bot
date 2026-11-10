@@ -135,3 +135,64 @@ test('backtestReport labels boolean and hour buckets', () => {
   assert.deepEqual(names('Migrated at call').sort(), ['no', 'yes']);
   assert.ok(names('Hour of call (UTC)').every(l => /^(<6:00|6:00–12:00|12:00–18:00|≥18:00)$/.test(l)));
 });
+
+// ---- 4.4 ----
+test('pricePath: price N seconds after the alert, volume-weighted, on the candle scale', () => {
+  const A = Date.UTC(2026, 9, 20, 12, 0, 20), row = (s, sol, amount) => ({at: A + s * 1000, sol, amount});
+  // Pre-alert price 1e-7 SOL/token; +50% by 5s, +100% by 15s, minute closes at +80%. One dust trade with a huge tip is ignored by weight.
+  const rows = [row(-8, 1, 1e7), row(-3, 1, 1e7), row(2, 1.2, 1e7), row(5, 1.5, 1e7), row(6, 0.001, 1e3), row(15, 2, 1e7), row(30, 1.9, 1e7), row(38, 1.8, 1e7), row(75, 1.7, 1e7)];
+  const p = V.pricePath(rows, A);
+  assert.equal(Math.round(p.pct[2]), 20);
+  assert.ok(Math.abs(p.pct[5] - 50) < 1, 'dust trade barely moves the 5s price: ' + p.pct[5]);
+  assert.equal(Math.round(p.pct[15]), 100);
+  assert.equal(Math.round(p.pct[10]), 50, 'no trade at 10-13s: the last 15s carry forward');
+  assert.ok(Math.abs(p.entry[5] - 1.5 / 1.8) < 0.01, 'fill vs the close of its own minute');
+  assert.equal(V.pricePath([row(5, 1, 1e7)], A), null, 'no price before the alert');
+});
+
+test('scoreCall with a trade-level fill price keeps the candle path', () => {
+  const cs = [candle(0, 1, 1.9, 1, 1.8), candle(1, 1.8, 2.1, 1.7, 2), candle(2, 2, 2.05, 0.6, 0.7)];
+  const atClose = V.scoreCall(cs, T0), early = V.scoreCall(cs, T0, {delay: 5 / 60, entryPrice: 1.2});
+  assert.equal(atClose.entry, 1.8);
+  assert.equal(atClose.outcome, 'loss', 'bought the minute close at 1.8, stopped at 0.9');
+  assert.equal(early.entry, 1.2);
+  assert.equal(early.outcome, 'loss', '1.2 entry: 2.1 is short of the 2.4 target, the stop at 0.6 fills');
+  assert.equal(V.scoreCall(cs, T0, {delay: 5 / 60, entryPrice: 1.04}).outcome, 'win', '1.04 entry: 2.1 clears the 2.08 target first');
+});
+
+test('position: average entry, realised and marked profit', () => {
+  const t = (side, usd, amount, at) => ({side, usd, amount, price: usd / amount, at});
+  const open = V.position([t('buy', 20, 1e6, 1000), t('buy', 10, 4e5, 2000), t('sell', 12, 4e5, 3000)], 3e-5);
+  assert.equal(open.entryAt, 1000);
+  assert.ok(Math.abs(open.avg - 30 / 1.4e6) < 1e-12);
+  assert.ok(open.open && Math.abs(open.heldFrac - 1e6 / 1.4e6) < 1e-9);
+  assert.equal(Math.round(open.pnl), 40, '(12 received + 1e6 × 3e-5 left) / 30 paid');
+  const closed = V.position([t('buy', 20, 1e6, 1000), t('sell', 15, 1e6, 5000)], 9e-5);
+  assert.equal(closed.open, false);
+  assert.equal(closed.pnl, -25);
+  assert.equal(V.position([t('sell', 15, 1e6, 5000)], 1e-5), null, 'a sale with no buy seen is not a position');
+});
+
+test('backtestReport: primary hypotheses clear a lower bar than exploratory ones', () => {
+  const rep = V.backtestReport(fakeItems(rng(21), 300, false), 5);
+  assert.ok(rep.tested.primary > 0 && rep.tested.explore > rep.tested.primary);
+  const bar = name => rep.features.find(f => f.name === name).rows.find(r => r.bar != null).bar;
+  assert.ok(bar('Move into entry') < bar('Market cap at call'));
+  assert.equal(rep.features.find(f => f.name === 'Move into entry').primary, true);
+});
+
+test('botFlow: counted share is a floor; one-use-wallet wash is "possible", real traders are neither', () => {
+  const now = T0, t0 = now - 280000, rows = [], add = (at, side, usd, price, wallet, hash) => rows.push({at, side, usd, amount: usd / price, price, wallet, hash, ex: 'pump'});
+  for (let i = 0; i < 10; i++) { add(t0 + i * 9000, 'buy', 150, 2e-5, 'WASH', 'w' + i); add(t0 + i * 9000, 'sell', 147, 1.96e-5, 'WASH', 'w' + i); }            // buy+sell in one transaction
+  for (let i = 0; i < 10; i++) { add(t0 + i * 20000, 'buy', 100, 2e-5, 'once' + i, 'ob' + i); add(t0 + i * 20000 + 30000, 'sell', 99, 1.98e-5, 'once' + i, 'os' + i); } // flat, 30s, one wallet each
+  for (let i = 0; i < 10; i++) add(t0 + i * 11000, 'buy', 80 + i, 2e-5, 'retail' + i, 'rb' + i);                                                                  // people buying
+  add(t0 + 5000, 'buy', 300, 2e-5, 'flip', 'fb'); add(t0 + 8000, 'sell', 360, 2.4e-5, 'flip', 'fs');                                                               // a fast profitable flip
+  const vb = V.botFlow(rows, t0 - 1000, now), kind = w => vb.flagged.filter(f => f.wallet === w).map(f => f.rule + (f.sure ? '' : '?'));
+  assert.equal(vb.byRule.txWash, 20);
+  assert.equal(vb.byRule.slowTrip, 20);
+  assert.equal(vb.botTradeShare.toFixed(0), (100 * 20 / rows.length).toFixed(0), 'only the provable wash is counted');
+  assert.equal(vb.possibleTradeShare.toFixed(0), (100 * 20 / rows.length).toFixed(0), 'the one-use wallets are reported as possible');
+  assert.deepEqual(kind('flip'), []);
+  assert.ok(vb.organic.some(t => t.wallet === 'once3'), 'possible trades stay in the organic flow');
+  assert.ok(vb.organic.every(t => t.wallet !== 'WASH'));
+});
