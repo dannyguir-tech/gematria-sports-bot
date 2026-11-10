@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         VolTrak Steroids 4.4
+// @name         VolTrak Steroids 4.3
 // @namespace    voltrak-alert
 // @version      4.4.0
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), live rug checks (dev, top 10, launch block, funder), GMGN holder data, insider-exit alerts, a live coin score, Telegram pings, market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
