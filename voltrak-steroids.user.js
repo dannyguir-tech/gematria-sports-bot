@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         VolTrak Steroids
+// @name         VolTrak Steroids 4.3
 // @namespace    voltrak-alert
-// @version      3.7.0
-// @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
+// @version      4.3.0
+// @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), live rug checks (dev, top 10, launch block, funder), GMGN holder data, insider-exit alerts, a live coin score, Telegram pings, market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
 // @match        https://photon-sol.tinyastro.io/*
@@ -20,6 +20,10 @@
 // @connect      api.geckoterminal.com
 // @connect      mainnet.helius-rpc.com
 // @connect      solana-mainnet.g.alchemy.com
+// @connect      api.telegram.org
+// @connect      gmgn.ai
+// @connect      lite-api.jup.ag
+// @connect      api.rugcheck.xyz
 // @noframes
 // @run-at       document-start
 // ==/UserScript==
@@ -129,6 +133,7 @@ const VTCore = (() => {
     return {channel: msg.channel, items: data.filter(x => x && typeof x === 'object').map(x => x.d && typeof x.d === 'object' && !Array.isArray(x.d) ? {...x, ...x.d} : x)};
   }
   const addrOf = x => x?.a || x?.address || x?.token_address || null;
+  const WSOL_MINT = 'So11111111111111111111111111111111111111112';
   const millis = v => { const n = number(v); return n == null ? null : n < 1e12 ? n * 1000 : n; };
   // token_activity item → trade, or null for anything that is not a buy or sell.
   function gmgnTrade(x) {
@@ -136,7 +141,10 @@ const VTCore = (() => {
     if (!side || at == null) return null;
     // Wallet tags, if GMGN sends any (field name unconfirmed; the Settings data check lists the real fields).
     const tags = [x.maker_tags, x.makerTags, x.maker_tag, x.tags].find(v => v != null);
-    return {at, side, usd: number(x.au) || 0, sol: number(x.qa), amount: number(x.ba), price: number(x.pu), wallet: x.m || null, hash: x.h || null, mint: addrOf(x), ex: x.ex || null,
+    // The quote side is SOL only when GMGN says so (qad = quote mint). Pump coins can be paired with USDC, USDT or other
+    // coins; their quote amount is not SOL and must never set the SOL price.
+    const quoteMint = x.qad || null, quote = number(x.qa);
+    return {at, side, usd: number(x.au) || 0, sol: quoteMint === WSOL_MINT ? quote : null, quote, quoteMint, amount: number(x.ba), price: number(x.pu), wallet: x.m || null, hash: x.h || null, mint: addrOf(x), ex: x.ex || null,
       tags: Array.isArray(tags) ? tags.map(String) : typeof tags === 'string' && tags ? tags.split(',') : null};
   }
   // token_stat item → GMGN's own rolling windows (b/s = buy/sell count, bv/sv = buy/sell volume, v = volume, p = price then).
@@ -148,7 +156,9 @@ const VTCore = (() => {
   // bots (optional): botFlow() over the last 5 min; its organic trades give a bot-free flow window.
   function liveView(trades, stat, at, now, since, bots) {
     if (!at) return null;
-    const last = trades.reduce((a, b) => !a || b.at >= a.at ? b : a, null), price = stat?.price ?? last?.price ?? null;
+    // Price: the newer of GMGN's stats frame and the last trade (a trade's time is its block time, ~1-2s before receipt).
+    const last = trades.reduce((a, b) => !a || b.at >= a.at ? b : a, null);
+    const price = last?.price > 0 && (!(stat?.price > 0) || last.at >= (stat.at ?? 0) - 2000) ? last.price : stat?.price ?? last?.price ?? null;
     // pump.fun tokens have a fixed 1B supply, so market cap = price × 1e9.
     const marketCap = price > 0 && /pump/i.test(last?.ex || '') ? price * 1e9 : null;
     return {at, stat, flow: trades.length ? windows(trades, now, ms => since <= now - ms) : null, price, marketCap, last,
@@ -236,8 +246,14 @@ const VTCore = (() => {
   // close (or a gap open); a target needs a close above it, or a high 10% beyond it (one thin wick is not a fill).
   // opt.trail {arm, drop} (%): once the price has traded `arm`% above entry, also sell `drop`% below the highest high
   // so far. The level only uses highs of earlier candles, because inside one candle the order of high and low is unknown.
+  // Coverage (4.2): opt.dataEnd = the time the candles are known to reach (the caller allows for indexing lag); short of
+  // the horizon → 'incomplete'. Target, stop and early-exit events in the candles are taken first; only an open trade
+  // with no trade after the entry candle is 'no-exit'. exit = 'target' | 'stop' | 'trail' | 'early' | 'mark' (priced on a
+  // trade within 15 min of the horizon) | 'stale-mark' (the last trade was older: a price, not proof the exit could fill).
+  const STALE_MARK_MIN = 15;
   function scoreCall(cs, alertAt, opt = {}) {
     const tp = opt.tp ?? 100, sl = opt.sl ?? -50, horizon = opt.horizon ?? 120, at = alertAt + (opt.delay ?? 0) * 60000;
+    if (opt.dataEnd != null && opt.dataEnd < alertAt + horizon * 60000) return {status: 'incomplete'};
     const early = opt.earlyExit ?? null, cautious = opt.fill === 'cautious', trail = opt.trail ?? null;
     const minute = Math.floor(at / 60000) * 60000, end = alertAt + horizon * 60000, i0 = cs.findIndex(k => k.t >= minute);
     // No swap within 5 min of the entry time (e.g. a dead coin at +30 min): nothing to buy.
@@ -258,9 +274,12 @@ const VTCore = (() => {
       else if (!checked && k.t + 60000 >= at + early * 60000) { checked = true; if (k.c <= entry) { outcome = 'exit'; ret = pct(k.c); outcomeAt = k.t; } }
       held = Math.max(held, k.h);
     }
+    // Still open with no trade after the entry candle: nothing to exit on.
+    if (outcome === 'open' && !path.some(k => k.t > cs[i0].t)) return {status: 'no-exit', entry};
     const priceAt = min => { let p = entry; for (const k of path) { if (k.t + 60000 <= at + min * 60000) p = k.c; else break; } return pct(p); };
-    const rEnd = priceAt((end - at) / 60000);
-    return {status: 'scored', entry, outcome, ret: ret ?? rEnd, outcomeMin: outcomeAt == null ? null : (outcomeAt - at) / 60000,
+    const rEnd = priceAt((end - at) / 60000), lastT = path.length ? path[path.length - 1].t + 60000 : at, markAge = Math.max(0, (end - lastT) / 60000);
+    const exit = outcome === 'win' ? 'target' : outcome === 'loss' ? 'stop' : outcome === 'exit' ? (trail && ret > sl ? 'trail' : 'early') : markAge > STALE_MARK_MIN ? 'stale-mark' : 'mark';
+    return {status: 'scored', entry, outcome, exit, ret: ret ?? rEnd, outcomeMin: outcomeAt == null ? null : (outcomeAt - at) / 60000, exitAgeMin: outcomeAt != null ? 0 : markAge,
       peakPct: pct(peak), peakMin: (peakAt - at) / 60000, troughPct: pct(trough), troughMin: (troughAt - at) / 60000,
       r1: priceAt(1), r2: priceAt(2), r3: priceAt(3), r5: priceAt(5), r10: priceAt(10), r15: priceAt(15), r30: priceAt(30), r60: priceAt(60), rEnd};
   }
@@ -319,10 +338,40 @@ const VTCore = (() => {
     // Move into entry = fill price vs the price the call went out at: how far the call's own crowd had already pushed it.
     ['Move into entry', c => c.entryMove, [0, 10, 25], '%'],
     ['Run-up in the 15 min before the alert', c => c.runUp15, [0, 50, 200], '%'],
+    // Rug checks (3.8): rebuilt from the coin's own transactions up to the alert, so nothing after the call leaks in.
+    // c.rug is set by the report from the saved check; calls without one land in "unknown".
+    ['Top 10 holders at call (excl. curve/pool)', c => c.rug?.top10 ?? null, [15, 25, 35], '%'],
+    ['Dev holding at call', c => c.rug?.devPct ?? null, [1, 5], '%'],
+    ['Dev sold or moved tokens before the call', c => c.rug?.devSold == null ? null : +c.rug.devSold, [1], 'bool'],
+    ['Launch-block buyers besides the dev', c => c.rug?.launchBuyers ?? null, [1, 4], ''],
+    ['Supply bought in the launch block', c => c.rug?.launchPct ?? null, [5, 15, 30], '%'],
+    ['Dev or its funder on an earlier call', c => c.rug?.seen == null ? null : +c.rug.seen, [1], 'bool'],
+    ['Rug grade at the call', c => c.rug?.grade ?? null, [1, 2], 'grade'],
+    // Live score (3.9): GMGN's numbers + chain checks + volume bots, saved when the call first opened on GMGN
+    // (c.gm, forward only: GMGN gives today's numbers, not past ones).
+    // Grade and parts: 4.3 rules only (v2 snapshots); older snapshots used different weights and would blur the test.
+    ['Live grade at the call (4.3 rules)', c => c.gm?.v >= 2 ? c.gm.code ?? null : null, [1, 2], 'grade'],
+    ['Risk score at the call', c => c.gm?.v >= 2 ? c.gm.risk ?? null : null, [-3, -1, 0], ''],
+    ['Demand score at the call', c => c.gm?.v >= 2 ? c.gm.demand ?? null : null, [-1, 0, 1], ''],
+    ['Entry score at the call', c => c.gm?.v >= 2 ? c.gm.entry ?? null : null, [-2, -1, 0], ''],
+    ['Data confidence at the call', c => c.gm?.v >= 2 ? {high: 0, medium: 1, low: 2}[c.gm.conf] ?? null : null, [1, 2], 'conf'],
+    ['Round trip at your size (Jupiter)', c => c.gm?.exitCost ?? null, [5, 10, 25], '%'],
+    ['First 70 buyers still holding', c => c.gm?.retention ?? null, [25, 50, 75], '%'],
+    ['Holders at 2×+ profit (by supply)', c => c.gm?.profitShare ?? null, [25, 50], '%'],
+    ['Move since the call when graded', c => c.gm?.move ?? null, [25, 100], '%'],
+    ['Insider bag at the call', c => c.gm?.insiderHold ?? null, [15, 25, 40], '%'],
+    ['Bundlers hold at the call', c => c.gm?.bundlerPct ?? null, [10, 20], '%'],
+    ['Real traders (app buyers) at the call', c => c.gm?.platformRate ?? null, [20, 50], '%'],
+    ['Fresh wallets at the call', c => c.gm?.freshRate ?? null, [20, 40], '%'],
+    ['Dev launches', c => c.gm?.launches ?? null, [10, 50], ''],
+    ['Volume / MC (1h) at the call', c => c.gm?.volMc ?? null, [3, 10], '×'],
+    ['Smart money at the call', c => c.gm?.smart ?? null, [1, 3], ''],
   ];
   const edgeLabel = (v, unit) => unit === '$' ? '$' + (v >= 1000 ? v / 1000 + 'K' : v) : v + unit;
   function bucketOf(v, cuts, unit) {
     if (unit === 'bool') return v >= cuts[0] ? 'yes' : 'no';
+    if (unit === 'grade') return v < 1 ? 'clean' : v < 2 ? 'risky' : 'avoid';
+    if (unit === 'conf') return v < 1 ? 'high' : v < 2 ? 'medium' : 'low';
     const i = cuts.findIndex(x => v < x);
     if (i === 0) return unit === '' && cuts[0] === 1 ? '0' : '<' + edgeLabel(cuts[0], unit);
     if (i < 0) return '≥' + edgeLabel(cuts[cuts.length - 1], unit);
@@ -357,15 +406,51 @@ const VTCore = (() => {
     return {all, features, tested, timing: {r5: median(scores.map(s => s.r5)), r15: median(scores.map(s => s.r15)), r60: median(scores.map(s => s.r60)),
       peakMin: median(scores.map(s => s.peakMin)), peakWithin5: within(5), peakWithin15: within(15), peakWithin60: within(60)}};
   }
-  // ---- Volume bots: wash-trading patterns in per-trade rows {at, side, usd, amount, wallet, hash, ex} ----
-  // Flags (a rough lower bound; rotating wallets and cross-transaction washes are missed; untested as a signal):
-  //  T  one transaction buys and sells the coin on the same exchange (on different exchanges it is arbitrage, not counted);
+  // ---- Volume bots (4.0): wash-trading patterns in per-trade rows {at, side, usd, amount, wallet, hash, ex} ----
+  // GMGN labels every trade's wallet on a second feed channel (token_activity_info_all) and in its trades API: wallet tags
+  // (wash_trader, sandwich_bot, app names like axiom/gmgn/photon), token tags (bundler, sniper…), the wallet's trade
+  // count on this coin and what it has bought and sold of it in total. prof = Map wallet → gmgnMaker(); without it
+  // (Helius history) only the pattern rules run. A trade counts as bot volume when any rule fits:
+  //  washTag  GMGN tags the wallet a wash trader / volume bot;   mev  GMGN tags it a sandwich / MEV bot;
+  //  heavy    100+ trades on this coin with a flat position (sold ≥70% of what it bought, or the reverse), or 300+ trades;
+  //  lifeChurn 25+ trades on this coin, position within 15% of flat, no trading-app tag;
+  //  T  one transaction buys and sells the coin on the same pool (on different pools it is arbitrage, not counted);
+  //  mirror  one wallet buys and another sells the same token amount (±0.5%) within 3s, neither using a trading app;
   //  F  a wallet buys and sells ≥80% of those tokens back within 10s at nearly the same USD value (flat round trip);
-  //  C  churn: 6+ trades with 2+ buys and 2+ sells, ending within 15% of where it started;
-  //  M  dust: 3+ trades, every one under $3.
-  // A flat trip that takes 10–30s is only "suspect". Profitable flips and repeated preset-size buys are never flagged.
-  const VB = Object.freeze({fastSec: 10, suspectSec: 30, flatTol: 0.04, tokFrac: 0.8, churnN: 6, churnNet: 0.15, microUsd: 3, microN: 3, buyerUsd: 15});
-  function botFlow(trades, from, to, o = VB) {
+  //  C  churn: 6+ trades in the window with 2+ buys and 2+ sells, ending within 15% of where it started;
+  //  bump  sub-$3 trades from a wallet that makes many of them (3+ in the window), or a sub-$1 trade from a wallet with
+  //        10+ trades on this coin per GMGN:
+  //        trend/"maker" bots that spam tiny trades to inflate trade and holder counts. They are most of the trades on a
+  //        bumped coin but almost none of its dollars, so the reading reports both: bot share of trades and of volume.
+  // Profitable flips and repeated preset-size buys are never flagged. Untested as a signal.
+  const VB = Object.freeze({fastSec: 10, suspectSec: 30, flatTol: 0.04, tokFrac: 0.8, churnN: 6, churnNet: 0.15, microUsd: 3, microN: 3, buyerUsd: 15,
+    heavyTt: 100, heavyAny: 300, heavyFlat: 0.7, lifeTt: 25, lifeFlat: 0.85, mirrorSec: 3, mirrorTol: 0.005, dustUsd: 3, bumpN: 3, bumpTt: 10, bumpTtUsd: 1});
+  const APP_TAG = /^(gmgn|gmgn_go|axiom|photon|padre|trojan|bullx|maestro|bonkbot|banana|bloom|nova|pepeboost|ave|okx|binance|fomo_app|tg_bot|moonshot)/i;
+  const WASH_TAG = /wash|volume_bot|bump_bot|maker_bot/i, MEV_TAG = /sandwich|mev|arbitrage|arb_bot|jito_bot/i;
+  const BOT_RULES = ['washTag', 'mev', 'heavy', 'lifeChurn', 'bump', 'txWash', 'mirror', 'fastTrip', 'churn'];
+  // Confident = the trade itself shows it (GMGN's label, same-tx wash, flat 10s round trip, repeated dust). Possible =
+  // a pattern a real trader can also make (many trades, mirrored sizes, churn): reported, never counted as bot volume.
+  const BOT_SURE = new Set(['washTag', 'mev', 'bump', 'txWash', 'fastTrip']);
+  // GMGN maker info (feed row or trades-API row) → profile. null without a wallet.
+  function gmgnMaker(x) {
+    const w = x?.m ?? x?.maker;
+    if (!w) return null;
+    const list = v => Array.isArray(v) ? v.map(String) : typeof v === 'string' && v ? v.split(',') : [];
+    return {wallet: w, at: millis(x.t ?? x.timestamp) ?? 0, tags: list(x.ts ?? x.maker_tags), tokenTags: list(x.tts ?? x.maker_token_tags), eventTags: list(x.maker_event_tags),
+      tt: number(x.tt ?? x.total_trade), bought: number(x.hba ?? x.history_bought_amount), sold: number(x.hsa ?? x.history_sold_amount), bal: number(x.b ?? x.balance)};
+  }
+  // GMGN trades-API row (vas/api/mul-region/token_trades_v2) → trade, same shape as gmgnTrade().
+  function gmgnApiTrade(x) {
+    const side = {buy: 'buy', sell: 'sell'}[String(x?.event).toLowerCase()], at = millis(x?.timestamp);
+    if (!side || at == null) return null;
+    const quoteMint = x.quote_address || null, quote = number(x.quote_amount);
+    return {at, side, usd: number(x.amount_usd) || 0, sol: quoteMint === WSOL_MINT ? quote : null, quote, quoteMint, amount: number(x.base_amount), price: number(x.price_usd), wallet: x.maker || null,
+      hash: x.tx_hash || null, mint: x.token_address || null, ex: null, tags: null, src: 'api'};
+  }
+  const isApp = p => !!p?.tags?.some(t => APP_TAG.test(t));
+  // Lifetime position on this coin: min(bought, sold) / max(bought, sold); 1 = sold everything it bought.
+  const flatness = p => p?.bought > 0 && p?.sold > 0 ? Math.min(p.bought, p.sold) / Math.max(p.bought, p.sold) : 0;
+  function botFlow(trades, from, to, o = VB, prof = null) {
     const seen = new Set(), rows = [];
     for (const t of Array.isArray(trades) ? trades : []) {
       if (!t || !(t.at >= from && t.at <= to) || (t.side !== 'buy' && t.side !== 'sell')) continue;
@@ -373,14 +458,34 @@ const VTCore = (() => {
       if (!seen.has(key)) { seen.add(key); rows.push(t); }
     }
     rows.sort((a, b) => a.at - b.at);
+    const P = w => prof?.get?.(w) || null;
     const rule = new Map(), mark = (t, r) => { if (!rule.has(t)) rule.set(t, r); }, group = (list, f) => { const m = new Map(); for (const t of list) { const k = f(t); if (k) (m.get(k) || m.set(k, []).get(k)).push(t); } return m; };
+    // 1) Confident rules. GMGN's own wash/MEV labels:
+    let profiled = 0;
+    for (const t of rows) {
+      const p = P(t.wallet);
+      if (!p) continue;
+      profiled++;
+      if (p.tags.some(x => MEV_TAG.test(x))) mark(t, 'mev');
+      else if (p.tags.some(x => WASH_TAG.test(x)) || p.eventTags.some(x => WASH_TAG.test(x))) mark(t, 'washTag');
+    }
+    // Bump bots: repeated sub-$3 trades from one wallet.
+    const dust = t => (t.usd || 0) < o.dustUsd, dustBy = new Map();
+    for (const t of rows) if (dust(t)) dustBy.set(t.wallet, (dustBy.get(t.wallet) || 0) + 1);
+    // A single sub-$1 trade from a wallet with 10+ trades on the coin also counts; a single $1-3 trade does not (a person
+    // closing a small leftover bag looks like that: live check, Oct 27, 2.4% of bump hits).
+    for (const t of rows) if (dust(t) && (dustBy.get(t.wallet) >= o.bumpN || P(t.wallet)?.tt >= o.bumpTt && (t.usd || 0) < o.bumpTtUsd)) mark(t, 'bump');
+    // Same transaction buys and sells on the same pool (different pools = arbitrage, not counted).
     let arb = 0, suspectUsd = 0; const arbLegs = new Set();
     for (const legs of group(rows, t => t.hash).values()) {
-      const buyEx = new Set(legs.filter(t => t.side === 'buy').map(t => t.ex || '')), sellEx = new Set(legs.filter(t => t.side === 'sell').map(t => t.ex || ''));
-      if (!buyEx.size || !sellEx.size) continue;
+      const buys = legs.filter(t => t.side === 'buy'), sells = legs.filter(t => t.side === 'sell');
+      if (!buys.length || !sells.length) continue;
+      // Pool unknown (trades API rows): neither wash nor arbitrage can be told apart, so leave the legs alone.
+      if (legs.some(t => t.ex == null)) continue;
+      const buyEx = new Set(buys.map(t => t.ex)), sellEx = new Set(sells.map(t => t.ex));
       if ([...buyEx].some(e => sellEx.has(e))) legs.forEach(t => mark(t, 'txWash')); else { arb++; legs.forEach(t => arbLegs.add(t)); }
     }
-    // Arbitrage legs stay out of the wallet rules: buying on one pool and selling on another is real trading.
+    // Flat buy-then-sell within 10s (a profitable or losing flip is not flat, so it is never flagged).
     const tokens = t => t.amount > 0 ? t.amount : null, byWallet = group(rows.filter(t => !arbLegs.has(t)), t => t.wallet);
     for (const list of byWallet.values()) {
       const used = new Set();
@@ -400,13 +505,36 @@ const VTCore = (() => {
         legs.forEach(s => used.add(s));
         if (end - b.at <= o.fastSec * 1000) { mark(b, 'fastTrip'); legs.forEach(s => mark(s, 'fastTrip')); } else suspectUsd += b.usd + usd;
       }
+    }
+    // 2) Possible (heuristics): many trades on this coin with a flat lifetime position, mirrored sizes across two wallets,
+    // churn in the window that is flat in tokens AND in dollars (a $100-in/$200-out trader is not churn).
+    for (const t of rows) {
+      const p = P(t.wallet);
+      if (!p || rule.has(t)) continue;
+      if (p.tt >= o.heavyAny || p.tt >= o.heavyTt && flatness(p) >= o.heavyFlat) mark(t, 'heavy');
+      else if (p.tt >= o.lifeTt && flatness(p) >= o.lifeFlat && !isApp(p)) mark(t, 'lifeChurn');
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const a = rows[i];
+      if (rule.has(a) || arbLegs.has(a) || !(a.amount > 0) || isApp(P(a.wallet))) continue;
+      for (let j = i + 1; j < rows.length && rows[j].at - a.at <= o.mirrorSec * 1000; j++) {
+        const b = rows[j];
+        if (b.side === a.side || b.wallet === a.wallet || rule.has(b) || arbLegs.has(b) || !(b.amount > 0) || isApp(P(b.wallet))) continue;
+        if (Math.abs(b.amount / a.amount - 1) <= o.mirrorTol) { mark(a, 'mirror'); mark(b, 'mirror'); break; }
+      }
+    }
+    for (const list of byWallet.values()) {
       const buys = list.filter(t => t.side === 'buy'), sells = list.filter(t => t.side === 'sell');
       const bought = buys.reduce((x, t) => x + (tokens(t) ?? 0), 0), sold = sells.reduce((x, t) => x + (tokens(t) ?? 0), 0);
-      if (list.length >= o.churnN && buys.length >= 2 && sells.length >= 2 && bought > 0 && Math.abs(bought - sold) <= o.churnNet * bought) list.forEach(t => mark(t, 'churn'));
-      if (list.length >= o.microN && list.every(t => (t.usd || 0) < o.microUsd)) list.forEach(t => mark(t, 'micro'));
+      const inUsd = buys.reduce((x, t) => x + (t.usd || 0), 0), outUsd = sells.reduce((x, t) => x + (t.usd || 0), 0);
+      if (list.length >= o.churnN && buys.length >= 2 && sells.length >= 2 && bought > 0 && Math.abs(bought - sold) <= o.churnNet * bought
+        && inUsd > 0 && Math.abs(outUsd - inUsd) <= o.churnNet * inUsd) list.forEach(t => mark(t, 'churn'));
     }
-    const usd = rows.reduce((x, t) => x + (t.usd || 0), 0), flagged = rows.filter(t => rule.has(t)), botUsd = flagged.reduce((x, t) => x + (t.usd || 0), 0);
-    const byRule = {txWash: 0, fastTrip: 0, churn: 0, micro: 0}; for (const r of rule.values()) byRule[r]++;
+    const sure = t => BOT_SURE.has(rule.get(t)), maybe = t => rule.has(t) && !sure(t);
+    const usd = rows.reduce((x, t) => x + (t.usd || 0), 0), flagged = rows.filter(sure), botUsd = flagged.reduce((x, t) => x + (t.usd || 0), 0);
+    const possible = rows.filter(maybe), possibleUsd = possible.reduce((x, t) => x + (t.usd || 0), 0);
+    const byRule = Object.fromEntries(BOT_RULES.map(r => [r, 0])), usdByRule = Object.fromEntries(BOT_RULES.map(r => [r, 0]));
+    for (const [t, r] of rule) { byRule[r]++; usdByRule[r] += t.usd || 0; }
     const botWallets = new Set(flagged.map(t => t.wallet).filter(Boolean));
     let buyers = 0, buyersNet = 0;
     for (const [w, list] of byWallet) {
@@ -415,13 +543,18 @@ const VTCore = (() => {
       const net = b.some(t => tokens(t)) ? b.reduce((x, t) => x + (tokens(t) ?? 0), 0) - s.reduce((x, t) => x + (tokens(t) ?? 0), 0) : bUsd - sUsd;
       if (bUsd >= o.buyerUsd && net > 0) { buyers++; buyersNet += bUsd - sUsd; }
     }
-    // Organic flow: every trade not flagged and not an arbitrage leg (both are ~50/50 buy/sell and carry no direction).
-    const organic = rows.filter(t => !rule.has(t) && !arbLegs.has(t)), orgUsd = organic.reduce((x, t) => x + (t.usd || 0), 0);
+    // Organic flow: every trade not confidently flagged and not an arbitrage leg ("possible" trades stay in).
+    const organic = rows.filter(t => !sure(t) && !arbLegs.has(t)), orgUsd = organic.reduce((x, t) => x + (t.usd || 0), 0);
     const orgBuyUsd = organic.reduce((x, t) => x + (t.side === 'buy' ? t.usd || 0 : 0), 0);
+    // Trading-app volume: unflagged trades from wallets GMGN tags with a trading app (people clicking buttons).
+    const appUsd = prof ? organic.reduce((x, t) => x + (isApp(P(t.wallet)) && !rule.has(t) ? t.usd || 0 : 0), 0) : null;
+    const dustN = rows.filter(dust).length;
     return {n: rows.length, usd, botUsd, botShare: usd > 0 ? 100 * botUsd / usd : null, botTradeShare: rows.length ? 100 * flagged.length / rows.length : null,
-      wallets: byWallet.size, botWallets: botWallets.size, byRule, arb, suspectShare: usd > 0 ? 100 * suspectUsd / usd : null,
+      possibleShare: usd > 0 ? 100 * possibleUsd / usd : null, possibleTradeShare: rows.length ? 100 * possible.length / rows.length : null,
+      wallets: byWallet.size, botWallets: botWallets.size, byRule, usdByRule, arb, suspectShare: usd > 0 ? 100 * suspectUsd / usd : null,
       buyers, buyersNet, organic, orgN: organic.length, orgShare: orgUsd > 0 ? 100 * orgBuyUsd / orgUsd : null, first: rows[0]?.at ?? null, last: rows[rows.length - 1]?.at ?? null,
-      flagged: flagged.slice(-50).map(t => ({wallet: t.wallet, hash: t.hash, rule: rule.get(t)}))};
+      appShare: appUsd != null && usd > 0 ? 100 * appUsd / usd : null, dustShare: rows.length ? 100 * dustN / rows.length : null, profiled: rows.length ? 100 * profiled / rows.length : null,
+      flagged: [...rule].slice(-50).map(([t, r]) => ({wallet: t.wallet, hash: t.hash, rule: r, sure: BOT_SURE.has(r)}))};
   }
   // ---- Solana transactions (getTransactionsForAddress, jsonParsed) → per-trade rows for one mint ----
   // One row per signer whose balance of the mint changed in a pump.fun or PumpSwap transaction. SOL size includes fees
@@ -527,8 +660,440 @@ const VTCore = (() => {
     if (call.messageAt > now+5000 || now-call.messageAt > maxAge || call.historical) return 'old';
     return current === call.mint ? 'already-open' : 'navigate';
   }
+  // ---- Rug checks: who holds the coin, rebuilt from its own transactions (launch → now) ----
+  // Rules from the Rugikk article. Untested on VolTrak calls: the backtest decides whether they matter.
+  // soldFrac: a dev balance drop below this share of supply (dust, rounding) is not a sale. outFrac: the dev holding
+  // less than this share of supply counts as out.
+  const RUG = Object.freeze({top10: 25, dev: 5, launch: 3, soldFrac: 0.0001, outFrac: 0.0005});
+  const SYSTEM_PROGRAM = '11111111111111111111111111111111';
+  // Holders that are never people even though no program owns the address: AMM authorities whose PDA has no account
+  // (Raydium AMM v4, Raydium CPMM, Meteora DAMM v2) and the burn address.
+  const NOT_HOLDERS = new Set(['5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', 'GpMZbSM2GgvTKHJirzeGfMFoaZ8UR2X7F4v8vHTvxFbL', 'HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC', '1nc1nerator11111111111111111111111111111111']);
+  // Base58 (Solana addresses, instruction data).
+  const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  function b58decode(str) {
+    const n = [0];
+    for (const c of String(str)) { let v = B58.indexOf(c); if (v < 0) return null; for (let i = 0; i < n.length; i++) { v += n[i] * 58; n[i] = v & 255; v >>= 8; } while (v) { n.push(v & 255); v >>= 8; } }
+    for (const c of String(str)) { if (c === '1') n.push(0); else break; }
+    return Uint8Array.from(n.reverse());
+  }
+  function b58encode(bytes) {
+    const d = [0];
+    for (const x of bytes) { let c = x; for (let i = 0; i < d.length; i++) { c += d[i] << 8; d[i] = c % 58; c = (c / 58) | 0; } while (c) { d.push(c % 58); c = (c / 58) | 0; } }
+    let out = ''; for (const x of bytes) { if (x === 0) out += '1'; else break; }
+    return out + d.reverse().map(i => B58[i]).join('');
+  }
+  // pump.fun's own creation instruction (create / create_v2, Anchor): 8-byte discriminator, name, symbol, uri (u32 length +
+  // bytes each), then the declared creator (32 bytes). Older creates had no creator argument: the creator is then the
+  // instruction's user account (index 7 for create, 5 for create_v2). Checked live on 5 launches (Oct 27 2026).
+  const PUMP_CREATE = {'181ec828051c0777': 7, 'd6904cec5f8b31b4': 5};
+  function pumpCreator(ix, mint) {
+    if (ix?.programId !== PUMP_PROGRAM || typeof ix.data !== 'string' || !Array.isArray(ix.accounts) || ix.accounts[0] !== mint) return null;
+    const d = b58decode(ix.data);
+    if (!d || d.length < 8) return null;
+    const userAt = PUMP_CREATE[[...d.slice(0, 8)].map(x => x.toString(16).padStart(2, '0')).join('')];
+    if (userAt == null) return null;
+    let o = 8;
+    for (let k = 0; k < 3; k++) { if (o + 4 > d.length) return null; const len = d[o] | d[o + 1] << 8 | d[o + 2] << 16 | d[o + 3] << 24; o += 4 + len; if (len < 0 || o > d.length) return null; }
+    return o + 32 <= d.length ? b58encode(d.slice(o, o + 32)) : ix.accounts[userAt] || null;
+  }
+  // One transaction → signature, time, slot, fee payer, signers and this mint's token-account balances before/after
+  // (owner and UI amount per token account). null for failed or unparsable transactions.
+  function txMint(tx, mint) {
+    const meta = tx?.meta, msg = tx?.transaction?.message;
+    if (!meta || !msg || meta.err) return null;
+    const keys = (msg.accountKeys || []).map(k => typeof k === 'string' ? {pubkey: k} : k || {}), nSig = msg.header?.numRequiredSignatures;
+    // jsonParsed lists lookup-table accounts inside accountKeys; other encodings append them as loadedAddresses.
+    const extra = [...(meta.loadedAddresses?.writable || []), ...(meta.loadedAddresses?.readonly || [])];
+    const key = i => keys[i]?.pubkey ?? extra[i - keys.length] ?? null;
+    const read = list => {
+      const m = new Map();
+      for (const b of list || []) {
+        if (b?.mint !== mint) continue;
+        const a = key(b.accountIndex);
+        if (a) m.set(a, {owner: b.owner || null, amt: Number(b.uiTokenAmount?.amount || 0) / 10 ** (b.uiTokenAmount?.decimals ?? 6)});
+      }
+      return m;
+    };
+    // Creation proof: the token program's initializeMint for this mint in this transaction (top level or inner).
+    const ins = [...(msg.instructions || []), ...(meta.innerInstructions || []).flatMap(x => x?.instructions || [])];
+    const init = ins.some(ix => /^initializeMint2?$/.test(ix?.parsed?.type || '') && ix.parsed.info?.mint === mint);
+    let declared = null; for (const ix of ins) if ((declared = pumpCreator(ix, mint))) break;
+    return {sig: tx.transaction?.signatures?.[0] || null, sec: number(tx.blockTime), slot: number(tx.slot), payer: keys[0]?.pubkey || null, init, declared,
+      signers: new Set(keys.filter((k, i) => k.signer ?? (nSig != null ? i < nSig : i === 0)).map(k => k.pubkey)),
+      pre: read(meta.preTokenBalances), post: read(meta.postTokenBalances)};
+  }
+  // Holder state. Token-account balances come from the chain (each transaction's own post balances, so a missed
+  // transfer heals on that account's next transaction). Live trades from GMGN's feed sit in `adj` until the chain
+  // catch-up brings in the same signature.
+  function rugState(mint) {
+    return {mint, creator: null, creatorSrc: null, payer: null, createSec: null, slot: null, supply: null, verified: false, ver: 0, txs: 0, lastSec: null, crossed: false, cutSec: null, atCall: null, devFlows: [],
+      acct: new Map(), acctOwner: new Map(), hold: new Map(), adj: new Map(), adjSig: new Map(), adjBy: new Map(), sigs: new Set(),
+      launch: new Map(), devBuy: null, devPeak: 0, devSales: []};
+  }
+  const rugHolding = (S, o) => (S.hold.get(o) || 0) + (S.adjBy.get(o) || 0);
+  function dropAdj(S, key) {
+    const x = S.adj.get(key);
+    if (!x) return;
+    S.adj.delete(key);
+    const v = (S.adjBy.get(x.wallet) || 0) - x.d;
+    if (Math.abs(v) < 1e-6) S.adjBy.delete(x.wallet); else S.adjBy.set(x.wallet, v);
+  }
+  // Dev balance change d (tokens, negative = out): a sale or transfer out above the dust level is logged once per signature.
+  // Every change to the dev's balance, in and out (d in tokens, signed), once per signature: a feed trade later confirmed
+  // on chain takes the chain's amount and slot. devNowVerified adds the ones after a verification.
+  function devFlow(S, d, at, sig, slot) {
+    if (!S.creator || !d) return;
+    const f = sig ? S.devFlows.find(x => x.sig === sig) : null;
+    if (f) { if (slot != null) { f.slot = slot; f.d = d; } return; }
+    S.devFlows.push({at, slot: slot ?? null, d, sig: sig || null});
+  }
+  // to: owners whose balance rose in the same transaction (chain); a GMGN feed sell is a sale (kind 'sale').
+  function devTrack(S, d, at, sig, src, to = null, slot = null) {
+    if (!S.creator) return null;
+    const dev = rugHolding(S, S.creator);
+    S.devPeak = Math.max(S.devPeak, dev);
+    if (!(d < 0) || !S.supply || -d < RUG.soldFrac * S.supply) return null;
+    if (sig && S.devSales.some(x => x.sig === sig)) return null;
+    const ev = {at, slot, amt: -d, sig: sig || null, src, left: Math.max(0, dev), to: to || [], kind: src === 'live' ? 'sale' : 'out'};
+    S.devSales.push(ev);
+    return ev;
+  }
+  // Apply one parsed transaction (txMint), oldest first. The first one that moves this token is taken as the creation:
+  // its fee payer is the dev and its slot is the launch block. S.verified: that transaction initialised the mint (the
+  // proof); without it the creator, dev buy and launch block are estimates. Returns the change per owner, or null if
+  // already applied.
+  function rugTx(S, t) {
+    if (!t || (t.sig && S.sigs.has(t.sig))) return null;
+    if (t.sig) S.sigs.add(t.sig);
+    S.txs++;
+    const first = S.creator == null && t.post.size > 0;
+    // The creator: pump.fun's declared creator when the creation instruction is decoded, else the fee payer (an
+    // assumption, kept as creatorSrc 'payer' so it is never treated as verified).
+    if (first) { S.payer = t.payer; S.creator = t.declared || t.payer; S.creatorSrc = t.declared ? 'pump' : 'payer'; S.createSec = t.sec; S.slot = t.slot; S.verified = !!t.init; }
+    if (t.sec != null) S.lastSec = Math.max(S.lastSec ?? t.sec, t.sec);
+    // A live trade with this signature is now part of the chain balances.
+    if (t.sig && S.adjSig.has(t.sig)) { for (const k of S.adjSig.get(t.sig)) dropAdj(S, k); S.adjSig.delete(t.sig); }
+    if (t.sig) for (const e of S.devSales) if (e.sig === t.sig && e.slot == null) e.slot = t.slot;
+    const delta = new Map();
+    for (const a of new Set([...t.pre.keys(), ...t.post.keys()])) {
+      const p = t.pre.get(a), q = t.post.get(a), o = q?.owner ?? p?.owner ?? S.acctOwner.get(a) ?? null;
+      if (!o) continue;
+      const old = S.acct.get(a) ?? 0, now = q ? q.amt : 0;
+      S.acct.set(a, now); S.acctOwner.set(a, o);
+      S.hold.set(o, (S.hold.get(o) || 0) + now - old);
+      delta.set(o, (delta.get(o) || 0) + now - (p ? p.amt : 0));
+    }
+    if (first) {
+      let s = 0; for (const v of S.acct.values()) s += v;
+      S.supply = s > 0 ? s : null;
+      S.devBuy = S.supply ? 100 * (S.hold.get(S.creator) || 0) / S.supply : null;
+    }
+    // Launch block = the creation's slot (or its second, if the RPC gives no slot). Only wallets that signed and gained.
+    const block = S.slot != null && t.slot != null ? t.slot === S.slot : t.sec != null && t.sec === S.createSec;
+    if (block) for (const [o, d] of delta) if (d > 0 && o !== S.creator && t.signers.has(o)) S.launch.set(o, (S.launch.get(o) || 0) + d);
+    devFlow(S, delta.get(S.creator), t.sec != null ? t.sec * 1000 : null, t.sig, t.slot);
+    devTrack(S, delta.get(S.creator), t.sec != null ? t.sec * 1000 : null, t.sig, 'chain', [...delta].filter(([o, d]) => d > 0 && o !== S.creator).map(x => x[0]), t.slot);
+    S.ver++;
+    return delta;
+  }
+  // Tokens in a GMGN feed trade: `ba` when ba × price ≈ the USD value; otherwise USD / price (if `ba` is in raw units).
+  function tradeTokens(t) {
+    const r = t?.amount > 0 && t.usd > 0 && t.price > 0 ? t.usd / (t.amount * t.price) : null;
+    if (r != null && r > 0.5 && r < 2) return t.amount;
+    if (t?.usd > 0 && t.price > 0) return t.usd / t.price;
+    return r == null && t?.amount > 0 ? t.amount : null;
+  }
+  // A GMGN feed trade {wallet, side, tokens, hash, at} → the wallet's balance, until the chain covers that signature.
+  // Returns a dev-sale event when the dev sells.
+  function rugTrade(S, t) {
+    if (!S?.supply || !t?.wallet || !(t.tokens > 0) || t.tokens > S.supply || (t.hash && S.sigs.has(t.hash))) return null;
+    const d = t.side === 'buy' ? t.tokens : t.side === 'sell' ? -t.tokens : 0, key = (t.hash || 't' + t.at) + '|' + t.wallet + '|' + t.side + '|' + t.tokens;
+    if (!d || S.adj.has(key)) return null;
+    S.adj.set(key, {wallet: t.wallet, d, sig: t.hash || null, at: t.at});
+    if (t.hash) (S.adjSig.get(t.hash) || S.adjSig.set(t.hash, []).get(t.hash)).push(key);
+    S.adjBy.set(t.wallet, (S.adjBy.get(t.wallet) || 0) + d);
+    S.ver++;
+    if (t.wallet === S.creator) devFlow(S, d, t.at, t.hash, null);
+    return t.wallet === S.creator ? devTrack(S, d, t.at, t.hash, 'live') : null;
+  }
+  // Chain caught up to second `sec`: live trades from 30s+ before it that the chain never confirmed are dropped.
+  function rugPrune(S, sec) {
+    for (const [k, x] of [...S.adj]) if (x.at != null && x.at < (sec - 30) * 1000) { dropAdj(S, k); if (x.sig) S.adjSig.delete(x.sig); }
+  }
+  // Newer transactions (oldest first) on top of a state → dev sales found in them.
+  // Newer transactions on top of a state. Until a transaction after the alert has been seen, the at-call snapshot keeps
+  // following the chain (the indexer can lag the alert by a few seconds); it freezes at the first one after the alert.
+  function rugCatch(S, txs) {
+    const before = S.devSales.length;
+    for (const tx of Array.isArray(txs) ? txs : []) {
+      const t = txMint(tx, S.mint);
+      if (t && !S.crossed && S.cutSec != null && t.sec != null && t.sec > S.cutSec) { S.atCall = rugSnap(S); S.crossed = true; }
+      rugTx(S, t);
+    }
+    if (!S.crossed && S.cutSec != null) S.atCall = rugSnap(S);
+    if (S.lastSec != null) rugPrune(S, S.lastSec);
+    return S.devSales.slice(before);
+  }
+  // Verified holders (4.1): the mint's history cannot show a plain token Transfer (it does not name the mint), so the
+  // rebuilt balances are checked against the chain's own largest token accounts. accounts: [{acct, owner, amt}] from
+  // getTokenLargestAccounts + their owners; supply: getTokenSupply. Returns the gap (% of supply, summed over those
+  // accounts) and the verified owner ranking, which replaces the rebuild for "top 10 now".
+  function rugVerify(S, accounts, supply) {
+    const sup = supply > 0 ? supply : S.supply, by = new Map();
+    if (!(sup > 0) || !Array.isArray(accounts) || !accounts.length) return null;
+    let gap = 0;
+    for (const x of accounts) {
+      if (!x?.owner || !(x.amt >= 0)) continue;
+      gap += Math.abs((S.acct.get(x.acct) ?? 0) - x.amt);
+      by.set(x.owner, (by.get(x.owner) || 0) + x.amt);
+    }
+    // approx: built from the chain's 20 largest token accounts, so an owner spread over smaller accounts can be missed.
+    return {diff: 100 * gap / sup, supply: sup, ranked: [...by].filter(x => x[1] > 0).sort((a, b) => b[1] - a[1]), n: accounts.length, approx: true};
+  }
+  // ---- Which chain figures can be used (4.2) ----
+  // holderTrust: 'verified' = the history was complete and the rebuild matched the chain's own largest accounts within
+  // 2% of supply when compared; 'mismatch' = it did not; 'unchecked' = never compared, or the history was cut short.
+  const HOLDER_GAP_MAX = 2;
+  const holderTrust = (complete, gap) => !complete || gap == null ? 'unchecked' : gap > HOLDER_GAP_MAX ? 'mismatch' : 'verified';
+  // Dev holding now from the chain's own figure: the balance at the verification, less the dev's sales after it (by
+  // slot when both are known, else by time against the moment the verification was requested). Never "the lower of
+  // two sources": a rebuild that missed a plain transfer can show 0% for a real holding.
+  // flows: S.devFlows ({d} signed: buys and incoming transfers add, sales and outgoing transfers subtract).
+  function devNowVerified(ver, flows, supply) {
+    if (ver?.devPct == null || !(supply > 0)) return null;
+    const after = (flows || []).filter(e => e.slot != null && ver.slot != null ? e.slot > ver.slot : e.at != null && e.at > ver.startedAt);
+    return Math.max(0, ver.devPct + 100 * after.reduce((t, e) => t + (e.d || 0), 0) / supply);
+  }
+  // Creator: the first transaction must initialise the mint ('none' otherwise). 'pump' = pump.fun's creation instruction
+  // declares it; 'confirmed' = that and GMGN agree; 'conflict' = they differ. 'payer' = only the fee payer (another
+  // launchpad): an assumption, so not usable for dev checks (GMGN's own dev % is used instead).
+  const creatorCheck = (S, gmCreator) => !S?.verified || !S.creator ? 'none' : S.creatorSrc !== 'pump' ? 'payer' : !gmCreator ? 'pump' : gmCreator === S.creator ? 'confirmed' : 'conflict';
+  const creatorUsable = c => c === 'confirmed' || c === 'pump';
+  // Discord sender: automatic actions only on an explicit match with the learned VolTrak account ('ok'). 'name-only'
+  // mode is for a VolTrak whose messages carry no account ID at all (set when learning finds none).
+  const senderTrust = (aid, trusted, mode) => mode === 'name-only' ? 'ok' : !trusted ? 'unknown' : !aid ? 'no-id' : aid === trusted ? 'ok' : 'mismatch';
+  // Owners by balance, largest first: [[owner, tokens], …].
+  function rugRanked(S, n = 40) {
+    const all = new Map(S.hold);
+    for (const [o, d] of S.adjBy) all.set(o, (all.get(o) || 0) + d);
+    return [...all].filter(x => x[1] > 0).sort((a, b) => b[1] - a[1]).slice(0, n);
+  }
+  // Share of supply (%) held by the n largest holders that are not program accounts (bonding curve, AMM pool, lockers).
+  function rugTop(ranked, supply, programs, n = 10) {
+    if (!(supply > 0) || !Array.isArray(ranked)) return null;
+    let s = 0, k = 0;
+    for (const [o, a] of ranked) { if (programs?.has(o) || NOT_HOLDERS.has(o)) continue; s += a; if (++k >= n) break; }
+    return 100 * s / supply;
+  }
+  // Launch-block wallets: how many, % of supply they bought there, % they hold now, how many hold under half of it.
+  function rugLaunch(S) {
+    let bought = 0, held = 0, sold = 0;
+    for (const [o, b] of S.launch) { const h = Math.max(0, rugHolding(S, o)); bought += b; held += h; if (h < b / 2) sold++; }
+    const p = v => S.supply ? 100 * v / S.supply : null;
+    return {wallets: S.launch.size, bought: p(bought), held: p(held), sold};
+  }
+  function rugSnap(S) {
+    const dev = S.supply && S.creator ? 100 * Math.max(0, rugHolding(S, S.creator)) / S.supply : null;
+    return {devPct: dev, devSold: S.devSales.length > 0, devSoldPct: S.supply ? 100 * S.devSales.reduce((t, x) => t + x.amt, 0) / S.supply : null,
+      holders: rugRanked(S, 40), launch: rugLaunch(S)};
+  }
+  // Transactions oldest first, from the coin's creation (getTransactionsForAddress, sortOrder asc) → holder state, with
+  // a snapshot at cutMs (the alert) in S.atCall. S.crossed: a transaction after the cut was seen, so every one up to
+  // the cut was too, even if the fetch stopped early.
+  function rugScan(txs, mint, cutMs) {
+    const S = rugState(mint), cut = Math.floor(cutMs / 1000);
+    S.cutSec = cut;
+    for (const tx of Array.isArray(txs) ? txs : []) {
+      const t = txMint(tx, mint);
+      if (!t) continue;
+      if (!S.atCall && t.sec != null && t.sec > cut) { S.atCall = rugSnap(S); S.crossed = true; }
+      rugTx(S, t);
+    }
+    if (!S.atCall) S.atCall = rugSnap(S);
+    return S;
+  }
+  // A wallet's earliest transactions (oldest first) → the first wallet that sent it SOL.
+  function funderOf(txs, wallet) {
+    for (const tx of Array.isArray(txs) ? txs : []) {
+      if (!tx?.meta || tx.meta.err) continue;
+      const msg = tx.transaction?.message, ins = [...(msg?.instructions || []), ...(tx.meta.innerInstructions || []).flatMap(x => x?.instructions || [])];
+      for (const ix of ins) {
+        const p = ix?.parsed, info = p?.info;
+        if (!info || (ix.program !== 'system' && ix.programId !== SYSTEM_PROGRAM) || !/^(transfer|transferWithSeed|createAccount)$/.test(p.type)) continue;
+        const to = info.destination ?? info.newAccount, from = info.source, lam = number(info.lamports), sec = number(tx.blockTime);
+        if (to === wallet && from && from !== wallet) return {funder: from, sol: lam == null ? null : lam / 1e9, at: sec == null ? null : sec * 1000};
+      }
+    }
+    return null;
+  }
+  // Real-time rug grade. AVOID: a hard red flag. RISKY: a softer one. CLEAN: none found with full data. PARTIAL: none
+  // found, but top 10 or dev % is unknown (busy coin). Untested: the backtest's "Rug grade at the call" table shows
+  // whether it predicts outcomes. x: {top10, devPct, devSoldRecent, devSoldBefore, sameDev, funderSeen, launchBuyers, botShare}.
+  function rugGrade(x) {
+    const p = v => (v < 10 ? v.toFixed(1) : v.toFixed(0)) + '%', avoid = [], risky = [];
+    if (x.devSoldRecent) avoid.push('Dev is selling'); else if (x.devSoldBefore) risky.push('Dev sold earlier');
+    if (x.sameDev) avoid.push('Same dev as an earlier call');
+    if (x.top10 >= 35) avoid.push('Top 10 hold ' + p(x.top10)); else if (x.top10 > RUG.top10) risky.push('Top 10 hold ' + p(x.top10));
+    if (x.devPct >= 10) avoid.push('Dev holds ' + p(x.devPct)); else if (x.devPct > RUG.dev) risky.push('Dev holds ' + p(x.devPct));
+    if (x.launchBuyers > RUG.launch) risky.push(x.launchBuyers + ' launch-block wallets');
+    if (x.funderSeen > 0) risky.push('Dev funder seen on ' + x.funderSeen + ' earlier call' + (x.funderSeen === 1 ? '' : 's'));
+    if (x.botShare >= 40) risky.push('Volume bots ' + p(x.botShare) + ' of volume');
+    const grade = avoid.length ? 'AVOID' : risky.length ? 'RISKY' : x.top10 != null && x.devPct != null ? 'CLEAN' : 'PARTIAL';
+    return {grade, code: {CLEAN: 0, RISKY: 1, AVOID: 2}[grade] ?? null, reasons: [...avoid, ...risky]};
+  }
+  // The grade from a saved check (values at the alert; a dev sale before the call counts as selling).
+  const rugGradeAt = (r, seen) => rugGrade({top10: r?.top10, devPct: r?.devPct, devSoldRecent: !!r?.devSold, sameDev: seen?.dev > 0, funderSeen: seen?.fund || 0, launchBuyers: r?.launchBuyers});
+  // ---- GMGN's own token data (3.9): read from the GMGN page's API, the same numbers GMGN shows ----
+  // Endpoints (Oct 2026): api/v1/token_stat, vas/api/v1/token_holder_stat, api/v1/tokens/top_buyers,
+  // api/v1/mutil_window_token_info (POST), vas/api/v1/token_holders. Rates come as fractions ("0.326") → %.
+  // Undocumented: any field may vanish, so everything missing stays null and its check shows "no data".
+  const INSIDER_TAG = /dev|creator|bundl|rat_trader|insider|snip|entrap/i;
+  const roleOfTags = tags => {
+    const t = (tags || []).join(' ');
+    return /dev|creator/i.test(t) ? 'dev team' : /bundl/i.test(t) ? 'bundler' : /snip/i.test(t) ? 'sniper' : /rat_trader|insider|entrap/i.test(t) ? 'insider' : null;
+  };
+  function gmgnParse(r) {
+    const n = v => v == null || v === '' ? null : Number.isFinite(+v) ? +v : null, pc = v => n(v) == null ? null : 100 * n(v);
+    const st = r?.stat?.data || {}, hs = r?.holderStat?.data || {}, tb = r?.topBuyers?.data?.holders || {};
+    const info = (Array.isArray(r?.info?.data) ? r.info.data : [])[0] || {}, dev = info.dev || {}, pr = info.price || {};
+    const supply = n(info.circulating_supply) ?? n(info.total_supply), price = n(pr.price), launches = Math.max(n(st.creator_created_count) ?? -1, n(dev.creator_open_count) ?? -1);
+    const G = {holders: n(st.holder_count) ?? n(info.holder_count), top10: pc(st.top_10_holder_rate ?? dev.top_10_holder_rate),
+      platformRate: pc(st.bot_degen_rate), platformCount: n(st.bot_degen_count), freshRate: pc(st.fresh_wallet_rate),
+      bundlerPct: pc(st.top_bundler_trader_percentage), ratPct: pc(st.top_rat_trader_percentage), entrapPct: pc(st.top_entrapment_trader_percentage),
+      devTeamPct: pc(st.dev_team_hold_rate), devPct: pc(st.creator_hold_rate), sniperPct: pc(st.top70_sniper_hold_rate ?? tb.top70_sniper_hold_rate),
+      launches: launches < 0 ? null : launches, devStatus: dev.creator_token_status || null, creator: dev.creator_address || null, cto: n(dev.cto_flag),
+      smart: n(hs.smart_degen_count), renowned: n(hs.renowned_count), insiderCount: n(hs.insider_count), bundlerCount: n(hs.bundler_count), sniperCount: n(hs.sniper_count),
+      first70Hold: pc(tb.statusNow?.holding_rate), first70Sold: n(tb.statusNow?.sold), first70N: n(tb.holder_count),
+      // First 70 buyers now: still holding, added, sold part, sold out (GMGN's own count).
+      first70: tb.statusNow ? {hold: n(tb.statusNow.hold), added: n(tb.statusNow.bought_more), part: n(tb.statusNow.sold_part), out: n(tb.statusNow.sold)} : null, profitShare: null,
+      supply, price, mc: price > 0 && supply > 0 ? price * supply : null, liquidity: n(info.liquidity), migrated: info.migrated_timestamp == null ? null : n(info.migrated_timestamp) > 0,
+      vol5m: n(pr.volume_5m), vol1h: n(pr.volume_1h), buys5m: n(pr.buys_5m), sells5m: n(pr.sells_5m), insiders: [], cluster: null, listed: false};
+    const list = Array.isArray(r?.holders?.data?.list) ? r.holders.data.list : null;
+    if (list) {
+      G.listed = true;
+      // People only: pools and the bonding curve (addr_type 2) are not holders.
+      const people = list.filter(h => h?.address && n(h.addr_type) !== 2);
+      for (const h of people) {
+        const role = G.creator && h.address === G.creator ? 'dev' : roleOfTags(h.maker_token_tags);
+        if (role) G.insiders.push({w: h.address, role, pct: pc(h.amount_percentage) || 0});
+      }
+      // Cost basis: share of the listed holders' supply bought at half today's price or less (sitting on 2x+). avg_cost is
+      // GMGN's average entry in USD per token; holders without one are left out.
+      if (price > 0) {
+        let all = 0, up = 0;
+        for (const h of people) { const c = n(h.avg_cost), q = pc(h.amount_percentage) || 0; if (!(c > 0) || !(q > 0)) continue; all += q; if (price / c >= 2) up += q; }
+        G.profitShare = all > 0 ? 100 * up / all : null;
+      }
+      // Hidden bundle: 3+ top holders first funded by the same wallet. A named funder (an exchange) is not a cluster.
+      const byFunder = new Map();
+      for (const h of people) { const f = h.native_transfer?.from_address; if (f && f !== h.address && !h.native_transfer?.name) (byFunder.get(f) || byFunder.set(f, []).get(f)).push(h); }
+      for (const [funder, hs] of byFunder) {
+        if (hs.length < 3) continue;
+        const pct = hs.reduce((t, h) => t + (pc(h.amount_percentage) || 0), 0);
+        if (!G.cluster || pct > G.cluster.pct) G.cluster = {funder, n: hs.length, pct, wallets: hs.map(h => ({w: h.address, pct: pc(h.amount_percentage) || 0}))};
+      }
+    }
+    return G;
+  }
+  // The insider group: GMGN-tagged dev/team/bundler/sniper/insider holders, the funder cluster, plus the dev and the
+  // launch-block wallets from the chain rebuild (extra: [{w, role, pct}]). Each wallet counts once, at its own holding
+  // (GMGN's holder list first, else the chain's). complete = GMGN's holder list was read; without it the group only has
+  // the chain wallets, so its total is not a measure of the insider bag.
+  function insiderGroup(G, extra = []) {
+    const m = new Map();
+    for (const x of G?.insiders || []) m.set(x.w, {role: x.role, pct: x.pct, src: 'gmgn'});
+    for (const x of G?.cluster?.wallets || []) if (!m.has(x.w)) m.set(x.w, {role: 'cluster', pct: x.pct, src: 'gmgn'});
+    for (const x of extra) { const o = m.get(x.w); if (!o) m.set(x.w, {role: x.role, pct: x.pct || 0, src: 'chain'}); else if (x.role === 'dev') o.role = 'dev'; }
+    const byRole = {};
+    let total = 0;
+    for (const v of m.values()) { total += v.pct; byRole[v.role] = (byRole[v.role] || 0) + v.pct; }
+    return {wallets: m, total, byRole, complete: !!G?.listed};
+  }
+  // Insider sells [{at, w, role, pct}] → is the group leaving together? coordinated: 3+ insider wallets sold within 60s,
+  // or the group sold 3%+ of supply within 2 min.
+  // A wallet counts toward "3 wallets" only if its sale is 0.1%+ of supply (GMGN tags many small bundler wallets).
+  const EXIT = Object.freeze({wallets: 3, walletMs: 60000, walletMinPct: 0.1, pct: 3, pctMs: 120000});
+  function exitStats(events, now) {
+    const w60 = new Set(), roles = new Set();
+    let pct = 0, last = null;
+    for (const e of events || []) {
+      if (!(e.at <= now + 5000)) continue;
+      if (now - e.at <= EXIT.walletMs && (e.pct || 0) >= EXIT.walletMinPct) w60.add(e.w);
+      if (now - e.at <= EXIT.pctMs) { pct += e.pct || 0; roles.add(e.role); last = Math.max(last ?? 0, e.at); }
+    }
+    return {wallets: w60.size, pct, roles: [...roles], last, coordinated: w60.size >= EXIT.wallets || pct >= EXIT.pct};
+  }
+  // ---- Coin grade (4.3): four parts and a risk-led headline ----
+  // Risk: control, concentration and insider hazards. Demand: is the buying broad, real and lasting. Entry: can it be
+  // bought and sold at our size without giving the edge away, and is it late. Confidence: is the evidence complete,
+  // current and from verified sources. Strong demand can no longer cancel a risk. Headline:
+  //   AVOID  a hard stop, Risk <= -4, or Entry <= -3 (cannot get out at a sane cost);
+  //   RISKY  Risk <= -1, Demand <= -2 or Entry <= -1;
+  //   CLEAN  otherwise, with data on the core risk checks (else PARTIAL; fewer than 5 checks with data: PARTIAL).
+  // The insider bag already holds bundlers, snipers and the funder cluster, so those three only score when the bag is
+  // unknown (no double counting). App traders is shown but never scored: an app tag names a tool, not a person.
+  // Thresholds are judgment calls, untested; every part is saved at each call for the backtest.
+  const SCORE_CORE = ['insiders', 'top10', 'dev'];
+  function scoreCoin(x) {
+    const checks = [], hard = [], p = v => (v < 10 ? v.toFixed(1) : v.toFixed(0)) + '%';
+    // status 'info': shown but not scored (counted in another check, or not a quality signal on its own).
+    const add = (cat, key, label, value, pts, note, info) => checks.push({cat, key, label, value, pts, status: value == null ? 'na' : info ? 'info' : pts < 0 ? (pts <= -2 ? 'fail' : 'warn') : 'pass', note: note || ''});
+    const band = (v, rules) => { if (v == null) return 0; for (const [test, pts] of rules) if (test(v)) return pts; return 0; };
+    if (x.exit?.coordinated) hard.push('Insiders selling together: ' + x.exit.wallets + ' wallet' + (x.exit.wallets === 1 ? '' : 's') + ', ' + p(x.exit.pct) + ' of supply in 2 min');
+    if (x.devSellingNow) hard.push('Dev is selling');
+    const bag = x.insiderHold != null;
+    // Risk
+    add('risk', 'insiders', 'Insider bag', x.insiderHold == null ? null : p(x.insiderHold), band(x.insiderHold, [[v => v >= 40, -3], [v => v >= 25, -2], [v => v >= 15, -1], [v => v < 10, 1]]), 'dev, team, bundlers, snipers, insiders, launch block, funder cluster');
+    add('risk', 'dev', 'Dev holds', x.devPct == null ? null : p(x.devPct) + (x.devSold ? ' · sold' : ''), band(x.devPct, [[v => v >= 10, -2], [v => v > 5, -1]]));
+    add('risk', 'launches', 'Dev launches', x.launches == null ? null : String(x.launches), band(x.launches, [[v => v >= 50, -2], [v => v >= 10, -1]]), 'coins this dev created before');
+    add('risk', 'repeat', 'Dev / funder seen', x.sameDev == null && x.funderSeen == null ? null : x.sameDev ? 'same dev' : x.funderSeen ? x.funderSeen + ' earlier call' + (x.funderSeen === 1 ? '' : 's') : 'new', x.sameDev ? -2 : x.funderSeen ? -1 : 0, 'on earlier VolTrak calls');
+    add('risk', 'top10', 'Top 10', x.top10 == null ? null : (x.top10Approx ? '≈' : '') + p(x.top10), band(x.top10, [[v => v > 35, -2], [v => v > 25, -1], [v => v < 15, 1]]));
+    add('risk', 'bundlers', 'Bundlers hold', x.bundlerPct == null ? null : p(x.bundlerPct), bag ? 0 : band(x.bundlerPct, [[v => v >= 20, -2], [v => v >= 10, -1]]), bag ? 'counted in the insider bag' : '', bag);
+    add('risk', 'snipers', 'Snipers hold', x.sniperPct == null ? null : p(x.sniperPct), bag ? 0 : band(x.sniperPct, [[v => v >= 20, -1]]), bag ? 'counted in the insider bag' : '', bag);
+    add('risk', 'cluster', 'Funder cluster', x.cluster == null ? null : x.cluster.n ? x.cluster.n + ' wallets · ' + p(x.cluster.pct) : 'none', bag || !x.cluster?.n ? 0 : x.cluster.pct >= 10 || x.cluster.n >= 5 ? -2 : -1, bag ? 'counted in the insider bag' : 'top holders funded by the same wallet', bag);
+    add('risk', 'launch', 'Launch block', x.launchBuyers == null ? null : x.launchBuyers + ' wallet' + (x.launchBuyers === 1 ? '' : 's'), band(x.launchBuyers, [[v => v > 3, -1]]));
+    // Demand
+    add('demand', 'app', 'App traders', x.platformRate == null ? null : p(x.platformRate), 0, 'holders whose wallets use a trading app (a tool, not proof of a person)', true);
+    add('demand', 'fresh', 'Fresh wallets', x.freshRate == null ? null : p(x.freshRate), band(x.freshRate, [[v => v >= 40, -1]]));
+    add('demand', 'smart', 'Smart money', x.smart == null ? null : String(x.smart), band(x.smart, [[v => v >= 3, 1]]));
+    add('demand', 'growth', 'Holders 5m', x.holderGrowth == null ? null : (x.holderGrowth >= 0 ? '+' : '') + p(x.holderGrowth).replace('-', '−'), band(x.holderGrowth, [[v => v >= 10, 1], [v => v <= -5, -1]]));
+    add('demand', 'retention', 'First buyers holding', x.retention == null ? null : p(x.retention), band(x.retention, [[v => v >= 50, 1], [v => v < 10, -1]]), 'share of the first 70 buyers' + String.fromCharCode(8217) + ' tokens still held');
+    // Bots: the worse of bot share of trades (bump bots faking activity) and of dollar volume (wash trading).
+    add('demand', 'bots', 'Bots', x.botShare == null && x.botTrades == null ? null : (x.botTrades == null ? '' : p(x.botTrades) + ' trades · ') + (x.botShare == null ? '' : p(x.botShare) + ' $'),
+      Math.min(band(x.botTrades, [[v => v >= 60, -2], [v => v >= 30, -1]]), band(x.botShare, [[v => v >= 40, -1]])), 'bot share of trades and of dollar volume');
+    add('demand', 'organic', 'Organic buys', x.orgShare == null ? null : p(x.orgShare), band(x.orgShare, [[v => v >= 60, 1]]), 'buy share with bot trades removed');
+    add('demand', 'volmc', 'Volume / MC', x.volMc == null ? null : x.volMc.toFixed(1) + '×', band(x.volMc, [[v => v >= 10, -1]]), '1h volume vs market cap');
+    // Entry
+    add('entry', 'exitcost', 'Round trip', x.exitCost == null ? null : '−' + p(Math.max(0, x.exitCost)), band(x.exitCost, [[v => v >= 50, -3], [v => v >= 25, -2], [v => v >= 10, -1]]), 'buy then sell at your size (Jupiter quote: fees and price impact)');
+    add('entry', 'overhang', 'Holders in profit', x.profitShare == null ? null : p(x.profitShare) + ' at 2×+', band(x.profitShare, [[v => v >= 50, -1]]), 'share of top-holder supply bought at half the price or less');
+    add('entry', 'move', 'Since the call', x.moveSinceCall == null ? null : (x.moveSinceCall >= 0 ? '+' : '−') + p(Math.abs(x.moveSinceCall)), band(x.moveSinceCall, [[v => v >= 100, -1]]), 'price move since the alert (chasing after +100%)');
+    const known = checks.filter(c => c.status !== 'na').length, sum = c => checks.filter(k => k.cat === c).reduce((t, k) => t + k.pts, 0);
+    const risk = sum('risk'), demand = sum('demand'), entry = sum('entry'), score = risk + demand + entry;
+    // CLEAN needs the core risk checks: missing data must not read as safe. Red flags still grade with partial data.
+    const missing = SCORE_CORE.filter(k => checks.find(c => c.key === k)?.status === 'na');
+    const g0 = hard.length || risk <= -4 || entry <= -3 ? 'AVOID' : known < 5 ? 'PARTIAL' : risk <= -1 || demand <= -2 || entry <= -1 ? 'RISKY' : 'CLEAN';
+    const grade = g0 === 'CLEAN' && missing.length ? 'PARTIAL' : g0;
+    // The check that set the grade: the worst one in the part that tripped the rule (not just the worst overall).
+    const worstIn = cat => checks.filter(k => k.cat === cat && k.pts < 0).sort((a, b) => a.pts - b.pts)[0] || null;
+    const because = hard.length ? null : g0 === 'AVOID' ? worstIn(risk <= -4 ? 'risk' : 'entry') : g0 === 'RISKY' ? worstIn(risk <= -1 ? 'risk' : demand <= -2 ? 'demand' : 'entry') : null;
+    // Confidence: missing core checks or a source conflict = low; stale or unverified inputs, or under 10 checks = medium.
+    const c = x.conf || {}, reasons = [...missing.map(k => 'no ' + checks.find(q => q.key === k).label.toLowerCase()), ...(c.conflict || []), ...(c.stale || []), ...(c.unverified || [])];
+    const level = missing.length || c.conflict?.length ? 'low' : c.stale?.length || c.unverified?.length || known < 10 ? 'medium' : 'high';
+    return {grade, score, risk, demand, entry, confidence: {level, reasons}, known, hard, checks, missing, because: because?.key ?? null, code: {CLEAN: 0, RISKY: 1, AVOID: 2}[grade] ?? null};
+  }
+  // Saved check (at the call) → one line for Telegram. seen: {dev, fund} earlier calls sharing the dev or its funder.
+  function rugLine(r, seen) {
+    if (!r || r.empty) return 'Rug checks: no chain data';
+    const p = v => v == null ? '?' : (v < 10 ? v.toFixed(1) : v.toFixed(0)) + '%', warn = b => b ? ' ⚠' : '';
+    return [rugGradeAt(r, seen).grade, 'Top 10 ' + p(r.top10) + warn(r.top10 > RUG.top10),
+      'Dev ' + p(r.devPct) + (r.devSold ? ' (sold)' : '') + warn(r.devPct > RUG.dev || r.devSold),
+      'Launch ' + (r.launchBuyers ?? '?') + ' wallet' + (r.launchBuyers === 1 ? '' : 's') + (r.launchPct != null ? ' / ' + p(r.launchPct) : '') + warn(r.launchBuyers > RUG.launch),
+      'Funder ' + (!r.funder ? '?' : seen?.dev ? 'same dev as an earlier call' : seen?.fund ? 'seen on ' + seen.fund + ' earlier call' + (seen.fund === 1 ? '' : 's') : 'new') + warn(seen?.dev || seen?.fund)].join(' · ');
+  }
   return {MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
-    candles,mergeCandles,scoreCall,preAlert,breakeven,wilson,summarize,zFor,tFor,backtestReport,VB,botFlow,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff};
+    candles,mergeCandles,scoreCall,preAlert,breakeven,wilson,summarize,zFor,tFor,backtestReport,VB,botFlow,gmgnMaker,gmgnApiTrade,APP_TAG,BOT_RULES,BOT_SURE,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff,
+    RUG,SYSTEM_PROGRAM,txMint,rugState,rugHolding,rugTx,tradeTokens,rugTrade,rugPrune,rugCatch,rugVerify,HOLDER_GAP_MAX,holderTrust,devNowVerified,creatorCheck,creatorUsable,senderTrust,rugRanked,rugTop,rugLaunch,rugSnap,rugScan,funderOf,rugGrade,rugGradeAt,rugLine,FEATURES,gmgnParse,roleOfTags,insiderGroup,EXIT,exitStats,scoreCoin,b58decode,b58encode,pumpCreator,devFlow,WSOL_MINT};
 })();
 /* CORE END */
 
@@ -536,7 +1101,7 @@ const VTCore = (() => {
 // that socket and never changes a message; it only reads token_activity and token_stat frames.
 const VTLive = (() => {
   const listeners = new Set(), pending = [], seen = new WeakSet();
-  let attachedAt = 0;
+  let attachedAt = 0, lastFrame = 0;
   // Data check: which channels GMGN sends, which fields its trade rows carry (e.g. wallet tags), a few sample rows.
   const census = {since: Date.now(), frames: 0, hidden: 0, nonText: 0, channels: {}, keys: {}, samples: {}};
   const note = (frame, hidden) => {
@@ -550,10 +1115,11 @@ const VTLive = (() => {
     if (!ws || seen.has(ws) || !/(^|\.)gmgn\.ai(:|\/|$)/.test(String(ws.url).replace(/^wss?:\/\//, ''))) return;
     seen.add(ws); attachedAt = attachedAt || Date.now();
     ws.addEventListener('message', e => {
+      lastFrame = Date.now();
       if (typeof e.data !== 'string') { census.nonText++; return; }
       const ch = e.data.slice(0, 200).match(/"channel"\s*:\s*"([^"]{1,40})"/)?.[1] || '?';
       if (ch in census.channels || Object.keys(census.channels).length < 60) census.channels[ch] = (census.channels[ch] || 0) + 1;
-      if (!/"(token_activity|token_stat)"/.test(e.data)) return;
+      if (!/"(token_activity|token_activity_info_all|token_stat)"/.test(e.data)) return;
       const frame = VTCore.gmgnFrame(e.data);
       if (frame) { try { note(frame, document.hidden); } catch (_) {} emit(frame); }
     });
@@ -568,7 +1134,7 @@ const VTLive = (() => {
       WS.prototype.send = function (...args) { try { watch(this); } catch (_) {} return send.apply(this, args); };
     } catch (_) {}
   }
-  return {on(fn) { listeners.add(fn); pending.splice(0).forEach(emit); }, attachedAt: () => attachedAt, census: () => census};
+  return {on(fn) { listeners.add(fn); pending.splice(0).forEach(emit); }, attachedAt: () => attachedAt, lastFrame: () => lastFrame, census: () => census};
 })();
 
 // Photon probe (Photon tab only, read-only): Photon has no public API, so this records the shape of the data Photon's
@@ -882,6 +1448,13 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .grade.g-b .gl{border-color:var(--lime);color:var(--lime)}
 #vts-root .grade.g-c .gl{border-color:var(--warn);color:var(--warn)}
 #vts-root .grade.g-d .gl{border-color:var(--sell);color:var(--sell)}
+#vts-root .grade.g-clean .gl{border-color:var(--buy);color:var(--buy)}
+#vts-root .grade.g-clean strong{color:var(--buy)}
+#vts-root .grade.g-risky .gl{border-color:var(--warn);color:var(--warn);background:var(--warn-bg)}
+#vts-root .grade.g-risky strong{color:var(--warn)}
+#vts-root .grade.g-avoid{border-color:var(--sell);background:var(--sell-bg)}
+#vts-root .grade.g-avoid .gl{background:var(--sell);border-color:var(--sell);color:var(--sell-ink)}
+#vts-root .grade.g-avoid strong{color:var(--sell)}
 #vts-root .grade.unproven .gl,#vts-root .grade.few .gl,#vts-root .grade.none .gl{background:transparent;border:2px dashed var(--line3);color:var(--muted)}
 #vts-root .grade.few .gl,#vts-root .grade.none .gl{color:var(--dim)}
 #vts-root .grade.unproven .gn,#vts-root .grade.few .gn{padding:3px 5px;border:1px dashed var(--line3);border-radius:4px;font:800 9.5px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase}
@@ -903,6 +1476,66 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .kpi b .i{width:.62em;height:.62em;margin-right:3px;vertical-align:.04em}
 #vts-root .kpi small{display:block;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #vts-root .kpi.na b{color:var(--dim)}
+#vts-root .rug{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+#vts-root .rug:empty{display:none}
+#vts-root .rug .kpi b{font-size:18px}
+#vts-root .rug .kpi.over{border-color:var(--warn-line);background:var(--warn-bg)}
+#vts-root .rug .kpi.over b{color:var(--warn)}
+#vts-root .rug .kpi.bad{border-color:var(--sell);background:var(--sell-bg)}
+#vts-root .rug .kpi.bad b{color:var(--sell)}
+#vts-root .rugbox .note{margin:6px 0 0}
+#vts-root .ins{margin:0 0 6px;padding:7px 10px 8px;border:1px solid var(--line2);border-radius:8px;background:var(--card)}
+#vts-root .ins .row1{display:flex;align-items:baseline;gap:8px;min-width:0}
+#vts-root .ins .row1 .lbl{flex:none}
+#vts-root .ins .row1 b{flex:none;font:850 18px/1.1 var(--sans);font-variant-numeric:tabular-nums}
+#vts-root .ins .roles{min-width:0;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .ins.over{border-color:var(--warn-line);background:var(--warn-bg)}
+#vts-root .ins.over .row1 b{color:var(--warn)}
+#vts-root .ins.bad{border-color:var(--sell);background:var(--sell-bg)}
+#vts-root .ins.bad .row1 b{color:var(--sell)}
+#vts-root .ins .exit{margin-top:5px;font-size:11.5px;line-height:1.35;color:var(--muted)}
+#vts-root .ins .exit.warn{color:var(--warn);font-weight:700}
+#vts-root .ins .exit.bad{color:var(--sell);font-weight:800}
+#vts-root .ins .exit.bad::before{content:"\25BC  "}
+#vts-root .checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
+#vts-root .ck.wide{grid-column:1/-1}
+#vts-root .ck.wide b{max-width:75%}
+#vts-root .ckh{grid-column:1/-1;margin:4px 0 0;font:700 10.5px/1.2 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+#vts-root .parts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:6px 0 0}
+#vts-root .parts[hidden]{display:none}
+#vts-root .pt{min-width:0;padding:5px 7px 6px;border:1px solid var(--line);border-radius:7px;background:var(--card)}
+#vts-root .pt .lbl{display:block;font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+#vts-root .pt b{display:block;font:850 16px/1.15 var(--sans);font-variant-numeric:tabular-nums}
+#vts-root .pt small{display:block;font-size:10.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .pt.ok b{color:var(--buy)}
+#vts-root .pt.warn{border-color:var(--warn-line)}
+#vts-root .pt.warn b{color:var(--warn)}
+#vts-root .pt.bad{border-color:var(--sell-line);background:var(--sell-bg)}
+#vts-root .pt.bad b{color:var(--sell)}
+#vts-root .pt.conf.high b{color:var(--buy)}
+#vts-root .pt.conf.medium b{color:var(--warn)}
+#vts-root .pt.conf.low{border-color:var(--sell-line)}
+#vts-root .pt.conf.low b{color:var(--sell)}
+#vts-root .rcbox{margin:6px 0 0}
+#vts-root .speed{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:2px 12px;font-size:11.5px;font-variant-numeric:tabular-nums}
+#vts-root .speed .h{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+#vts-root .speed span:not(.l):not(.h){text-align:right}
+#vts-root .rcbox summary{cursor:pointer;font-size:11.5px;color:var(--muted)}
+#vts-root .rcbox li.dim{opacity:.55}
+#vts-root .checks:empty{display:none}
+#vts-root .ck{display:flex;align-items:center;gap:6px;min-width:0;padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:var(--card);font-size:11.5px;line-height:1.2}
+#vts-root .ck i{flex:none;width:12px;text-align:center;font:900 12px/1 var(--sans)}
+#vts-root .ck span{flex:1 1 auto;min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .ck b{flex:0 1 auto;min-width:0;max-width:60%;font-weight:750;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#vts-root .ck.pass i{color:var(--buy)}
+#vts-root .ck.warn{border-color:var(--warn-line)}
+#vts-root .ck.warn i,#vts-root .ck.warn b{color:var(--warn)}
+#vts-root .ck.fail{border-color:var(--sell-line);background:var(--sell-bg)}
+#vts-root .ck.fail i,#vts-root .ck.fail b{color:var(--sell)}
+#vts-root .ck.na{opacity:.55}
+#vts-root .ck.info i{color:var(--dim)}
+#vts-root .ck.na i{color:var(--dim)}
+#vts-root .rugbox .buttons{margin:6px 0 0}
 #vts-root .late-chips{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin-top:6px}
 #vts-root .lc{position:relative;min-width:0;display:flex;flex-direction:column;gap:5px;padding:7px 10px 8px;border-radius:8px;border:1px solid var(--line2);background:var(--card);overflow:hidden;white-space:nowrap}
 #vts-root .lc .v{font:850 14.5px/1.1 var(--sans);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}
@@ -1128,9 +1761,11 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
     <div class="scale"><span class="b" data-vts="split-buy"></span><span data-vts="basis" title="">no data yet</span><span class="s" data-vts="split-sell"></span></div>
   </div>
   <div class="pair">
-    <div class="cell grade none" data-vts="grade" title="Setup grade from the backtest: how past calls with this setup did"><span class="lbl">Setup grade</span><div class="gb"><b class="gl" data-vts="grade-letter">—</b><span class="gt"><strong data-vts="grade-text">No similar calls yet</strong><span class="gn" data-vts="grade-note">needs 5+ calls</span></span></div></div>
-    <div class="cell bots na" data-vts="vol-bots" title="Share of 5m $ volume from wallets flagged as wash-trading bots"><span class="lbl">Volume bots</span><div class="bv"><b data-vts="bots-pct">—</b><span class="muted">of 5m vol</span><span class="tag" data-vts="bots-level">No data</span></div><div class="bar"><i data-vts="bots-bar"></i></div><small data-vts="bots-org">needs GMGN live trades</small></div>
+    <div class="cell grade none" data-vts="grade" title="Coin grade from the live checks"><span class="lbl">Coin grade</span><div class="gb"><b class="gl" data-vts="grade-letter">—</b><span class="gt"><strong data-vts="grade-text">No grade</strong><span class="gn" data-vts="grade-note">no rug check yet</span></span></div></div>
+    <div class="cell bots na" data-vts="vol-bots" title="Share of the last 5 min of trades (and of dollar volume) from bot wallets"><span class="lbl">Volume bots</span><div class="bv"><b data-vts="bots-pct">—</b><span class="muted">of 5m trades</span><span class="tag" data-vts="bots-level">No data</span></div><div class="bar"><i data-vts="bots-bar"></i></div><small data-vts="bots-org">needs GMGN live trades</small></div>
   </div>
+  <div class="parts" data-vts="parts" hidden></div>
+  <div class="rugbox" data-vts="rug" hidden><div class="sect"><span class="lbl">Checks</span><span class="lbl" data-vts="rug-src">untested</span></div><div class="ins" data-vts="ins" hidden></div><div class="checks" data-vts="rug-cells"></div><p class="note" data-vts="rug-note"></p><details class="rcbox" data-vts="rc" hidden><summary>RugCheck</summary><ul class="flags"></ul></details><div class="buttons" data-vts="rug-row" hidden><button data-vts="rug-check">Check this coin</button></div></div>
   <div class="kpis" data-vts="kpis"></div>
   <div class="late-chips" data-vts="late-chips"></div>
   <ul class="flags" data-vts="risks"></ul>
@@ -1156,6 +1791,8 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
   <div data-vts="late"></div>
   <div class="legend"><span><b class="gp buy">ABOVE</b> at or above the call price</span><span><b class="gp wait">BELOW</b> down 0–30%</span><span><b class="gp fade">DOWN</b> down 30%+</span><span><b class="gp dead">NO TRADES</b> none for 5 min</span></div>
   <p class="note">What the price did, not a signal. The backtest report shows what buying at each check did on your past calls.</p>
+  <div class="sect"><span class="lbl">Speed</span><span class="lbl">alert → each stage · last 20 calls</span></div>
+  <div class="speed" data-vts="speed"></div>
   <div class="sect"><span class="lbl">Saved calls</span></div>
   <select data-vts="call-list"></select>
   <div class="buttons two"><button data-vts="open">Open on GMGN</button><button data-vts="export">Export data</button></div>
@@ -1168,27 +1805,45 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
   <div class="grid3 field"><label><span class="lbl">Target</span><span class="pct"><input data-vts="bt-tp" type="number" min="1" step="any"></span></label><label><span class="lbl">Stop loss</span><span class="pct"><input data-vts="bt-sl" type="number" min="1" max="99" step="any"></span></label><label><span class="lbl">Costs</span><span class="pct"><input data-vts="bt-cost" type="number" min="0" step="any"></span></label></div>
   <div class="buttons two"><button class="primary" data-vts="bt-run">Score calls</button><button data-vts="bt-report">Open report</button></div>
   <div class="buttons"><button data-vts="hb-run">Add volume bots to past calls (Helius)</button></div>
+  <div class="buttons"><button data-vts="rc-run">Add rug checks to past calls (Helius)</button></div>
   <div class="btp" data-vts="bt-progress"></div>
   <p class="bt-status" data-vts="bt-status"></p>
 </section>
 <section data-pane="settings" hidden>
   <div class="set">
     <label class="check"><span><b>Market feed</b><small>PumpPortal public socket: pump.fun launches and graduations (its trade stream now needs a paid key)</small></span><input type="checkbox" data-vts="market-on"></label>
+    <label class="check"><span><b>GMGN token data</b><small>Holders, bundlers, snipers, insiders, real traders, dev launches: read from GMGN for the coin on screen</small></span><input type="checkbox" data-vts="gm-on"></label>
+    <label class="check"><span><b>Exit cost quotes (Jupiter)</b><small>Every 15s: buy at your size, sell it back; the gap is fees plus price impact</small></span><input type="checkbox" data-vts="jup-on"></label>
+    <label class="check"><span><b>RugCheck findings</b><small>Shown under the checks, never mixed into the score</small></span><input type="checkbox" data-vts="rc-on"></label>
     <label class="check"><span><b>GeckoTerminal fallback trades</b><small>Used when GMGN’s live feed is quiet</small></span><input type="checkbox" data-vts="trades"></label>
     <label class="check"><span><b>Voice alert on Discord</b><small>Speaks the token name when a call arrives</small></span><input type="checkbox" data-vts="sound"></label>
     <label class="check"><span><b>Alert when a call is still above its call price</b><small>Notification at +10 / +30 min. Not a buy signal; off by default</small></span><input type="checkbox" data-vts="late-alerts"></label>
   </div>
+  <label class="field"><span class="lbl">Your trade size (SOL) · for the exit-cost quote</span><input data-vts="trade-sol" type="number" min="0.001" step="any"></label>
   <div class="sect"><span class="lbl">Data sources</span></div>
   <p class="note">Live: GMGN’s own page feed (token_activity, token_stat), read-only; nothing is sent on GMGN’s connection. Fallbacks: DEX Screener snapshots and GeckoTerminal trades when the live feed is quiet.</p>
-  <p class="note">Market: PumpPortal’s public data socket (one connection, receiving GMGN tab only): launches and graduations. Volume bots: computed from GMGN’s live trades for the coin on screen.</p>
+  <p class="note">Market: PumpPortal’s public data socket (one connection, receiving GMGN tab only): launches and graduations. Volume bots: GMGN’s live trades for the coin on screen plus GMGN’s own wallet labels (wash trader, sandwich bot, trading app, trades per wallet), with the last 5 min loaded from GMGN’s trades list when a coin opens.</p>
+  <p class="note">Checks: GMGN’s own token data for the coin on screen (holders, bundlers, snipers, insiders, real traders, dev launches; read from the GMGN page every 5s for a new coin’s first 3 min, then every 15s), plus the chain checks from your Helius key. Dev and insider sells come from GMGN’s live trade feed the moment they happen.</p>
+  <p class="note">Exit cost: Jupiter’s public quote API, every 15s for the coin on screen (buy at your trade size, sell it back). RugCheck: its public report summary, once per coin every 5 min, shown as its own findings. Both are read-only lookups by mint.</p>
   <div class="sect"><span class="lbl">Helius · optional</span></div>
   <label class="field"><span class="lbl">Helius API key (or a full RPC URL)</span><span class="inline"><input data-vts="rpc-key" type="password" placeholder="free key from helius.dev" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore><button data-vts="rpc-save">Save</button></span></label>
   <div class="buttons two"><button data-vts="rpc-test">Test key</button><button data-vts="rpc-remove">Remove key</button></div>
   <div class="buttons"><button data-vts="rpc-sample" hidden>Copy sample transaction</button></div>
-  <p class="note" data-vts="rpc-status">Lets the backtest add volume-bot readings to past calls (Calls → Backtest). Free plan: 1M credits a month; one past call uses about 10–300. The key stays in this browser.</p>
+  <p class="note" data-vts="rpc-status">Powers the live rug checks (dev wallet, top 10, launch block, dev funder) and lets the backtest add volume bots and rug checks to past calls. Free plan: 1M credits a month; a rug check uses about 20–250, a past call's volume bots about 10–300. The key stays in this browser.</p>
+  <div class="sect"><span class="lbl">Telegram · optional</span></div>
+  <div class="set">
+    <label class="check"><span><b>Ping my phone on new calls</b><small>One message per call; it updates with the rug checks when they finish</small></span><input type="checkbox" data-vts="tg-on"></label>
+    <label class="check"><span><b>Ping when the dev sells</b><small>For a call open on GMGN: the first dev sale, and when the dev is fully out</small></span><input type="checkbox" data-vts="tg-dev"></label>
+  </div>
+  <label class="field"><span class="lbl">Bot token (from @BotFather)</span><span class="inline"><input data-vts="tg-token" type="password" placeholder="123456:ABC…" autocomplete="new-password" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore><button data-vts="tg-save">Save</button></span></label>
+  <div class="buttons two"><button data-vts="tg-find">Find my chat ID</button><button data-vts="tg-test">Send test</button></div>
+  <div class="buttons"><button data-vts="tg-remove">Remove Telegram</button></div>
+  <p class="note" data-vts="tg-status">1) In Telegram, message @BotFather, send /newbot and paste the token it gives you here. 2) Send your new bot any message. 3) Press Find my chat ID, then Send test. The token stays in this browser.</p>
   <div class="sect"><span class="lbl">Data check</span></div>
   <p class="note" data-vts="census">GMGN feed: not seen yet in this tab.</p>
   <div class="buttons"><button data-vts="census-copy">Copy GMGN feed report</button></div>
+  <div class="buttons" data-vts="author-row"><button data-vts="author-reset">Re-learn VolTrak sender</button></div>
+  <p class="note" data-vts="author-note"></p>
   <p class="note">Shows which fields GMGN's live feed sends (for example whether it tags wash-trading wallets). Paste the report to Claude to improve the volume-bot reading. It contains public trade data only.</p>
   <div class="sect"><span class="lbl">Keys</span></div>
   <p class="note"><kbd>Alt+V</kbd> hides the panel · <kbd>Alt+I</kbd> opens Recover initials · drag the header to move it. No private keys or trading endpoints. Disable the old VolTrak script before using this one.</p>
@@ -1210,7 +1865,7 @@ function start() {
   // AUTHOR_ID (optional): VolTrak's Discord user/webhook ID, the number in its avatar URL /avatars/<id>/.
   // Set it to ignore anyone else who renames themselves "VolTrak". Empty = match by name only.
   const CHANNEL='1531866550968254514', AUTHOR='voltrak', AUTHOR_ID='', PREFIX='vts3.';
-  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'3.7.0';
+  const VERSION=typeof GM_info!=='undefined'?GM_info.script.version:'4.3.0';
   const DEX='https://api.dexscreener.com/tokens/v1/solana/', GT='https://api.geckoterminal.com/api/v2/networks/solana/';
   const CURRENT_MS=3000, TRACK_MS=10000, FLOW_MS=6000, RECEIVER_TTL=90000, LEAVE_GRACE=20000;
   const get=(k,d)=>GM_getValue(PREFIX+k,d), set=(k,v)=>GM_setValue(PREFIX+k,v);
@@ -1238,13 +1893,16 @@ function start() {
   let flow=null, flowError='', flowing=false, lastFlow=0, flowPause=0, gtPools={};
   // GMGN live state for the token on screen: trades seen (deduped by tx), GMGN's token_stat rollup, first/last message time.
   let live=null;
-  const resetLive=mint=>{live={mint,since:Date.now(),first:0,at:0,stat:null,trades:[],keys:new Set(),prunedAt:Date.now()};};resetLive(current);
+  // prof: GMGN's label for each wallet seen (tags, trade count and lifetime position on this coin), for the volume-bot reading.
+  const resetLive=mint=>{live={mint,since:Date.now(),first:0,at:0,stat:null,trades:[],keys:new Set(),prunedAt:Date.now(),prof:new Map(),profVer:0,fill:null};};resetLive(current);
+  const putProf=p=>{if(!p)return;const o=live.prof.get(p.wallet);if(o&&o.at>p.at&&(o.tt??0)>=(p.tt??0))return;live.prof.set(p.wallet,p);live.profVer++;};
   // Volume-bot readings per live call (receiver tab only): bot-like share of the first 60s and 120s after the alert,
   // from GMGN's trades for that coin, saved as 'feat.<id>' so the backtest can test them once enough calls have one.
   // complete = the feed was on this coin within 15s of the alert and stayed until the end of the window.
   const packBots=(r,complete)=>({n:r.n,usd:Math.round(r.usd),share:r.botShare==null?null:+r.botShare.toFixed(1),tradeShare:r.botTradeShare==null?null:+r.botTradeShare.toFixed(1),
     wallets:r.wallets,bots:r.botWallets,buyers:r.buyers,buyersNet:Math.round(r.buyersNet),arb:r.arb,suspect:r.suspectShare==null?null:+r.suspectShare.toFixed(1),
-    org:r.orgShare==null?null:+r.orgShare.toFixed(1),orgN:r.orgN,rules:[r.byRule.txWash,r.byRule.fastTrip,r.byRule.churn,r.byRule.micro],complete});
+    org:r.orgShare==null?null:+r.orgShare.toFixed(1),orgN:r.orgN,rules:[r.byRule.txWash,r.byRule.fastTrip,r.byRule.churn,r.byRule.bump],
+    tagRules:[r.byRule.washTag,r.byRule.mev,r.byRule.heavy,r.byRule.lifeChurn,r.byRule.mirror],possible:r.possibleShare==null?null:+r.possibleShare.toFixed(1),app:r.appShare==null?null:+r.appShare.toFixed(1),dust:r.dustShare==null?null:+r.dustShare.toFixed(1),labeled:r.profiled==null?null:Math.round(r.profiled),complete});
   function recordBots(leaving=false){
     if(!GMGN||!isReceiver||!live?.mint)return;
     const now=Date.now();
@@ -1257,7 +1915,7 @@ function start() {
         // window closed: missed. Otherwise save what the feed saw (complete only if it started within 15s of the alert).
         if(!live.first){if(leaving||now-end>30000){f['vb'+sec]={missed:true,complete:false};changed=true;}continue;}
         if(live.first>end){f['vb'+sec]={missed:true,complete:false};changed=true;continue;}
-        const r=VTCore.botFlow(live.trades,c.messageAt,Math.min(end,now));
+        const r=VTCore.botFlow(live.trades,c.messageAt,Math.min(end,now),VTCore.VB,live.prof);
         f['vb'+sec]=packBots(r,live.first<=c.messageAt+15000&&now>=end);changed=true;
       }
       if(!changed)continue;
@@ -1267,6 +1925,37 @@ function start() {
   }
   // Leaving a coin: save what was seen so far (marked incomplete) before its trades are dropped.
   const switchLive=mint=>{try{recordBots(true);}catch(_){}resetLive(mint);};
+  // Opening a coin: the last 5 min of trades from GMGN's trades API (50 per page, newest first, up to 12 pages), with
+  // GMGN's wallet labels, so the volume-bot reading is complete at once instead of after 5 min on screen. The pages
+  // join the live feed without a gap (the feed is already running), so coverage starts at the oldest trade fetched.
+  async function backfillTrades(mint){
+    if(!GMGN||!mint||live.mint!==mint||live.fill||!get('gmOn',true)||Date.now()<gmS.pauseTill)return;
+    live.fill={busy:true,pages:0,from:null};
+    const goal=Date.now()-300000;let cursor=null,oldest=null,ok=false;
+    try{
+      for(let page=0;page<12;page++){
+        const r=await gmGet('/vas/api/mul-region/token_trades_v2/sol/'+mint+'?limit=50'+(cursor?'&cursor='+encodeURIComponent(cursor):''));
+        if(live.mint!==mint)return;
+        if(r.limited){gmS.pauseTill=Date.now()+60000;break;}
+        const list=r.data?.data?.history;if(!Array.isArray(list))break;
+        live.fill.pages++;
+        for(const x of list){
+          putProf(VTCore.gmgnMaker(x));
+          const t=VTCore.gmgnApiTrade(x);if(!t||t.mint&&t.mint!==mint)continue;
+          oldest=Math.min(oldest??t.at,t.at);
+          const key=tradeKey(t);if(key&&live.keys.has(key))continue;
+          if(key)live.keys.add(key);live.trades.push(t);
+        }
+        cursor=r.data?.data?.next||null;
+        if(!list.length||!cursor||oldest!=null&&oldest<=goal){ok=true;break;}
+        await new Promise(res=>setTimeout(res,150));
+      }
+      // Coverage: back to the oldest trade fetched when the pages reached 5 min or ran out (a coin younger than that);
+      // otherwise only the newest page's span is trusted as continuous with the feed.
+      if(oldest!=null){live.fill.from=oldest;live.fill.complete=ok;live.first=Math.min(live.first||Infinity,ok?Math.min(oldest,goal):oldest);}
+    }catch(_){}
+    finally{if(live.mint===mint){live.fill.busy=false;soon();}}
+  }
   const tradeKey=t=>t.hash?t.hash+':'+t.side+':'+t.wallet+':'+t.amount:null;
   const liveFresh=()=>!!live&&live.mint===current&&Date.now()-live.at<20000;
   const liveNow=bots=>live&&live.mint===current?VTCore.liveView(live.trades,live.stat,live.at,Date.now(),live.first||Infinity,bots):null;
@@ -1295,8 +1984,15 @@ function start() {
   $('sound').onchange=()=>set('sound',$('sound').checked);
   $('late-alerts').checked=get('lateAlerts',false);$('late-alerts').onchange=()=>set('lateAlerts',$('late-alerts').checked);
   $('trades').onchange=()=>{set('trades',$('trades').checked);flow=null;flowError='';render();};
+  $('jup-on').checked=get('jupOn',true);$('jup-on').onchange=()=>{set('jupOn',$('jup-on').checked);render();};
+  $('rc-on').checked=get('rcOn',true);$('rc-on').onchange=()=>{set('rcOn',$('rc-on').checked);render();};
+  $('trade-sol').value=get('tradeSol',0.1);$('trade-sol').onchange=()=>{const v=+$('trade-sol').value;if(v>0){set('tradeSol',v);jupS.tried=0;}else $('trade-sol').value=get('tradeSol',0.1);};
+  $('gm-on').checked=get('gmOn',true);$('gm-on').onchange=()=>{set('gmOn',$('gm-on').checked);render();};
   $('market-on').checked=get('marketOn',true);
   $('market-on').onchange=()=>{set('marketOn',$('market-on').checked);marketDisconnect();render();};
+  $('author-row').hidden=!DISCORD;$('author-note').hidden=!DISCORD;
+  const authorNote=()=>{const a=AUTHOR_ID||get('authorId','');if(!a&&get('authorMode','')==='name-only'){$('author-note').textContent='VolTrak sender: its messages carry no account ID, so it is matched by name only (anyone renamed "VolTrak" would pass).';return;}$('author-note').textContent=a?'VolTrak sender: account …'+a.slice(-6)+(AUTHOR_ID?' (set in the script)':' (learned from the channel)')+'. Alerts named VolTrak from any other account are flagged unverified.':'VolTrak sender: not learned yet (needs 3 VolTrak alerts on screen).';};authorNote();
+  $('author-reset').onclick=()=>{set('authorId','');set('authorMode','');authorNote();notice('VolTrak sender will be re-learned from the channel');render();};
   $('census-copy').onclick=()=>{GM_setClipboard(JSON.stringify({version:VERSION,site:location.hostname,...VTLive.census()},null,1),'text');notice('GMGN feed report copied: paste it to Claude');render();};
   $('rpc-key').value=get('rpcKey','')?'••••'+String(get('rpcKey','')).slice(-4):'';
   const maskKey=()=>{const k=String(get('rpcKey','')||'');$('rpc-key').value=k?'••••'+k.slice(-4):'';};
@@ -1309,6 +2005,34 @@ function start() {
   // Public on-chain data only (no key): one transaction, for checking the parser against a new format.
   $('rpc-sample').onclick=()=>{if(rpcSample){GM_setClipboard(JSON.stringify(rpcSample,null,1).slice(0,40000),'text');$('rpc-status').textContent='Sample transaction copied: paste it to Claude.';}};
   $('hb-run').onclick=()=>runBackfill();
+  $('rc-run').onclick=()=>runRugBackfill();
+  $('rug-check').onclick=()=>{if(current)rugBuild(current,callFor(current),(rugLive.get(current)?.tries||0)+1);};
+  // Telegram (optional): the bot token and chat ID stay in this browser's script storage, like the Helius key.
+  $('tg-on').checked=get('tgOn',true);$('tg-on').onchange=()=>set('tgOn',$('tg-on').checked);
+  $('tg-dev').checked=get('tgDev',true);$('tg-dev').onchange=()=>set('tgDev',$('tg-dev').checked);
+  const maskTg=()=>{const k=String(get('tgToken','')||'');$('tg-token').value=k?'••••'+k.slice(-4):'';};maskTg();
+  const tgStatus=t=>{$('tg-status').textContent=t;};
+  $('tg-token').onfocus=()=>{if(/^••••/.test($('tg-token').value))$('tg-token').value='';};
+  $('tg-token').onblur=()=>{if(!$('tg-token').value.trim())maskTg();};
+  $('tg-save').onclick=async()=>{
+    const v=$('tg-token').value.trim();if(!v||/^••••/.test(v)){maskTg();tgStatus('Paste the bot token first.');return;}
+    set('tgToken',v);maskTg();tgStatus('Saved. Checking it…');
+    const r=await tg('getMe');tgStatus(r.ok?'Saved: your bot is @'+r.result.username+'. Send it any message in Telegram, then press Find my chat ID.':'Saved, but Telegram said: '+r.error);
+  };
+  $('tg-find').onclick=async()=>{
+    if(!get('tgToken','')){tgStatus('Save the bot token first.');return;}
+    tgStatus('Looking for your message…');
+    const r=await tg('getUpdates',{limit:50,timeout:0});if(!r.ok){tgStatus('Telegram said: '+r.error);return;}
+    const msg=[...(r.result||[])].reverse().map(u=>u.message||u.edited_message||u.channel_post).find(m=>m?.chat?.id!=null);
+    if(!msg){tgStatus('No messages yet: send your bot any message in Telegram, then press this again.');return;}
+    set('tgChat',String(msg.chat.id));tgStatus('Found your chat'+(msg.chat.username?' (@'+msg.chat.username+')':msg.chat.first_name?' ('+msg.chat.first_name+')':'')+'. Press Send test.');
+  };
+  $('tg-test').onclick=async()=>{
+    if(!tgReady()){tgStatus('Save the token and find your chat ID first.');return;}
+    const r=await tgSend('VolTrak Steroids is connected. New calls and dev sells will ping here.');tgStatus(r.ok?'Test sent: check Telegram.':'Telegram said: '+r.error);
+  };
+  $('tg-remove').onclick=()=>{set('tgToken','');set('tgChat','');maskTg();tgStatus('Telegram removed from this browser.');};
+  if(tgReady())tgStatus('Connected: pings go to your Telegram bot.');
   $('mint-copy').onclick=()=>{if(current){GM_setClipboard(current,'text');notice('Contract copied');render();}};
   // Default round-trip cost 5%: about 1% pump.fun/PumpSwap + 1% GMGN per side, plus priority fee/tip and price impact
   // (roughly 2–3% round trip for 1 SOL on a sub-$50K bonding curve). Saved settings keep whatever was entered.
@@ -1359,38 +2083,57 @@ function start() {
   const lateView=L=>LATE_UI[lateCode(L)]||['dead',String(L.grade)], lateQuiet=L=>['NOTRADES','NOPRICE'].includes(lateCode(L));
   // Setup card. Filters from the first 22 calls (cluster, age, MC) failed on 73 newer calls, so nothing is graded:
   // the card shows how all scored calls did against the break-even win rate (from the last report opened).
-  function renderGrade(){
+  // Grade card (3.9): AVOID / RISKY / CLEAN from the live score (GMGN numbers + chain checks + volume bots), recomputed on
+  // every render. Replaces the old setup grade (its filters from the first 22 calls failed on 73 newer calls). Returns the grade.
+  let lastGrade={mint:null,grade:null};
+  function renderGrade(s,rv){
     const b=get('bt.summary',null), cell=$('grade');
-    cell.className='cell grade '+(b?.n?'few':'none');
-    $('grade-letter').textContent='—';
-    $('grade-text').textContent='No proven setup';
-    $('grade-note').textContent=b?.n?Math.round(b.winRate)+'% won · '+Math.round(b.be)+'% needed':'open a backtest report';
-    cell.title=b?.n?'Your backtest ('+b.n+' calls, +'+b.tp+'%/'+b.sl+'%, '+b.cost+'% costs): '+Math.round(b.winRate)+'% won, average '+(b.ev>=0?'+':'')+b.ev.toFixed(1)+'% per trade; break-even needs '+b.be.toFixed(0)+'%. Filters from the first 22 calls failed on 73 newer calls, so no setup is graded.':'No setup is graded: the filters from the first 22 calls failed on 73 newer calls.';
+    const bt=b?.n?' Your backtest ('+b.n+' calls, +'+b.tp+'%/'+b.sl+'%, '+b.cost+'% costs): '+Math.round(b.winRate)+'% won, average '+(b.ev>=0?'+':'')+b.ev.toFixed(1)+'% per trade; break-even '+b.be.toFixed(0)+'%.':'';
+    const show=(cls,glyph,text,note,title)=>{cell.className='cell grade '+cls;$('grade-letter').textContent=glyph;$('grade-text').textContent=text;$('grade-note').textContent=note;cell.title=title+bt;};
+    if(!s||!s.known){lastGrade={mint:current,grade:null};const busy=rv?.busy||gmS.busy;show(busy?'few':'none',busy?'…':'—',busy?'Checking':'No grade',busy?'loading data':rv?.wait||'no data yet','The grade comes from the checks below.');return null;}
+    const [cls,glyph]={AVOID:['g-avoid','✕'],RISKY:['g-risky','!'],CLEAN:['g-clean','✓'],PARTIAL:['few','?']}[s.grade];
+    const by=s.checks.find(k=>k.key===s.because), why=s.hard[0]||(by?by.label+' '+(rv?.detail?.[by.key]??by.value):'');
+    const sg=v=>(v>0?'+':v<0?'−':'')+Math.abs(v);
+    show(cls,glyph,s.grade==='PARTIAL'?'Partial':s.grade,(s.grade==='PARTIAL'?s.known+' checks so far':'risk '+sg(s.risk)+' · demand '+sg(s.demand)+' · entry '+sg(s.entry))+(why?' · '+why:s.grade==='CLEAN'?' · no red flags':'')+(s.confidence.level!=='high'?' · data '+s.confidence.level:''),
+      [...s.hard,...s.checks.filter(k=>k.status!=='na').map(k=>(k.pts>0?'+':'')+k.pts+'  '+k.label+' '+(rv?.detail?.[k.key]??k.value))].join('\n')+'\n\nAVOID: a hard stop, Risk -4 or less, or Entry -3 or less. RISKY: Risk -1 or less, Demand -2 or less, or Entry -1 or less. Strong demand cannot cancel a risk. Untested points: the backtest’s "Live grade at the call (4.3 rules)" table shows whether they predict outcomes.');
+    if(lastGrade.mint===current&&lastGrade.grade&&lastGrade.grade!==s.grade){cell.classList.remove('flash');void cell.offsetWidth;cell.classList.add('flash');setTimeout(()=>cell.classList.remove('flash'),1200);}
+    lastGrade={mint:current,grade:s.grade};
+    return s.grade==='PARTIAL'?null:s.grade;
   }
   let botCache={key:'',vb:null};
   function renderBots(now){
-    const cell=$('vol-bots'), on=live&&live.mint===current&&live.trades.length>0&&now-live.at<60000;
+    // On while GMGN's feed is live, or once the last 5 min were loaded from GMGN's trades list (a quiet coin).
+    const cell=$('vol-bots'), on=live&&live.mint===current&&live.trades.length>0&&(now-live.at<60000||!!live.fill?.pages&&!live.fill.busy);
     // botFlow pairs trades per wallet; with thousands of trades, recompute at most every 3s and only while the panel is
     // visible. Every view needs it (the collapsed scoreboard shows the organic gauge too), not just the Live tab.
-    const key=on?live.mint+'|'+live.trades.length+'|'+Math.floor(now/3000):'';
-    if(on&&key!==botCache.key&&!root.hidden&&!document.hidden)botCache={key,vb:VTCore.botFlow(live.trades,now-300000,now)};
+    const key=on?live.mint+'|'+live.trades.length+'|'+live.profVer+'|'+Math.floor(now/3000):'';
+    if(on&&key!==botCache.key&&!root.hidden&&!document.hidden)botCache={key,vb:VTCore.botFlow(live.trades,now-300000,now,VTCore.VB,live.prof)};
     const vb=on&&botCache.key.startsWith(live.mint+'|')?botCache.vb:null;
     if(!vb||!vb.n||vb.botShare==null){
       cell.className='cell bots na';$('bots-pct').textContent='—';$('bots-level').textContent='No data';$('bots-level').className='tag';$('bots-bar').style.setProperty('--p','0%');
-      $('bots-org').textContent=on?'no trades in the last 5m':'needs GMGN live trades';cell.title='Volume bots need GMGN’s live trade feed for the coin on screen.';return null;
+      $('bots-org').textContent=live?.fill?.busy?'loading the last 5 min…':on?'no trades in the last 5m':'needs GMGN live trades';cell.title='Volume bots need GMGN’s live trade feed for the coin on screen.';return null;
     }
-    const sh=vb.botShare, lv=sh<15?['low','Low','']:sh<40?['med','Med','warn']:['high','High','bad'], partial=live.first>now-300000;
+    // Headline: bot share of trades (bump bots are most of a bumped coin's trades but almost none of its dollars);
+    // the line under it gives the bot share of dollar volume and the trading-app share. Level = the worse of the two.
+    const sh=vb.botTradeShare??0, vs=vb.botShare??0, lvT=sh<25?0:sh<50?1:2, lvV=vs<15?0:vs<40?1:2, lvl=Math.max(lvT,lvV), lv=[['low','Low',''],['med','Med','warn'],['high','High','bad']][lvl], partial=live.first>now-300000;
     cell.className='cell bots '+lv[0];$('bots-pct').textContent=Math.round(sh)+'%';$('bots-level').textContent=lv[1];$('bots-level').className='tag'+(lv[2]?' '+lv[2]:'');
-    cell.querySelector('.bv .muted').textContent=partial?'of last '+mmss(now-live.first):'of 5m vol';
+    cell.querySelector('.bv .muted').textContent=partial?'of trades · '+mmss(now-live.first):'of 5m trades';
     $('bots-bar').style.setProperty('--p',Math.min(100,sh).toFixed(0)+'%');
-    const org=$('bots-org');org.replaceChildren(node('b','',String(vb.buyers)),' real buyers'+(vb.buyersNet?' · '+(vb.buyersNet>=0?'+':'−')+usd(Math.abs(vb.buyersNet))+' net':''));
-    cell.title='Bot-like = buy+sell in one transaction ('+vb.byRule.txWash+' trades), flat buy-then-sell within 10s ('+vb.byRule.fastTrip+'), churn wallets ('+vb.byRule.churn+'), dust trades ('+vb.byRule.micro+'). '+vb.botWallets+' of '+vb.wallets+' wallets flagged'+(vb.arb?'; '+vb.arb+' arbitrage txs not counted':'')+'. Rough lower bound; untested as a signal.';
+    const org=$('bots-org');org.replaceChildren(node('b','',Math.round(vs)+'%'),' of $ vol',...(vb.appShare!=null?[' · ',node('b','',Math.round(vb.appShare)+'%'),' app']:[]),' · ',node('b','',String(vb.buyers)),' buyers');
+    const R=vb.byRule, U=vb.usdByRule, pc=x=>vb.usd>0?Math.round(100*x/vb.usd)+'%':'0%', line=(lbl,r)=>R[r]?'\n  '+lbl+': '+R[r]+' trades, '+pc(U[r])+' of $':'';
+    cell.title='Bots: '+Math.round(sh)+'% of '+vb.n+' trades and '+Math.round(vs)+'% of $'+Math.round(vb.usd).toLocaleString()+' volume over '+(partial?mmss(now-live.first):'the last 5 min')+', from '+vb.botWallets+' of '+vb.wallets+' wallets.'
+      +line('bump bots (repeated sub-$3 trades)','bump')+line('GMGN wash-trader tag','washTag')+line('GMGN sandwich/MEV tag','mev')+line('buy+sell in one transaction','txWash')+line('flat buy-then-sell within 10s','fastTrip')
+      +(vb.possibleTradeShare?'\nPossible bots, not counted above (real traders can trade like this too): '+Math.round(vb.possibleTradeShare)+'% of trades, '+Math.round(vb.possibleShare||0)+'% of $'
+        +line('100+ trades on this coin, flat position','heavy')+line('25+ trades, flat, no trading app','lifeChurn')+line('mirrored buy/sell across two wallets','mirror')+line('churn, flat in tokens and dollars','churn'):'')
+      +(vb.arb?'\n  '+vb.arb+' arbitrage txs not counted':'')
+      +'\n\nTrading-app volume (axiom, gmgn, photon…, not flagged): '+(vb.appShare==null?'n/a':Math.round(vb.appShare)+'%')+'. '+vb.buyers+' wallets bought $15+ and are net buyers. Trades under $3: '+Math.round(vb.dustShare||0)+'%.'
+      +'\nGMGN wallet labels on '+Math.round(vb.profiled||0)+'% of trades.'+(live.fill?.pages?' Last 5 min loaded from GMGN ('+live.fill.pages+' page'+(live.fill.pages===1?'':'s')+').':'')+' Untested as a signal.';
     return vb;
   }
   function render(){
     const all=calls().slice().sort((a,b)=>b.messageAt-a.messageAt), signature=all.map(c=>c.id).join('|');
-    if(signature!==listSignature){const v=$('call-list').value;$('call-list').replaceChildren(...all.slice(0,100).map(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name+' · '+new Date(c.messageAt).toLocaleTimeString()+(c.historical?' · history':'');return o;}));if(all.some(c=>c.id===v))$('call-list').value=v;listSignature=signature;}
-    renderMarket();renderBt();renderLate();
+    if(signature!==listSignature){const v=$('call-list').value;$('call-list').replaceChildren(...all.slice(0,100).map(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name+' · '+new Date(c.messageAt).toLocaleTimeString()+(c.historical?' · history':'')+(c.unverified?' · unverified sender':'');return o;}));if(all.some(c=>c.id===v))$('call-list').value=v;listSignature=signature;}
+    renderMarket();renderBt();renderLate();renderSpeed();
     const nowAll=Date.now(), active=all.filter(c=>!c.historical&&!c.manual&&nowAll-c.messageAt<30*60000).length;
     $('calls-badge').hidden=!active;$('calls-badge').textContent=active||'';
     $('status').textContent=(Date.now()<noteUntil?note+' · ':'')+status+(hasLocks?'':' · Web Locks unavailable: tab coordination is best effort');
@@ -1448,7 +2191,9 @@ function start() {
     $('split-buy').textContent=dexOnly&&snapshot?'▲ '+snapshot.buys5m+' buys':sw?'▲ '+(sw.buys??'—')+' buys · '+usd(sw.buyUsd):'';
     $('split-sell').textContent=dexOnly&&snapshot?snapshot.sells5m+' sells ▼':sw?usd(sw.sellUsd)+' · '+(sw.sells??'—')+' sells ▼':'';
     $('basis').textContent=a.basis||'no data yet';$('basis').title=a.basis?'Buy share basis: '+a.basis:'';
-    renderGrade();
+    const rv=rugView(c,now), ls=liveScore(rv,vb,now,move);renderChecks(c,now,rv,ls);gmSnapshot(c,ls,now);
+    const grade=renderGrade(ls.score,rv);
+    if(c&&grade)latMark(c.mint,'grade');
     // KPIs.
     const wl=lf||f, part=w=>w.complete?'':'+', last=Lf?.last, lastAt=last?.at??f?.lastTradeAt, cl=c?.clusters?.length?Math.max(...c.clusters):null;
     const kpi=(lbl,val,sub,cls,icon)=>{const d=node('div','kpi'+(cls==='na'?' na':'')),b=node('b',cls&&cls!=='na'?cls:'');if(icon){b.append(node('span','',icon))}b.append(val);d.append(node('span','lbl',lbl),b,typeof sub==='string'?node('small','',sub):sub);return d;};
@@ -1467,7 +2212,7 @@ function start() {
       chips.push(ch);
     }
     $('late-chips').replaceChildren(...chips);
-    $('risks').replaceChildren(...a.risks.map(t=>node('li','risk',t)),...a.flags.map(t=>node('li','',t)));
+    $('risks').replaceChildren(...a.risks.map(t=>node('li','risk',t)),...rugRisks(now).map(t=>node('li','risk',t)),...(ls.ex.coordinated?[node('li','risk','Insiders leaving together: '+ls.ex.wallets+' wallet'+(ls.ex.wallets===1?'':'s')+' sold '+pctS(ls.ex.pct)+' of supply in 2 min ('+ls.ex.roles.join(', ')+')')]:[]),...a.flags.map(t=>node('li','',t)));
     // Flow table: 1m and 5m from the best live source.
     const m5=[st?.m5,lf?.m5].find(has)||null, cells=[];
     const add=(cls,t,plus)=>{const e=node('span',cls,t);if(plus)e.append(node('sup','','+'));cells.push(e);};
@@ -1491,7 +2236,7 @@ function start() {
     listText($('reasons'),[...a.reasons,...(vb?['Volume bots: '+Math.round(vb.botShare)+'% of '+(live.first>now-300000?'recent':'5m')+' $ volume from '+vb.botWallets+' flagged wallets (rough lower bound; untested as a signal)']:[])]);
     $('missing').textContent=a.missing.length?'Missing: '+a.missing.join(' · '):'';
     // Collapsed scoreboard.
-    $('mini-state').textContent=short;$('mini-sym').textContent=c?.symbol?'$'+c.symbol:current?current.slice(0,4)+'…':'';
+    $('mini-state').textContent=short;$('mini-sym').textContent=(grade?grade+' · ':'')+(c?.symbol?'$'+c.symbol:current?current.slice(0,4)+'…':'');
     $('mini-share').replaceChildren(...(share==null?['—',node('small','','no data')]:[Math.round(share)+'%',node('small','','buys')]));
     $('mini-since').textContent=c?sinceText(now-c.messageAt):'—';
     const mb=$('mini-bar');mb.classList.toggle('empty',share==null);if(share!=null)mb.style.setProperty('--p',share.toFixed(0)+'%');
@@ -1596,17 +2341,19 @@ function start() {
     const cs=VTCore.mergeCandles(lists).filter(k=>k.t>=c.messageAt-BT_PRE*60000&&k.t<=c.messageAt+BT_H*60000);
     if(!cs.length)return 'no-trades';
     const sig=x=>+x.toPrecision(6);
-    set('bt.c.'+c.id,cs.map(k=>[k.t/1000,sig(k.o),sig(k.h),sig(k.l),sig(k.c),sig(k.v)]));
+    set('bt.c.'+c.id,cs.map(k=>[k.t/1000,sig(k.o),sig(k.h),sig(k.l),sig(k.c),sig(k.v)]));set('bt.f.'+c.id,Date.now());
     const pre=get('bt.pre',{});pre[c.id]=1;set('bt.pre',pre);
     return 'ok';
   }
-  const btCandidates=()=>calls().filter(c=>!c.manual&&VTCore.MINT.test(c.mint)&&Number.isFinite(c.messageAt));
+  // Unverified-sender calls are kept in the list but left out of every automatic path (backtest, checks, pings).
+  const btCandidates=()=>calls().filter(c=>!c.manual&&!c.unverified&&VTCore.MINT.test(c.mint)&&Number.isFinite(c.messageAt));
   const upgradeable=()=>{const done=get('bt.done',{}), pre=get('bt.pre',{});return btCandidates().filter(c=>done[c.id]==='ok'&&!(c.id in pre));};
   function renderBt(){
     const done=get('bt.done',{}), all=btCandidates(), ok=all.filter(c=>done[c.id]==='ok').length, none=all.filter(c=>done[c.id]&&done[c.id]!=='ok').length;
     const young=all.filter(c=>!done[c.id]&&Date.now()-c.messageAt<=(BT_H+5)*60000).length, left=all.length-ok-none-young;
     const oldest=all.reduce((m,c)=>Math.min(m,c.messageAt),Infinity), when=t=>new Date(t).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
     $('bt-run').textContent=btRunning?'Stop':'Score calls';$('hb-run').textContent=hbRunning?'Stop adding volume bots':'Add volume bots to past calls (Helius)';$('bt-history').textContent=histRunning?'Stop loading':'Load channel history';
+    $('rc-run').textContent=rcRunning?'Stop adding rug checks':'Add rug checks to past calls (Helius)';
     $('history-row').hidden=!DISCORD;
     // Progress bar: scored / no price data / waiting / too recent.
     const parts=[['ok',ok,'scored'],['none',none,'no price data'],['left',left,'waiting'],['young',young,'too recent']].filter(x=>x[1]>0);
@@ -1618,7 +2365,7 @@ function start() {
     $('bt-help').textContent=DISCORD?'1) Load channel history: scrolls the VolTrak channel back for you and saves every alert. 2) Score calls: fetches 2h of 1m prices per call from GeckoTerminal (about 7–10s per call; slows down automatically if GeckoTerminal rate-limits; you can stop and resume). 3) Open report.'
       :'Open the VolTrak channel in Discord and press "Load channel history" there first. Then score calls (about 7–10s per call; stop and resume any time).';
     const up=btRunning?0:upgradeable().length;
-    $('bt-status').textContent=[histNote,btNote,hbNote].filter(Boolean).join(' · ')+(histNote||btNote||hbNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+'. Calls under '+(BT_H+5)+' min old wait until their 2h window is complete.'
+    $('bt-status').textContent=[histNote,btNote,hbNote,rcNote].filter(Boolean).join(' · ')+(histNote||btNote||hbNote||rcNote?' · ':'')+all.length+' saved calls'+(all.length?' (oldest '+when(oldest)+')':'')+'. Calls under '+(BT_H+5)+' min old wait until their 2h window is complete.'
       +(up?' '+up+' older scored call'+(up===1?'':'s')+' will be refetched once on the next "Score calls" to add '+BT_PRE+' min of pre-alert prices (run-up split).':'');
   }
   // Discord: load older messages by scrolling the channel to the top until Discord stops loading more.
@@ -1663,11 +2410,12 @@ function start() {
   }
   // Late checks: 10 and 30 min after each live alert, read DEX Screener once and grade the call (VTCore.lateGrade).
   // The base price is DEX Screener's own market cap in the first 3 min after the alert (else the alert's MC). Discord
-  // tabs and the GMGN receiver all run this; the lock and the stored results keep it to one request per check.
+  // tabs and the GMGN receiver can both run this, but Web Locks do not reach across sites, so there is one writer: the
+  // GMGN receiver while it is alive, else Discord. The write merges per call into the latest stored copy.
   let lateBusy=false;
   async function lateChecks(){
-    if(lateBusy||GMGN&&!isReceiver)return;
-    const last=LATE_AT[LATE_AT.length-1], recent=()=>calls().filter(c=>!c.historical&&!c.manual&&Date.now()-c.messageAt<(last+6)*60000);
+    if(lateBusy||GMGN&&!isReceiver||DISCORD&&receiverAlive(receiver()))return;
+    const last=LATE_AT[LATE_AT.length-1], recent=()=>calls().filter(c=>!c.historical&&!c.manual&&!c.unverified&&Date.now()-c.messageAt<(last+6)*60000);
     if(!recent().length)return;
     lateBusy=true;
     try{await locked('late',async()=>{
@@ -1698,7 +2446,7 @@ function start() {
           }
         }
       }
-      set('late',late);
+      {const cur=get('late',{});for(const c of list)if(late[c.id])cur[c.id]=late[c.id];for(const [id,L] of Object.entries(cur))if(now-L.t>48*3600000)delete cur[id];set('late',cur);}
       if(!get('lateAlerts',false))return;
       for(const [c,d,change] of fresh){
         GM_notification({title:'VolTrak +'+d+' min · '+c.name,text:'Still above the call price ('+(change>=0?'+':'')+change.toFixed(0)+'%) and trading. Not a buy signal: see the backtest report. Click to open on GMGN.',timeout:15000,
@@ -1739,21 +2487,25 @@ function start() {
       onerror:()=>resolve({status:0,error:'network error'}),ontimeout:()=>resolve({status:0,error:'timeout'})}));
   }
   let rpcSample=null;
+  // getTransactionsForAddress result → transactions. Items are {transaction, meta, blockTime, slot}; some providers
+  // nest them one level deeper.
+  const txList=res=>(Array.isArray(res)?res:Array.isArray(res?.data)?res.data:Array.isArray(res?.transactions)?res.transactions:[])
+    .map(x=>x?.meta?x:x?.transaction?.meta?{...x.transaction,blockTime:x.transaction.blockTime??x.blockTime,slot:x.transaction.slot??x.slot}:x);
+  // from = null: from the address's first transaction.
   async function txWindow(mint,from,to,maxPages=40){
     const txs=[];let token=null,pages=0;
     do{
       // Solana now has version-1 transactions; the RPC refuses to return them unless asked. If it names a newer
       // version in its error, retry once with that and remember it.
-      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:get('rpcTxVersion',1),filters:{blockTime:{gte:from,lte:to},status:'succeeded'}};
+      const opt={transactionDetails:'full',sortOrder:'asc',limit:100,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:get('rpcTxVersion',1),filters:{blockTime:from==null?{lte:to}:{gte:from,lte:to},status:'succeeded'}};
       if(token)opt.paginationToken=token;
       let r=await rpcCall('getTransactionsForAddress',[mint,opt]);
       const want=+(String(r.error||'').match(/maxSupportedTransactionVersion\W+(\d+)/)?.[1]);
       if(Number.isFinite(want)&&want>opt.maxSupportedTransactionVersion&&want<10){set('rpcTxVersion',want);opt.maxSupportedTransactionVersion=want;r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
       if(r.status===429){await sleep(2500);r=await rpcCall('getTransactionsForAddress',[mint,opt]);}
       if(r.error)return {txs,pages,error:r.error,truncated:true};
-      const res=r.data?.result, list=Array.isArray(res)?res:Array.isArray(res?.data)?res.data:Array.isArray(res?.transactions)?res.transactions:[];
-      // Items are {transaction, meta, blockTime}; some providers nest them one level deeper.
-      txs.push(...list.map(x=>x?.meta?x:x?.transaction?.meta?{...x.transaction,blockTime:x.transaction.blockTime??x.blockTime}:x));
+      const res=r.data?.result;
+      txs.push(...txList(res));
       if(!rpcSample&&txs.length)rpcSample=txs.find(t=>t?.meta&&!t.meta.err)||txs[0];
       token=res?.paginationToken||null;pages++;await sleep(120);
     }while(token&&pages<maxPages);
@@ -1802,28 +2554,636 @@ function start() {
       hbNote=hbStop?'Volume bots: stopped; run again to continue':'Volume bots added: open the report';
     }finally{hbRunning=false;hbStop=false;renderBt();}
   }
+  // ---- Rug checks (3.8): dev wallet, top 10 holders, launch-block wallets and the dev's funder ----
+  // Built from the coin's own chain history (Helius getTransactionsForAddress, oldest first), then kept live on the GMGN
+  // tab from GMGN's trade feed plus chain catch-ups. The rules are the Rugikk article's and untested: each call's values
+  // at the alert are saved ('rug.<id>') so the backtest can test them. The live state and the saved record come from
+  // the same scan, so they always match.
+  // RUG_LAG: history read 3s after the alert (current-state reads start at once, see rugQuick). The at-call record is
+  // saved once a transaction after the alert has been seen, or 20s after the alert (indexing has caught up by then).
+  const RUG_LAG=3000, RUG_SAVE_AFTER=20000, RUG_PAGES=25, RUG_LIVE_MS=2*3600000, RUG_SALE_MS=10*60000;
+  const rugLive=new Map(); // mint → {mint, call, S, prog, checked, status, err, at, startedAt, building, catching, lastCatch, tries, alerted…}
+  let rugIdx=null, rugBusy=false, rcRunning=false, rcStop=false, rcNote='', rugRankCache={mint:null,ver:-1,rk:null,launch:null};
+  const pctS=v=>v==null?'—':(v<1?v.toFixed(2):v<10?v.toFixed(1):v.toFixed(0))+'%', r2=v=>v==null?null:Math.round(v*100)/100;
+  function callFor(mint){let best=null;for(const c of calls())if(c.mint===mint&&(!best||c.messageAt>best.messageAt))best=c;return best;}
+  // The wallet that first sent SOL to the dev, from the dev wallet's earliest transactions.
+  async function funderLookup(wallet,sec){
+    if(!wallet)return null;
+    const opt={transactionDetails:'full',sortOrder:'asc',limit:25,commitment:'confirmed',encoding:'jsonParsed',maxSupportedTransactionVersion:get('rpcTxVersion',1),filters:{status:'succeeded'}};
+    if(sec!=null)opt.filters.blockTime={lte:sec};
+    const r=await rpcCall('getTransactionsForAddress',[wallet,opt]);
+    return r.error?{error:r.error}:VTCore.funderOf(txList(r.data?.result),wallet)||{funder:null};
+  }
+  // Which large holders are program accounts (bonding curve, AMM pool, lockers): those stay out of the top 10.
+  async function rugPrograms(L,more=[]){
+    const want=[...new Set([...L.S.atCall.holders,...VTCore.rugRanked(L.S,30)].map(h=>h[0]).concat(more))].filter(o=>o&&!L.checked.has(o)).slice(0,100);
+    if(!want.length)return;
+    const r=await rpcCall('getMultipleAccounts',[want,{encoding:'base64',dataSlice:{offset:0,length:0},commitment:'confirmed'}]), v=r.data?.result?.value;
+    if(r.error||!Array.isArray(v)){L.progErr=r.error||'no result';return;}
+    want.forEach((o,i)=>{L.checked.add(o);if(v[i]&&v[i].owner!==VTCore.SYSTEM_PROGRAM)L.prog.add(o);});
+    L.progErr=null;
+  }
+  // Verified holders (4.1): the chain's own supply, largest token accounts (with owners) and the dev's token accounts.
+  // A plain token Transfer never names the mint, so the mint's history can miss it; this is the check on the rebuild.
+  // quick: no history yet (rugQuick): holders and supply only, no dev balance, no rebuild comparison.
+  async function rugVerifyNow(L,quick=false){
+    const S=L.S, startedAt=Date.now();
+    L.verTried=startedAt;
+    try{
+      const [sup,big,dv]=await Promise.all([rpcCall('getTokenSupply',[L.mint,{commitment:'confirmed'}]),rpcCall('getTokenLargestAccounts',[L.mint,{commitment:'confirmed'}]),
+        S.creator&&!quick?rpcCall('getTokenAccountsByOwner',[S.creator,{mint:L.mint},{encoding:'jsonParsed',commitment:'confirmed'}]):Promise.resolve({})]);
+      const supply=+sup.data?.result?.value?.uiAmountString, accts=big.data?.result?.value;
+      if(sup.error||big.error||!(supply>0)||!Array.isArray(accts)){L.verifyErr=sup.error||big.error||'no result';return;}
+      const own=accts.length?await rpcCall('getMultipleAccounts',[accts.map(a=>a.address),{encoding:'jsonParsed',commitment:'confirmed'}]):{data:{result:{value:[]}}}, vals=own.data?.result?.value;
+      if(own.error||!Array.isArray(vals)){L.verifyErr=own.error||'no owners';return;}
+      const list=accts.map((a,i)=>({acct:a.address,owner:vals[i]?.data?.parsed?.info?.owner,amt:+a.uiAmountString})).filter(x=>x.owner&&x.amt>=0);
+      const v=VTCore.rugVerify(S,list,supply);if(!v){L.verifyErr='no holders';return;}
+      await rugPrograms(L,v.ranked.map(x=>x[0]));
+      const dl=dv?.data?.result?.value, devAmt=Array.isArray(dl)?dl.reduce((t,x)=>t+(+x.account?.data?.parsed?.info?.tokenAmount?.uiAmountString||0),0):null;
+      // startedAt/slot: what the balances include (sales after them come off); diff: the latest rebuild gap.
+      const slot=dv?.data?.result?.context?.slot??big.data?.result?.context?.slot??null;
+      L.ver={...v,diff:quick?null:v.diff,at:Date.now(),startedAt,slot,devPct:devAmt==null||quick?null:100*devAmt/supply};L.verifyErr=null;
+      if(!quick&&L.firstGap==null)L.firstGap=v.diff;
+    }catch(e){L.verifyErr=String(e?.message||e).slice(0,100);}
+  }
+  // A dev outflow: a sale when tokens went to the curve/pool (a program account) or came from GMGN's sell feed; a
+  // transfer when every recipient is a checked ordinary wallet; otherwise "sold or moved".
+  // Creator check for a chain state: the mint's initialisation, plus GMGN's creator when GMGN names one.
+  const creatorOf=L=>VTCore.creatorCheck(L?.S,gmS.mint===L?.mint?gmS.G?.creator:null);
+  const creatorOk=L=>VTCore.creatorUsable(creatorOf(L));
+  function devKind(L,ev){
+    if(ev.kind==='sale'||ev.to?.some(o=>L.prog.has(o)))return 'sale';
+    return ev.to?.length&&ev.to.every(o=>L.checked.has(o)&&!L.prog.has(o))?'transfer':'out';
+  }
+  const DEV_VERB={sale:'sold',transfer:'moved',out:'sold or moved'};
+  function noteDevWallets(L,evs){for(const ev of evs)if(devKind(L,ev)==='transfer'){L.devWallets=L.devWallets||new Set();for(const w of ev.to)L.devWallets.add(w);}}
+  // Saved check: the values at the alert only (no lookahead), for the backtest and the Telegram ping.
+  // holders: 'verified' (history complete and the rebuild matched the chain's own holders when compared), 'unchecked'
+  // (never compared: e.g. history cut short) or 'mismatch' (dropped). creator: 'confirmed' | 'payer' | 'conflict' | 'none';
+  // dev, launch-block and funder figures only for a usable creator. The report's tables use verified holders only.
+  const HOLDER_GAP_MAX=VTCore.HOLDER_GAP_MAX;
+  function rugRecord(call,L){
+    const S=L.S, a=S.atCall, ok=!!L.atCallOk, f=L.funder, gap=L.firstGap??null, holders=VTCore.holderTrust(ok&&L.complete!==false,gap), cc=creatorOf(L), cOk=VTCore.creatorUsable(cc);
+    const keep=ok&&holders!=='mismatch';
+    return {v:3,done:true,t:call.messageAt,at:Date.now(),creator:S.creator,creatorCheck:cc,creatorVerified:cOk,createdAt:S.createSec!=null?S.createSec*1000:null,funder:cOk?f?.funder||null:null,funderSol:cOk?r2(f?.sol??null):null,
+      top10:keep&&!L.progErr?r2(VTCore.rugTop(a.holders,S.supply,L.prog)):null,devPct:keep&&cOk?r2(a.devPct):null,devSold:keep&&cOk?a.devSold:null,devBuyPct:cOk?r2(S.devBuy):null,
+      launchBuyers:cOk?S.launch.size:null,launchPct:cOk?r2(a.launch.bought):null,complete:ok,holders,holderGap:gap==null?null:r2(gap),txs:S.txs,pages:L.pages};
+  }
+  function saveRug(call,rec){
+    set('rug.'+call.id,rec);
+    if(!rec.done)return;
+    const ids=get('rugIds',[]);
+    if(!ids.includes(call.id)){ids.unshift(call.id);for(const old of ids.splice(2000))GM_deleteValue(PREFIX+'rug.'+old);set('rugIds',ids);}
+    rugIdx=null;tgUpdate(call);
+  }
+  // Earlier calls (by alert time) whose saved check has the same dev or the same funder.
+  // Built from the stored records themselves (not the id list), so a record saved by another site is never missed.
+  function rugIndex(){
+    if(rugIdx)return rugIdx;
+    const ids=typeof GM_listValues==='function'?GM_listValues().filter(k=>k.startsWith(PREFIX+'rug.')).map(k=>k.slice(PREFIX.length+4)):get('rugIds',[]);
+    rugIdx=[];for(const id of ids){const r=get('rug.'+id,null);if(r?.done&&!r.empty&&r.creatorVerified!==false&&r.creatorCheck!=='conflict')rugIdx.push({id,t:r.t,creator:r.creator,funder:r.funder});}
+    return rugIdx;
+  }
+  function rugSeen(id,t,creator,funder){
+    let dev=0,fund=0;
+    for(const x of rugIndex()){if(x.id===id||!(x.t<t))continue;if(creator&&x.creator===creator)dev++;if(funder&&x.funder===funder)fund++;}
+    return {dev,fund};
+  }
+  // At-call check without a live state (background calls, backfill): history up to the alert only.
+  // At-call check without a live state (background calls, backfill): the history to now (the at-call snapshot is taken
+  // on the way), then the rebuild is compared with the chain's own holders, so saved holder figures are verified or
+  // marked unchecked. A coin with more history than RUG_PAGES pages stays unchecked (the at-call snapshot is still exact
+  // if the pages got past the alert).
+  async function rugCheck(c){
+    const w=await txWindow(c.mint,null,Math.floor(Date.now()/1000),RUG_PAGES);
+    if(w.error)return {err:w.error};
+    const S=VTCore.rugScan(w.txs,c.mint,c.messageAt);
+    if(!S.creator)return {v:3,done:true,empty:true,t:c.messageAt,at:Date.now(),complete:false,holders:'unchecked',pages:w.pages};
+    const L={mint:c.mint,S,prog:new Set(),checked:new Set(),complete:!w.truncated,atCallOk:!w.truncated||S.crossed,pages:w.pages};
+    await rugPrograms(L);
+    if(L.complete)await rugVerifyNow(L);
+    L.funder=S.verified?await funderLookup(S.creator,S.createSec):null;
+    return rugRecord(c,L);
+  }
+  // Live state for a coin on this GMGN tab: full history to now (the at-call snapshot is taken on the way), then GMGN's
+  // feed and chain catch-ups keep it current.
+  async function rugBuild(mint,call,tries=0){
+    if(!rpcUrl()||rugLive.get(mint)?.building)return;
+    const Q=rugQuickMap.get(mint), L={mint,call:call||null,S:null,prog:new Set(Q?.prog||[]),checked:new Set(Q?.checked||[]),status:'checking',at:Date.now(),startedAt:Date.now(),building:true,lastCatch:0,tries,alerted:{},noted:{}};
+    rugLive.set(mint,L);soon();
+    try{
+      const w=await txWindow(mint,null,Math.floor(Date.now()/1000),RUG_PAGES);
+      if(w.error){L.status='error';L.err=w.error;return;}
+      const S=VTCore.rugScan(w.txs,mint,call?call.messageAt:Date.now());
+      if(!S.creator){L.status='error';L.err='no transactions found for this coin yet';return;}
+      // A busy coin stops after RUG_PAGES pages: the at-call snapshot is still exact if the fetch got past the alert,
+      // but the live holder state is not (dev sells from GMGN's feed still show).
+      L.S=S;L.complete=!w.truncated;L.atCallOk=!w.truncated||S.crossed;L.pages=w.pages;
+      await rugPrograms(L,S.devSales.flatMap(e=>e.to||[]));
+      // Check the rebuild against the chain's own holders before anything is saved or scored.
+      await rugVerifyNow(L);
+      L.funder=S.verified?await funderLookup(S.creator,S.createSec):null;
+      noteDevWallets(L,S.devSales);
+      // Trades already seen on this tab that are newer than the chain read (older ones are in it; the signature check
+      // catches the rest, e.g. trades loaded from GMGN's trades list).
+      if(live?.mint===mint)for(const t of live.trades)if(t.at>=(S.lastSec??0)*1000)rugFeed(L,t);
+      L.status='ok';L.at=Date.now();L.lastCatch=Date.now();
+      for(const ev of S.devSales)devAlert(L,ev);
+      latMark(mint,'chain');
+      if(call&&!call.manual&&!call.unverified&&!get('rug.'+call.id,null)?.done){if(S.crossed||Date.now()-call.messageAt>RUG_SAVE_AFTER)saveRug(call,rugRecord(call,L));else L.pendingSave=true;}
+    }catch(e){L.status='error';L.err=String(e?.message||e).slice(0,120);}
+    finally{L.building=false;soon();}
+  }
+  // Current state at once (no history needed): the chain's own largest holders and supply, for a provisional top 10.
+  const rugQuickMap=new Map();
+  async function rugQuick(mint){
+    if(rugQuickMap.has(mint))return;
+    const Q={mint,S:VTCore.rugState(mint),prog:new Set(),checked:new Set(),startedAt:Date.now()};Q.S.atCall={holders:[]};rugQuickMap.set(mint,Q);
+    await rugVerifyNow(Q,true);
+    if(Q.ver)latMark(mint,'chainQuick');
+    soon();
+  }
+  // GMGN tab: check the call on screen as soon as the chain has it; retry a failed check up to 3 times.
+  function rugAuto(){
+    if(!GMGN||!current||!rpcUrl())return;
+    const L=rugLive.get(current), c=callFor(current);
+    if(!L&&c&&!c.historical&&!c.manual&&!c.unverified)rugQuick(current);
+    if(L){if(L.status==='error'&&!L.building&&L.tries<2&&Date.now()-L.at>20000)rugBuild(current,L.call,L.tries+1);return;}
+    if(!c||!c.historical&&!c.manual&&Date.now()-c.messageAt<RUG_LAG)return;
+    rugBuild(current,c);
+  }
+  async function rugCatchUp(L){
+    L.catching=true;
+    try{
+      const w=await txWindow(L.mint,L.S.lastSec,Math.floor(Date.now()/1000),5);
+      // More than 500 new transactions: carry on from where this stopped on the next tick.
+      if(w.error&&!w.txs.length){L.catchErr=w.error;return;}
+      L.lastCatch=w.truncated?0:Date.now();L.catchOk=Date.now();
+      L.catchErr=null;
+      const evs=VTCore.rugCatch(L.S,w.txs);
+      await rugPrograms(L,evs.flatMap(e=>e.to||[]));noteDevWallets(L,evs);
+      for(const ev of evs)devAlert(L,ev);
+      await rugVerifyNow(L);
+      // At-call record held back until indexing caught up past the alert.
+      if(L.pendingSave&&L.call&&(L.S.crossed||Date.now()-L.call.messageAt>RUG_SAVE_AFTER)){L.pendingSave=false;L.atCallOk=L.complete||L.S.crossed;if(!get('rug.'+L.call.id,null)?.done)saveRug(L.call,rugRecord(L.call,L));}
+    }finally{L.catching=false;soon();}
+  }
+  // GMGN's feed carries every trade while it is connected; the chain catch-up adds transfers and fixes drift every 2 min,
+  // or every 20s when the feed is quiet or disconnected. Only for a complete state, for 2h after the check.
+  function rugCatchTick(){
+    const L=current&&rugLive.get(current);
+    if(!L?.S||L.status!=='ok'||L.catching||!rpcUrl()||document.hidden||Date.now()-L.startedAt>RUG_LIVE_MS)return;
+    // History cut short (busy coin): no rebuild to catch up, but the chain's own figures are re-read every minute.
+    if(!L.complete){if(!L.verifying&&Date.now()-(L.verTried||0)>60000){L.verifying=true;rugVerifyNow(L).finally(()=>{L.verifying=false;soon();});}return;}
+    // A held-back at-call record gets a catch-up as soon as the 20s have passed.
+    const due=L.pendingSave&&L.call&&Date.now()-L.call.messageAt>RUG_SAVE_AFTER&&Date.now()-L.lastCatch>5000;
+    if(!due&&Date.now()-L.lastCatch<(Date.now()-VTLive.lastFrame()<15000?120000:20000))return;
+    rugCatchUp(L);
+  }
+  function rugFeed(L,t){
+    if(!L?.S||!t)return null;
+    return VTCore.rugTrade(L.S,{wallet:t.wallet,side:t.side,tokens:VTCore.tradeTokens(t),hash:t.hash,at:t.at});
+  }
+  // A dev sale after the call (or after a manual check started), seen within the last 10 min: flash, notify, Telegram.
+  // Notifications: the first sale, the moment the dev is out, and at most one a minute in between.
+  function devAlert(L,ev){
+    const S=L.S, key=ev.sig||String(ev.at);
+    if(!ev||L.alerted[key]||!creatorOk(L))return;
+    L.alerted[key]=1;
+    const since=L.call&&!L.call.historical&&!L.call.manual?L.call.messageAt:L.startedAt;
+    if(!(ev.at>=since-1000)||Date.now()-ev.at>RUG_SALE_MS)return;
+    const left=L.complete?100*Math.max(0,VTCore.rugHolding(S,S.creator))/S.supply:null, out=left!=null&&left<VTCore.RUG.outFrac*100, kind=devKind(L,ev);
+    const name=L.call?.name||L.mint.slice(0,4)+'…'+L.mint.slice(-4);
+    const text='Dev '+DEV_VERB[kind]+' '+pctS(100*ev.amt/S.supply)+' of supply'+(kind==='transfer'?' to wallet …'+ev.to[0].slice(-4):'')+(left==null?'':out?'. The dev wallet is empty.':', '+pctS(left)+' left');
+    if(L.mint===current)flash();
+    const now=Date.now(), first=!L.noted.first, outNow=out&&!L.noted.out;
+    if(!first&&!outNow&&now-(L.noted.at||0)<60000)return;
+    L.noted.first=1;if(out)L.noted.out=1;L.noted.at=now;
+    GM_notification({title:(kind==='transfer'?'Dev moving tokens · ':'Dev selling · ')+name,text,timeout:10000});
+    if(L.call&&get('tgDev',true)&&tgReady()&&(first||outNow))tgSend((kind==='transfer'?'Dev moving tokens: ':'Dev selling: ')+name+'\n'+text+'\n'+VTCore.gmgnURL(L.mint));
+  }
+  // Background checks for live calls that are not on a GMGN screen. One runner: the GMGN receiver when there is one,
+  // else a Discord tab. The GMGN tab checks the coin on its own screen itself (rugBuild).
+  const rugDue=(r,now)=>!r||(!r.done&&(r.pending?now-r.pending>90000:(r.tries||0)<3&&now-(r.failedAt||0)>30000));
+  async function rugTick(){
+    if(rugBusy||!rpcUrl()||rcRunning)return;
+    if(GMGN?!isReceiver:receiverAlive(receiver()))return;
+    const now=Date.now(), due=calls().filter(c=>!c.historical&&!c.manual&&!c.unverified&&now-c.messageAt>=RUG_LAG&&now-c.messageAt<15*60000&&!(GMGN&&c.mint===current)&&rugDue(get('rug.'+c.id,null),now));
+    if(!due.length)return;
+    const c=due.sort((a,b)=>b.messageAt-a.messageAt)[0], prev=get('rug.'+c.id,null);
+    rugBusy=true;
+    try{
+      set('rug.'+c.id,{pending:now,tries:prev?.tries||0});
+      const r=await rugCheck(c);
+      if(r.err)set('rug.'+c.id,{failedAt:Date.now(),tries:(prev?.tries||0)+1,err:r.err});else saveRug(c,r);
+    }catch(e){set('rug.'+c.id,{failedAt:Date.now(),tries:(prev?.tries||0)+1,err:String(e?.message||e).slice(0,120)});}
+    finally{rugBusy=false;}
+  }
+  async function runRugBackfill(){
+    if(rcRunning){rcStop=true;rcNote='Stopping…';renderBt();return;}
+    if(!rpcUrl()){rcNote='Add a Helius key in Settings first';renderBt();return;}
+    rcRunning=true;rcStop=false;
+    try{
+      const done=get('bt.done',{}), todo=btCandidates().filter(c=>done[c.id]==='ok'&&!(get('rug.'+c.id,null)?.v>=3)).sort((a,b)=>b.messageAt-a.messageAt);
+      if(!todo.length){rcNote=btCandidates().some(c=>done[c.id]==='ok')?'Rug checks: every scored call already has one':'Score calls first: rug checks are added to scored calls';return;}
+      for(let i=0;i<todo.length&&!rcStop;i++){
+        rcNote='Rug checks: '+(i+1)+' of '+todo.length;renderBt();
+        const r=await rugCheck(todo[i]);
+        if(r.err){rcNote='Helius error on '+todo[i].name+': '+r.err+' (stopped; run again to retry)';return;}
+        saveRug(todo[i],r);
+      }
+      rcNote=rcStop?'Rug checks: stopped; run again to continue':'Rug checks added: open the report';
+    }finally{rcRunning=false;rcStop=false;renderBt();}
+  }
+  // Recent dev sales on the coin on screen, as RISK lines.
+  function rugRisks(now){
+    const L=current&&rugLive.get(current), S=L?.S;
+    if(!S||!creatorOk(L)||!S.devSales.length)return [];
+    const last=S.devSales[S.devSales.length-1];
+    if(!(now-(last.at||0)<RUG_SALE_MS))return [];
+    const total=100*S.devSales.reduce((t,x)=>t+x.amt,0)/S.supply, left=L.complete?100*Math.max(0,VTCore.rugHolding(S,S.creator))/S.supply:null;
+    const kinds=new Set(S.devSales.map(e=>devKind(L,e))), verb=kinds.size===1?DEV_VERB[[...kinds][0]]:'sold or moved';
+    return ['Dev '+verb+' '+pctS(total)+' of supply'+(S.devSales.length>1?' in '+S.devSales.length+' transactions':'')+' · last '+sinceText(now-last.at).slice(1)+' ago'+(left==null?'':left<VTCore.RUG.outFrac*100?' · dev wallet empty':' · '+pctS(left)+' left')];
+  }
+  // Chain checks for the coin on screen → {gradeIn, detail} for the score, or {wait, busy} while not ready. No DOM.
+  function rugView(c,now){
+    const L=rugLive.get(current), isCall=!!c&&!c.manual;
+    if(!rpcUrl())return {wait:'add a Helius key for chain checks',noKey:true};
+    const Q=rugQuickMap.get(current), qTop=Q?.ver&&now-Q.ver.at<=300000&&!Q.progErr?VTCore.rugTop(Q.ver.ranked,Q.ver.supply,Q.prog):null;
+    if(!L?.S&&qTop!=null){
+      const base={detail:{top10:'≈'+pctS(qTop)+' (chain, provisional)'},titles:{top10:'Read from the chain’s 20 largest accounts at once; the full check (dev, launch block, funder) follows.'},src:'chain provisional',
+        gradeIn:{top10:qTop,top10Approx:true},quick:true};
+      if(L?.status==='checking')return {...base,busy:true,wait:'reading the history '+Math.round((now-L.startedAt)/1000)+'s'};
+      if(!L)return {...base,busy:true,wait:'history in '+Math.max(0,Math.ceil((RUG_LAG-(now-(callFor(current)?.messageAt||now)))/1000))+'s'};
+    }
+    if(!L?.S){
+      if(L?.status==='checking')return {busy:true,wait:'reading the chain '+Math.round((now-L.startedAt)/1000)+'s'};
+      if(L?.status==='error')return {wait:'chain check failed: '+L.err+(L.tries<2?' · retrying':''),retry:L.tries>=2};
+      if(c&&!c.historical&&!c.manual&&now-c.messageAt<RUG_LAG)return {busy:true,wait:'chain check in '+Math.ceil((RUG_LAG-(now-c.messageAt))/1000)+'s'};
+      if(c)return {busy:true,wait:'starting the chain check'};
+      return {wait:'not a VolTrak call',manual:true};
+    }
+    const S=L.S, sup=L.ver?.supply||S.supply, a=S.atCall, cc=creatorOf(L), cOk=VTCore.creatorUsable(cc);
+    if(rugRankCache.mint!==current||rugRankCache.ver!==S.ver)rugRankCache={mint:current,ver:S.ver,rk:VTCore.rugRanked(S,40),launch:VTCore.rugLaunch(S)};
+    // Three separate states: fetched (L.complete), verified (the chain's own figures, read in the last 5 min), current
+    // (the rebuild, only while its latest comparison matched and it was caught up in the last 5 min). The live score
+    // takes current figures only; at-call figures are shown apart and never stand in for them.
+    const verified=!!L.ver&&now-L.ver.at<=300000, trustNow=VTCore.holderTrust(!!L.complete,L.ver?.diff??null);
+    // The rebuild's own clock: its last successful catch-up (a live trade does not prove transfers were caught).
+    const chainAt=L.catchOk||L.at||0, rebuildNow=trustNow==='verified'&&now-chainAt<=300000;
+    const topNow=L.progErr?null:verified?VTCore.rugTop(L.ver.ranked,sup,L.prog):rebuildNow?VTCore.rugTop(rugRankCache.rk,S.supply,L.prog):null;
+    const callTrust=VTCore.holderTrust(!!L.atCallOk&&!!L.complete,L.firstGap??null);
+    const topCall=isCall&&L.atCallOk&&!L.progErr&&callTrust!=='mismatch'?VTCore.rugTop(a.holders,S.supply,L.prog):null;
+    const sales=S.devSales, lastSale=sales[sales.length-1], recent=!!lastSale&&now-(lastSale.at||0)<RUG_SALE_MS;
+    // Dev now: the chain's own balance less sales after it was read; else the trusted rebuild. Never the lower of the two.
+    const devNow=!cOk?null:verified?VTCore.devNowVerified(L.ver,S.devFlows,sup):rebuildNow?100*Math.max(0,VTCore.rugHolding(S,S.creator))/S.supply:null;
+    const devCall=cOk&&isCall&&L.atCallOk&&callTrust!=='mismatch'?a.devPct:null;
+    const soldPct=100*sales.reduce((t,x)=>t+x.amt,0)/sup, out=devNow!=null&&devNow<VTCore.RUG.outFrac*100&&sales.length>0;
+    const ln=rugRankCache.launch, n=cOk?ln.wallets:null;
+    const f=L.funder, seen=f?.funder?rugSeen(isCall?c.id:null,isCall?c.messageAt:Infinity,S.creator,f.funder):{dev:0,fund:0};
+    const kinds=new Set(sales.map(e=>devKind(L,e))), verb=kinds.size===1?DEV_VERB[[...kinds][0]]:'sold or moved';
+    const callNote=v=>v==null?null:'call '+pctS(v)+', not scored';
+    const detail={
+      top10:topNow!=null?pctS(topNow)+(topCall!=null&&Math.abs(topNow-topCall)>=1?' (call '+pctS(topCall)+')':''):callNote(topCall),
+      dev:devNow!=null?(out?'empty · '+verb+' '+pctS(soldPct):pctS(devNow)+(sales.length?' · '+verb+' '+pctS(soldPct)+(lastSale.at?' '+sinceText(now-lastSale.at).slice(1)+' ago':''):'')):callNote(devCall),
+      launch:n==null?null:n+' wallet'+(n===1?'':'s')+(n?' · hold '+pctS(ln.held):''),
+      repeat:!cOk?null:f?.error?null:!f?.funder?'no funder found':seen.dev?'same dev':seen.fund?'funder seen '+seen.fund+'×':'new'};
+    const creatorTxt={confirmed:'Dev wallet (declared in pump.fun’s creation instruction; GMGN agrees) ',pump:'Dev wallet (declared in pump.fun’s creation instruction) ',payer:'Fee payer of the creation (not pump.fun: not verified, so GMGN’s dev % is used) ',conflict:'Creator CONFLICT: GMGN names a different creator than pump.fun’s instruction ',none:'Creator NOT verified (no initializeMint in the first transaction) '}[cc];
+    const titles={dev:creatorTxt+S.creator+(S.devBuy!=null&&cOk?' · bought '+pctS(S.devBuy)+' at launch':'')+(L.devWallets?.size?' · moved tokens to '+L.devWallets.size+' wallet(s), counted as dev wallets':'')
+        +(verified?' · balance from the chain, read '+sinceText(now-L.ver.at).slice(1)+' ago':''),
+      launch:'Wallets besides the dev that bought in the launch block: bought '+pctS(ln.bought)+', hold '+pctS(ln.held)+(ln.sold?', '+ln.sold+' dumped':''),
+      repeat:f?.funder?'First wallet to send the dev SOL: '+f.funder+(f.sol!=null?' ('+f.sol.toFixed(2)+' SOL)':''):'',
+      top10:'Ten largest holders that are not the bonding curve, a pool or another program account. '+(verified?'From the chain’s own largest accounts, read '+sinceText(now-L.ver.at).slice(1)+' ago.':rebuildNow?'Rebuilt from the coin’s transactions (matched the chain when last compared).':'No current figure.')
+        +(L.ver?.diff!=null?' Latest rebuild gap: '+pctS(L.ver.diff)+' of supply.':'')};
+    const src=verified?'chain verified':rebuildNow?'chain rebuilt':!L.complete?'chain: at the call':'chain not current';
+    const note=[L.catchErr?'Chain catch-up failed: '+L.catchErr+'.':'',L.verifyErr?'Holder check failed: '+L.verifyErr+'.':'',
+      !cOk?(cc==='conflict'?'GMGN names a different creator than the chain':cc==='payer'?'Not a pump.fun launch: the creator is only the fee payer':'Creator not verified')+': chain dev, launch block and funder checks are off for this coin.':'',
+      trustNow==='mismatch'?'Rebuilt holders were off by '+pctS(L.ver.diff)+' of supply; only the chain’s own figures are used.':'',
+      !verified&&!rebuildNow?'No current chain figures (last read over 5 min ago or not matched): top 10 and dev % are not scored.':''].filter(Boolean).join(' ');
+    return {S,L,src,note,detail,titles,unverified:[...(cOk?[]:[cc==='payer'?'dev from the fee payer only (not pump.fun)':'creator not verified']),...(trustNow==='unchecked'&&!verified?['holders not checked against the chain']:[])],conflict:cc==='conflict'?['GMGN names a different creator']:[],
+      stale:!verified&&!rebuildNow&&L.S?['chain figures over 5 min old']:[],gradeIn:{top10:topNow,top10Approx:verified&&topNow!=null,devPct:devNow,devSoldRecent:cOk&&recent&&[...sales].reverse().some(e=>now-(e.at||0)<RUG_SALE_MS&&devKind(L,e)!=='transfer'),devSoldBefore:cOk&&sales.length>0,
+      sameDev:cOk&&f?.funder?seen.dev>0:null,funderSeen:cOk&&f?.funder?seen.fund:null,launchBuyers:n}};
+  }
+  // ---- GMGN's own token data (3.9): read by this GMGN tab for the coin on screen ----
+  // Right away when a coin opens, every 5s for its first 3 minutes (after the alert or after opening it), then every
+  // 15s. A rate limit pauses it for 60s. Same-origin requests from the GMGN page; nothing is sent anywhere else.
+  const GMX={fast:5000,slow:15000,fastFor:180000};
+  // at = last successful read (data age), tried = last attempt (scheduling). Data older than GM_MAX is not used.
+  const GM_MAX=60000;
+  // parts: each GMGN response with its own time; the parsed view only uses parts read in the last GM_MAX.
+  const GM_PARTS={stat:'token stats',holderStat:'holder tags',topBuyers:'first buyers',info:'token info',holders:'holder list'};
+  let gmS={mint:null,G:null,at:0,tried:0,opened:0,busy:false,err:null,pauseTill:0,hist:[],exits:[],exitKeys:new Set(),noted:{},group:null,parts:{},view:null};
+  function gmReset(mint){gmS={mint,G:null,at:0,tried:0,opened:Date.now(),busy:false,err:null,pauseTill:gmS.pauseTill||0,hist:[],exits:[],exitKeys:new Set(),noted:{},group:null,parts:{},view:null};}
+  function gmFresh(now=Date.now()){
+    if(gmS.mint!==current)return null;
+    const fresh=Object.entries(gmS.parts).filter(([,v])=>now-v.at<=GM_MAX), key=fresh.map(([k,v])=>k+v.at).join('|');
+    if(!fresh.length)return null;
+    if(gmS.view?.key!==key)gmS.view={key,G:VTCore.gmgnParse(Object.fromEntries(fresh.map(([k,v])=>[k,v.data])))};
+    return gmS.view.G;
+  }
+  // GMGN parts that were read once but are now older than GM_MAX (shown in Confidence).
+  const gmStale=(now=Date.now())=>gmS.mint!==current?[]:Object.entries(gmS.parts).filter(([,v])=>now-v.at>GM_MAX).map(([k,v])=>'GMGN '+GM_PARTS[k]+' '+Math.round((now-v.at)/1000)+'s old');
+  function gmGet(path,opt={}){
+    const done=(resolve,status,text)=>{let j=null;try{j=JSON.parse(text);}catch(_){}
+      resolve(status===429||status===403?{limited:true,status}:j&&j.code===0?{data:j}:{status,error:j?.message||'HTTP '+status});};
+    return new Promise(resolve=>{
+      const ctl=typeof AbortController!=='undefined'?new AbortController():null, t=setTimeout(()=>ctl?.abort(),8000);
+      // The page's own origin first (cookies included); GM_xmlhttpRequest if this context cannot fetch.
+      fetch(path,{credentials:'include',...opt,signal:ctl?.signal}).then(r=>r.text().then(x=>done(resolve,r.status,x)))
+        .catch(()=>GM_xmlhttpRequest({method:opt.method||'GET',url:'https://gmgn.ai'+path,headers:{Accept:'application/json',...(opt.headers||{})},data:opt.body,timeout:8000,
+          onload:r=>done(resolve,r.status,r.responseText),onerror:()=>resolve({error:'network error'}),ontimeout:()=>resolve({error:'timeout'})}))
+        .finally(()=>clearTimeout(t));
+    });
+  }
+  // Five reads at once; each one is used the moment it arrives (a slow endpoint does not hold the others back).
+  async function gmPull(mint){
+    gmS.busy=true;gmS.tried=Date.now();
+    const b='/sol/'+mint, reqs={stat:gmGet('/api/v1/token_stat'+b),holderStat:gmGet('/vas/api/v1/token_holder_stat'+b),topBuyers:gmGet('/api/v1/tokens/top_buyers'+b),
+      info:gmGet('/api/v1/mutil_window_token_info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chain:'sol',addresses:[mint]})}),
+      holders:gmGet('/vas/api/v1/token_holders'+b+'?limit=100&orderby=amount_percentage&direction=desc')};
+    let ok=0, limited=false, firstErr=null;
+    await Promise.all(Object.entries(reqs).map(([k,pr])=>pr.then(r=>{
+      if(gmS.mint!==mint)return;
+      if(r.limited){limited=true;return;}
+      if(!r.data){firstErr=firstErr||r.error;return;}
+      ok++;const at=Date.now();gmS.parts[k]={data:r.data,at};gmS.at=at;
+      // Unfiltered view of everything read so far (for non-scoring uses: supply, creator); scoring uses gmFresh().
+      gmS.G=VTCore.gmgnParse(Object.fromEntries(Object.entries(gmS.parts).map(([q,v])=>[q,v.data])));
+      if(k==='stat'&&gmS.G.holders!=null){gmS.hist.push({t:at,h:gmS.G.holders});gmS.hist=gmS.hist.filter(x=>at-x.t<=15*60000);}
+      latMark(mint,'gmgn');soon();
+    }).catch(e=>{firstErr=firstErr||String(e?.message||e).slice(0,80);})));
+    if(gmS.mint===mint){
+      if(limited)gmS.pauseTill=Date.now()+60000;
+      gmS.err=!ok?(limited?'GMGN rate limit: paused 60s':'GMGN data unavailable ('+(firstErr||'no data')+')'):ok<5?(5-ok)+' of 5 GMGN reads failed this round'+(!reqs.holders||!gmS.parts.holders||Date.now()-gmS.parts.holders.at>GM_MAX?' (holder list missing: insider bag unknown)':''):null;
+    }
+    gmS.busy=false;soon();
+  }
+  function gmTick(){
+    if(!GMGN||!current||!get('gmOn',true))return;
+    if(gmS.mint!==current)gmReset(current);
+    if(gmS.busy||Date.now()<gmS.pauseTill||(document.hidden&&!isReceiver))return;
+    const c=callFor(current), since=Math.min(Date.now()-gmS.opened,c&&!c.historical?Date.now()-c.messageAt:Infinity);
+    if(gmS.tried&&Date.now()-gmS.tried<(since<GMX.fastFor?GMX.fast:GMX.slow))return;
+    gmPull(current);
+  }
+  // Insider group for the coin on screen: GMGN's tagged holders + funder cluster + the dev and launch-block wallets.
+  function gmGroup(){
+    // The dev, its launch block and the wallets it moved tokens to: only with a usable creator. Dev % from the chain's own
+    // figure when verified (the rebuild can miss a plain transfer).
+    const L=rugLive.get(current), S=L?.S, extra=[], pct=w=>S?.supply?100*Math.max(0,VTCore.rugHolding(S,w))/S.supply:0;
+    if(S&&creatorOk(L)){
+      const verDev=L.ver&&Date.now()-L.ver.at<=300000?VTCore.devNowVerified(L.ver,S.devFlows,L.ver.supply):null;
+      extra.push({w:S.creator,role:'dev',pct:verDev??pct(S.creator)});
+      for(const [w] of S.launch)extra.push({w,role:'launch block',pct:pct(w)});
+      for(const w of L.devWallets||[])extra.push({w,role:'dev wallet',pct:pct(w)});
+    }
+    const G=gmFresh();
+    return gmS.group=G||extra.length?VTCore.insiderGroup(G,extra):null;
+  }
+  // ---- Speed (4.3): per call, when each stage first happened (GMGN side; Discord's detection is the call's receivedAt
+  // and the Telegram ping time is in its tg record). One record per call, fields only ever set once.
+  const latSeen=new Set();
+  function latMark(mint,field){
+    if(!GMGN||!mint)return;
+    const c=callFor(mint);if(!c||c.historical||c.manual||c.unverified||Date.now()-c.messageAt>15*60000)return;
+    const seen=c.id+'|'+field;if(latSeen.has(seen))return;latSeen.add(seen);
+    const k='lat.'+c.id, had=get(k,null), r=had||{t:c.messageAt};if(r[field])return;r[field]=Date.now();set(k,r);
+    // A new record: drop ones over 48h old.
+    if(!had)try{for(const key of GM_listValues())if(key.startsWith(PREFIX+'lat.')&&Date.now()-(GM_getValue(key,null)?.t||0)>48*3600000)GM_deleteValue(key);}catch(_){}
+  }
+  const LAT_STAGES=[['detected','Seen on Discord'],['handoff','GMGN tab got it'],['open','Coin open on GMGN'],['feed','First live trade'],['gmgn','First GMGN data'],['chainQuick','Chain top 10'],['grade','First grade'],['chain','Full chain check'],['quote','Exit quote'],['tg','Telegram ping']];
+  let speedCache={at:0,rows:null};
+  function speedRows(){
+    if(Date.now()-speedCache.at<3000&&speedCache.rows)return speedCache.rows;
+    const list=calls().filter(c=>!c.historical&&!c.manual&&!c.unverified).sort((a,b)=>b.messageAt-a.messageAt).slice(0,20), vals=Object.fromEntries(LAT_STAGES.map(([k])=>[k,[]]));
+    for(const c of list){
+      const r=get('lat.'+c.id,null)||{}, tgr=get('tg.'+c.id,null);
+      const at={...r,detected:c.receivedAt,tg:tgr?.at};
+      for(const [k] of LAT_STAGES)if(at[k]>0&&at[k]>=c.messageAt-5000)vals[k].push((at[k]-c.messageAt)/1000);
+    }
+    const med=a=>{const s=[...a].sort((x,y)=>x-y);return s.length?s.length%2?s[s.length>>1]:(s[s.length/2-1]+s[s.length/2])/2:null;};
+    speedCache={at:Date.now(),rows:LAT_STAGES.map(([k,l])=>({k,l,n:vals[k].length,med:med(vals[k]),max:vals[k].length?Math.max(...vals[k]):null})),n:list.length};
+    return speedCache.rows;
+  }
+  function renderSpeed(){
+    const box=$('speed');if(!box)return;
+    const rows=speedRows(), f=v=>v==null?'n/a':v<10?v.toFixed(1)+'s':Math.round(v)+'s', cells=[];
+    for(const r of rows){if(!r.n)continue;cells.push(node('span','l',r.l),node('span','',f(r.med)),node('span','',f(r.max)));}
+    box.replaceChildren(...(cells.length?[node('span','h','Stage'),node('span','h','Median'),node('span','h','Slowest'),...cells]:[node('span','l','No live calls timed yet')]));
+  }
+  // ---- Exit cost (4.3): a Jupiter quote to buy at your size, then one to sell what that buys back ----
+  // The gap is the round trip: pool fees plus price impact both ways (not GMGN's own fee or priority fees). No route on
+  // Jupiter means unknown here, not unsellable. Every 15s for the coin on screen.
+  const JUP='https://lite-api.jup.ag/swap/v1/quote', WSOL=VTCore.WSOL_MINT;
+  let jupS={mint:null,at:0,tried:0,busy:false,res:null};
+  async function jupTick(){
+    if(!GMGN||!current||!get('jupOn',true)||jupS.busy||document.hidden&&!isReceiver)return;
+    if(jupS.mint!==current)jupS={mint:current,at:0,tried:0,busy:false,res:null};
+    if(Date.now()-jupS.tried<15000)return;
+    const mint=current, size=Math.max(0.001,+get('tradeSol',0.1)||0.1), lam=Math.round(size*1e9);
+    jupS.busy=true;jupS.tried=Date.now();
+    try{
+      const buy=await http(JUP+'?inputMint='+WSOL+'&outputMint='+mint+'&amount='+lam+'&slippageBps=2500');
+      let res;
+      if(!(buy.data?.outAmount>0))res={noRoute:'buy',status:buy.status};
+      else{
+        const sell=await http(JUP+'?inputMint='+mint+'&outputMint='+WSOL+'&amount='+buy.data.outAmount+'&slippageBps=2500');
+        res=sell.data?.outAmount>0?{roundTrip:100*(1-sell.data.outAmount/lam),size,route:[...new Set([...(buy.data.routePlan||[]),...(sell.data.routePlan||[])].map(r=>r.swapInfo?.label).filter(Boolean))].join(', ')}:{noRoute:'sell',status:sell.status};
+      }
+      if(jupS.mint===mint){jupS.res={...res,at:Date.now()};jupS.at=Date.now();if(res.roundTrip!=null)latMark(mint,'quote');}
+    }finally{jupS.busy=false;soon();}
+  }
+  // ---- RugCheck (4.3): its own findings, kept separate (never mixed into the score) ----
+  // On a coin still on the pump.fun curve, RugCheck's holder-concentration findings are about the curve itself.
+  let rcS={mint:null,at:0,busy:false,res:null};
+  async function rcTick(){
+    if(!GMGN||!current||!get('rcOn',true)||rcS.busy)return;
+    if(rcS.mint===current&&Date.now()-rcS.at<300000)return;
+    rcS={mint:current,at:Date.now(),busy:true,res:rcS.mint===current?rcS.res:null};const mint=current;
+    try{const r=await http('https://api.rugcheck.xyz/v1/tokens/'+mint+'/report/summary');if(rcS.mint===mint)rcS.res=r.data&&Array.isArray(r.data.risks)?{risks:r.data.risks,score:r.data.score_normalised??null}:{err:r.status||'no answer'};}
+    finally{rcS.busy=false;soon();}
+  }
+  // A sell by an insider wallet (GMGN's feed): logged for the "leaving together" check.
+  function gmOnTrade(t,mint){
+    if(t.side!=='sell'||!t.wallet||gmS.mint!==mint)return;
+    const L=rugLive.get(mint), role=gmS.group?.wallets.get(t.wallet)?.role||(L?.S?.creator===t.wallet?'dev':L?.S?.launch.has(t.wallet)?'launch block':null)
+      ||(live.mint===mint?VTCore.roleOfTags(live.prof.get(t.wallet)?.tokenTags):null);
+    if(!role)return;
+    const sup=gmS.G?.supply||L?.ver?.supply||L?.S?.supply, tok=VTCore.tradeTokens(t), key=(t.hash||t.at)+'|'+t.wallet;
+    if(!(sup>0)||!(tok>0)||gmS.exitKeys.has(key))return;
+    gmS.exitKeys.add(key);gmS.exits.push({at:t.at,w:t.wallet,role,pct:100*tok/sup});
+    gmS.exits=gmS.exits.filter(e=>Date.now()-e.at<=600000);
+    const ex=VTCore.exitStats(gmS.exits,Date.now());
+    if(ex.coordinated)insiderAlert(ex,mint);
+  }
+  function insiderAlert(ex,mint){
+    const now=Date.now();if(now-(gmS.noted.exit||0)<120000)return;gmS.noted.exit=now;
+    const c=callFor(mint), name=c?.name||mint.slice(0,4)+'…'+mint.slice(-4), text=ex.wallets+' insider wallet'+(ex.wallets===1?'':'s')+' sold '+pctS(ex.pct)+' of supply in 2 min ('+ex.roles.join(', ')+')';
+    if(mint===current)flash();
+    GM_notification({title:'Insiders exiting · '+name,text,timeout:10000});
+    if(c&&get('tgDev',true)&&tgReady())tgSend('Insiders exiting: '+name+'\n'+text+'\n'+VTCore.gmgnURL(mint));
+  }
+  // Live score for the coin on screen: GMGN numbers + chain checks + volume bots.
+  function liveScore(rv,vb,now,move){
+    const G=gmFresh(now), gi=rv?.gradeIn||{}, grp=gmGroup(), ex=VTCore.exitStats(gmS.mint===current?gmS.exits:[],now);
+    // GMGN's holder list is up to 15s old: take off insider sells seen since it was read.
+    // (Chain-tracked wallets are already live, so only GMGN-listed ones are adjusted.)
+    const soldSince=gmS.exits.filter(e=>e.at>gmS.at&&grp?.wallets.get(e.w)?.src==='gmgn').reduce((t,e)=>t+Math.min(e.pct,grp.wallets.get(e.w).pct),0);
+    const old=G?gmS.hist.find(x=>gmS.at-x.t>=240000&&gmS.at-x.t<=420000):null;
+    // Insider bag only with GMGN's holder list (complete): the chain wallets alone (dev, launch block) are not the bag.
+    const x={exit:ex,devSellingNow:!!gi.devSoldRecent,insiderHold:grp?.complete?Math.max(0,grp.total-soldSince):null,devPct:gi.devPct??G?.devPct,devSold:gi.devSoldBefore||G?.devStatus==='creator_close',
+      launches:G?.launches,sameDev:gi.sameDev,funderSeen:gi.funderSeen,top10:gi.top10??G?.top10,bundlerPct:G?.bundlerPct,sniperPct:G?.sniperPct,
+      cluster:G?.listed?(G.cluster||{n:0}):null,launchBuyers:gi.launchBuyers,platformRate:G?.platformRate,freshRate:G?.freshRate,smart:G?.smart,
+      holderGrowth:old&&old.h>0?100*(G.holders/old.h-1):null,volMc:G?.vol1h!=null&&G.mc>0?G.vol1h/G.mc:null,botShare:vb?.botShare,botTrades:vb?.botTradeShare,orgShare:vb?.orgShare,
+      top10Approx:gi.top10!=null?!!gi.top10Approx:false,retention:G?.first70Hold??null,profitShare:G?.profitShare??null,moveSinceCall:Number.isFinite(move)?move:null};
+    const jr=jupS.mint===current&&jupS.res&&now-jupS.res.at<=60000?jupS.res:null;
+    x.exitCost=jr?.roundTrip??null;
+    // Confidence inputs: stale parts, unverified identities, conflicts.
+    x.conf={stale:[...gmStale(now),...(rv?.stale||[]),...(jupS.mint===current&&jupS.res&&!jr?['exit quote over 60s old']:[])],unverified:rv?.unverified||[],conflict:rv?.conflict||[]};
+    return {score:VTCore.scoreCoin(x),x,grp,ex,jr};
+  }
+  // The checks box: insider bag + who is selling, then every check with its points.
+  function renderChecks(c,now,rv,ls){
+    const box=$('rug');box.hidden=!current;
+    if(!current)return;
+    const row=$('rug-row'), btn=$('rug-check'), say=t=>{$('rug-note').textContent=t;$('rug-note').hidden=!t;}, ins=$('ins');
+    row.hidden=!(rv.manual||rv.retry)||!rpcUrl();btn.textContent=rv.retry?'Retry chain check':'Check this coin';
+    const G=gmFresh(now), {score,grp,ex,x}=ls, age=gmS.mint===current&&gmS.at?Math.max(0,Math.round((now-gmS.at)/1000)):null;
+    $('rug-src').textContent=[age!=null?'GMGN '+age+'s'+(age>30?(G?' old':' · expired'):''):gmS.busy?'GMGN loading':null,rv.src||null].filter(Boolean).join(' · ')||'untested';
+    // Insider bag and live selling.
+    if(grp){
+      const roles=Object.entries(grp.byRole).filter(r=>r[1]>=0.05).sort((a,b)=>b[1]-a[1]).map(([r,v])=>r+' '+pctS(v)).join(' · ');
+      const h=x.insiderHold, cls=ex.coordinated?'bad':h>=25?'over':'';
+      ins.className='ins'+(cls?' '+cls:'');
+      const top=node('div','row1');top.append(node('span','lbl','Insider bag'),node('b','',h==null?'?':pctS(h)),node('span','roles',h==null?'no GMGN holder list: dev and launch block only ('+pctS(grp.total)+')':roles||'no tagged insiders'));
+      const recent=gmS.exits.filter(e=>now-e.at<=VTCore.EXIT.pctMs), line=node('div','exit'+(ex.coordinated?' bad':recent.length?' warn':''));
+      line.textContent=ex.coordinated?'Leaving together: '+ex.wallets+' wallet'+(ex.wallets===1?'':'s')+' sold '+pctS(ex.pct)+' in 2 min ('+ex.roles.join(', ')+')'
+        :recent.length?'Insider selling: '+pctS(ex.pct)+' in 2 min ('+ex.roles.join(', ')+')':'No insider selling in the last 2 min';
+      ins.replaceChildren(top,line);ins.hidden=false;
+      ins.title='Everyone likely to dump: '+[...grp.wallets.values()].length+' wallets (dev, dev team, bundlers, snipers, GMGN insiders, launch-block wallets, funder cluster). "Leaving together" = 3+ of them selling within 60s, or 3%+ of supply in 2 min.';
+    }else ins.hidden=true;
+    // Four parts, then the checklist grouped by part.
+    const glyph={pass:'✓',warn:'!',fail:'✕',na:'·',info:'·'}, detail={...(rv.detail||{})}, titles={...(rv.titles||{})}, jr=ls.jr;
+    if(jr?.roundTrip!=null){detail.exitcost='−'+pctS(Math.max(0,jr.roundTrip))+' · '+jr.size+' SOL';titles.exitcost='Jupiter: buy '+jr.size+' SOL then sell it back: '+pctS(jr.roundTrip)+' lost to pool fees and price impact ('+(jr.route||'route')+'). GMGN’s fee and priority fees are not included.';}
+    else if(jupS.mint===current&&jupS.res?.noRoute)detail.exitcost='no Jupiter route (unknown, not unsellable)';
+    const parts=$('parts'), PART={risk:'Risk',demand:'Demand',entry:'Entry'}, sgn=v=>(v>0?'+':v<0?'−':'')+Math.abs(v);
+    if(score.known){
+      const cells=Object.entries(PART).map(([cat,lbl])=>{const v=score[cat], worst=score.checks.filter(k=>k.cat===cat&&k.pts<0).sort((a,b)=>a.pts-b.pts)[0], d=node('div','pt '+(v<=-2?'bad':v<0?'warn':'ok'));
+        d.append(node('span','lbl',lbl),node('b','',sgn(v)),node('small','',worst?worst.label:score.checks.some(k=>k.cat===cat&&k.status!=='na')?'no flags':'no data'));
+        d.title=lbl+': '+score.checks.filter(k=>k.cat===cat&&k.status!=='na').map(k=>(k.pts>0?'+':'')+k.pts+' '+k.label).join(', ');return d;});
+      const cf=score.confidence, dc=node('div','pt conf '+cf.level);dc.append(node('span','lbl','Data'),node('b','',cf.level),node('small','',cf.reasons[0]||'complete and current'));dc.title='Confidence: '+cf.level+(cf.reasons.length?'\n'+cf.reasons.join('\n'):'');
+      parts.replaceChildren(...cells,dc);parts.hidden=false;
+    }else parts.hidden=true;
+    const out=[];
+    for(const cat of ['risk','demand','entry']){
+      const list=score.checks.filter(k=>k.cat===cat);if(!score.known||!list.length)continue;
+      out.push(node('div','ckh',PART[cat]));
+      // Long readings take a full row, after the short ones of the same part (so nothing is cut off).
+      const cellsOf=list.map(k=>{const d=node('div','ck '+k.status),v=detail[k.key]??k.value, wide=String(v??'').length>12||(k.label+String(v??'no data')).length>24;if(wide)d.classList.add('wide');
+        d.append(node('i','',glyph[k.status]),node('span','',k.label),node('b','',v??'no data'));
+        d.title=k.label+': '+(v??'no data')+(k.note?' ('+k.note+')':'')+' · '+(k.pts>0?'+':'')+k.pts+' pts'+(titles[k.key]?'\n'+titles[k.key]:'');return [wide,d];});
+      out.push(...cellsOf.filter(x=>!x[0]).map(x=>x[1]),...cellsOf.filter(x=>x[0]).map(x=>x[1]));
+    }
+    $('rug-cells').replaceChildren(...out);
+    // RugCheck: its findings as they are, apart from the score.
+    const rc=$('rc'), rr=rcS.mint===current?rcS.res:null;
+    if(rr?.risks){
+      const onCurve=gmS.mint===current&&gmS.G?.migrated!=null?gmS.G.migrated===false:callFor(current)?.migrated===false, curveish=r=>onCurve&&/single holder|holder concentration|top 10 holders|top holders/i.test(r.name||'');
+      const real=rr.risks.filter(r=>!curveish(r)), dz=real.filter(r=>r.level==='danger').length, wn=real.filter(r=>r.level==='warn').length;
+      rc.querySelector('summary').textContent='RugCheck: '+(dz?dz+' danger':'')+(dz&&wn?', ':'')+(wn?wn+' warning'+(wn===1?'':'s'):'')+(!dz&&!wn?'no findings':'')+' (not in the score)';
+      rc.querySelector('ul').replaceChildren(...rr.risks.map(r=>node('li',(r.level==='danger'?'risk':'')+(curveish(r)?' dim':''),(r.name||'?')+(r.value?' · '+r.value:'')+(curveish(r)?' (the bonding curve, normal before migration)':''))));
+      rc.hidden=false;
+    }else{rc.hidden=!(rcS.mint===current&&rr?.err);if(!rc.hidden){rc.querySelector('summary').textContent='RugCheck: no report ('+rr.err+')';rc.querySelector('ul').replaceChildren();}}
+    say([rv.wait&&!rv.S?'Chain: '+rv.wait+'.':'',rv.note,gmS.err?'GMGN: '+gmS.err+'.':'',!get('gmOn',true)?'GMGN token data is off (Settings).':''].filter(Boolean).join(' '));
+  }
+  // At-call snapshot of the live score, once per call, when the call first opens on GMGN (within 3 min of the alert).
+  // Waits up to 30s for the chain check so the saved score uses everything. Forward data for the backtest.
+  function gmSnapshot(c,ls,now){
+    if(!c||c.historical||c.manual||c.unverified||gmS.mint!==c.mint||!gmFresh(now)||now-c.messageAt>180000||get('gm.'+c.id,null))return;
+    const L=rugLive.get(c.mint);
+    if(rpcUrl()&&L?.status!=='ok'&&L?.status!=='error'&&now-c.messageAt<30000)return;
+    // Wait (up to 30s after the alert) for the first exit quote too, so the saved score has it.
+    if(get('jupOn',true)&&!(jupS.mint===c.mint&&jupS.res)&&now-c.messageAt<30000)return;
+    const {score:s,x}=ls, r=v=>v==null?null:Math.round(v*100)/100;
+    set('gm.'+c.id,{t:c.messageAt,at:now,delay:Math.round((now-c.messageAt)/1000),grade:s.grade,code:s.code,score:s.score,known:s.known,hard:s.hard,
+      insiderHold:r(x.insiderHold),bundlerPct:r(x.bundlerPct),sniperPct:r(x.sniperPct),platformRate:r(x.platformRate),freshRate:r(x.freshRate),launches:x.launches??null,
+      volMc:r(x.volMc),smart:x.smart??null,top10:r(x.top10),devPct:r(x.devPct),clusterN:x.cluster?.n??null,clusterPct:r(x.cluster?.pct),holders:gmS.G.holders,
+      first70Hold:r(gmS.G.first70Hold),devStatus:gmS.G.devStatus,checks:Object.fromEntries(s.checks.map(k=>[k.key,k.status==='na'?null:k.pts])),
+      v:2,risk:s.risk,demand:s.demand,entry:s.entry,conf:s.confidence.level,confWhy:s.confidence.reasons.slice(0,4),exitCost:r(x.exitCost),tradeSol:ls.jr?.size??null,retention:r(x.retention),profitShare:r(x.profitShare),move:r(x.moveSinceCall)});
+    locked('gmIds',()=>{const ids=get('gmIds',[]);if(!ids.includes(c.id)){ids.unshift(c.id);for(const old of ids.splice(2000))GM_deleteValue(PREFIX+'gm.'+old);set('gmIds',ids);}});
+    tgUpdate(c);
+  }
+  // ---- Telegram (optional): call pings that update with the rug checks, and dev-sell pings ----
+  function tg(method,body){
+    const t=String(get('tgToken','')||'').trim();
+    if(!t)return Promise.resolve({ok:false,error:'no bot token'});
+    return new Promise(resolve=>GM_xmlhttpRequest({method:'POST',url:'https://api.telegram.org/bot'+t+'/'+method,headers:{'Content-Type':'application/json'},data:JSON.stringify(body||{}),timeout:12000,
+      onload:r=>{let d=null;try{d=JSON.parse(r.responseText);}catch(_){}resolve(d?.ok?{ok:true,result:d.result}:{ok:false,error:d?.description||'HTTP '+r.status});},
+      onerror:()=>resolve({ok:false,error:'network error'}),ontimeout:()=>resolve({ok:false,error:'timeout'})}));
+  }
+  function tgReady(){return !!(get('tgToken','')&&get('tgChat',''));}
+  function tgSend(text){return tg('sendMessage',{chat_id:get('tgChat',''),text,link_preview_options:{is_disabled:true}});}
+  function tgCallText(c){
+    const r=get('rug.'+c.id,null), age=c.ageSeconds==null?'':' · age '+(c.ageSeconds<3600?Math.round(c.ageSeconds/60)+'m':(c.ageSeconds/3600).toFixed(1)+'h');
+    const lines=['VolTrak call: '+c.name+(c.symbol?' ($'+c.symbol+')':''),'MC '+(c.callMc?usd(c.callMc):'?')+age,VTCore.gmgnURL(c.mint)];
+    const g=get('gm.'+c.id,null);
+    if(g){const worst=Object.entries(g.checks||{}).filter(e=>e[1]<0).sort((a,b)=>a[1]-b[1]).slice(0,3).map(e=>TG_NAMES[e[0]]||e[0]);
+      const sg=v=>(v>0?'+':v<0?'−':'')+Math.abs(v);
+      lines.push('Live: '+g.grade+(g.v>=2?' (risk '+sg(g.risk)+', demand '+sg(g.demand)+', entry '+sg(g.entry)+(g.conf&&g.conf!=='high'?', data '+g.conf:'')+')':' (score '+(g.score>0?'+':'')+g.score+', '+g.known+' checks)')
+        +(g.hard?.length?' · '+g.hard[0]:worst.length?' · weak: '+worst.join(', '):''));
+      if(g.exitCost!=null)lines.push('Round trip at '+g.tradeSol+' SOL: −'+Math.max(0,g.exitCost).toFixed(1)+'% (Jupiter quote)');}
+    // With a live score, the chain line is just the numbers (one grade per ping); without one, it carries the chain grade.
+    if(r?.done&&!r.empty){const line=VTCore.rugLine(r,rugSeen(c.id,c.messageAt,r.creator,r.funder));lines.push(g?'Chain: '+line.replace(/^[A-Z]+ · /,''):'Chain grade: '+line);}else if(r?.empty)lines.push('Chain checks: no chain data yet');else if(rpcUrl())lines.push('Chain checks: running…');
+    return lines.join('\n');
+  }
+  const TG_NAMES={insiders:'insider bag',dev:'dev holds',launches:'dev launches',repeat:'dev/funder seen before',top10:'top 10',bundlers:'bundlers',snipers:'snipers',cluster:'funder cluster',
+    launch:'launch block',real:'few real traders',app:'app traders',fresh:'fresh wallets',growth:'holders falling',volmc:'volume vs MC',bots:'volume bots',organic:'organic buys',smart:'smart money',
+    retention:'first buyers sold',exitcost:'exit cost',overhang:'holders in profit',move:'already pumped'};
+  async function tgCall(c){
+    if(c.unverified)return;
+    if(!get('tgOn',true)||!tgReady())return;
+    const r=await tgSend(tgCallText(c));
+    if(!r.ok){notice('Telegram: '+r.error);render();return;}
+    const now=Date.now();
+    set('tg.'+c.id,{chat:get('tgChat',''),id:r.result.message_id,at:now,last:tgCallText(c)});
+    try{for(const k of GM_listValues())if(k.startsWith(PREFIX+'tg.')&&now-(GM_getValue(k,null)?.at||0)>48*3600000)GM_deleteValue(k);}catch(_){}
+    tgUpdate(c);
+  }
+  const tgRec=id=>get('tg.'+id,null)||get('tgMsgs',{})[id]||null;
+  // Edits the call's ping when a new piece (chain check, live score) arrives; never sends the same text twice.
+  async function tgUpdate(c){
+    const m=tgRec(c.id), text=tgCallText(c);
+    if(!m||m.last===text||!get('tgToken',''))return;
+    const r=await tg('editMessageText',{chat_id:m.chat,message_id:m.id,text,link_preview_options:{is_disabled:true}});
+    if(r.ok)set('tg.'+c.id,{...m,last:text});
+  }
   function openReport(){
     const tp=Math.max(1,+$('bt-tp').value||100), sl=-Math.min(99,Math.abs(+$('bt-sl').value||50)), cost=Math.max(0,+$('bt-cost').value||0);
     const delay=BT_DELAYS.includes(+$('bt-delay').value)?+$('bt-delay').value:0, exit=+$('bt-exit').value===5?5:0, fill=$('bt-fill').value==='cautious'?'cautious':'touch';
     set('bt.opt',{tp,sl,cost,delay,exit,fill});
     const base={tp,sl,horizon:BT_H,fill,earlyExit:exit||null};
     // Every call is scored at each entry delay from the same cached candles (no extra requests).
-    const done=get('bt.done',{}), covered=get('bt.pre',{}), rows=[];let noData=0;
+    const done=get('bt.done',{}), covered=get('bt.pre',{}), rows=[];let noData=0, noExit=0, incomplete=0;
     // Trailing exit with fixed, untuned settings (arm at half the target, give back 30% from the peak) so it is not fitted to these calls.
     const trail={arm:tp/2,drop:30};
     for(const c of btCandidates()){
       if(done[c.id]!=='ok'){if(done[c.id])noData++;continue;}
-      const cs=VTCore.candles(get('bt.c.'+c.id,[])), by={};
-      for(const d of BT_DELAYS)by[d]=VTCore.scoreCall(cs,c.messageAt,{...base,delay:d});
+      // dataEnd: candles cover up to the fetch time (calls are fetched once their 2h window has closed; caches from
+      // before 4.1 have no fetch time and were fetched under the same rule).
+      // Coverage: GeckoTerminal can lag a few minutes behind the chain, so candles fetched at time F are taken to reach
+      // F - 5 min at most (an assumption, stated in the report). Caches from before 4.1 have no fetch time: they were
+      // fetched under the same "window closed + 5 min" rule and are counted as covered (also stated).
+      const cs=VTCore.candles(get('bt.c.'+c.id,[])), by={}, fetched=get('bt.f.'+c.id,null), cb={...base,dataEnd:fetched?Math.min(fetched-5*60000,c.messageAt+(BT_H+1)*60000):undefined};
+      for(const d of BT_DELAYS)by[d]=VTCore.scoreCall(cs,c.messageAt,{...cb,delay:d});
       // Exit rules compared at the chosen entry: target/stop only, a 5-min early exit, a +50% target, and a trailing exit.
-      const ex={plain:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,delay}),early5:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:5,delay}),tp50:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,tp:50,delay}),
-        trail:VTCore.scoreCall(cs,c.messageAt,{...base,earlyExit:null,delay,trail})};
-      if(by[0].status!=='scored'){noData++;continue;}
+      const ex={plain:VTCore.scoreCall(cs,c.messageAt,{...cb,earlyExit:null,delay}),early5:VTCore.scoreCall(cs,c.messageAt,{...cb,earlyExit:5,delay}),tp50:VTCore.scoreCall(cs,c.messageAt,{...cb,earlyExit:null,tp:50,delay}),
+        trail:VTCore.scoreCall(cs,c.messageAt,{...cb,earlyExit:null,delay,trail})};
+      if(by[0].status!=='scored'){if(by[0].status==='no-exit')noExit++;else if(by[0].status==='incomplete')incomplete++;else noData++;continue;}
       // The live late check, replayed: price vs the alert entry and any swap in the 5 min before the check.
       const late={};
       // Only candles that closed inside [check−5 min, check) count as "traded", so nothing after the check leaks in.
       for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t>=at-300000&&k.t+60000<=at));}
-      rows.push({call:c,by,ex,late,pre:VTCore.preAlert(cs,c.messageAt,covered[c.id]===1),hb:get('hb.'+c.id,null),ft:get('feat.'+c.id,null)});
+      rows.push({call:c,by,ex,late,pre:VTCore.preAlert(cs,c.messageAt,covered[c.id]===1),hb:get('hb.'+c.id,null),ft:get('feat.'+c.id,null),rug:get('rug.'+c.id,null),gm:get('gm.'+c.id,null)});
     }
     const scored=d=>rows.filter(r=>r.by[d].status==='scored');
     const entries=BT_DELAYS.map(d=>({delay:d,dead:rows.length-scored(d).length,...VTCore.summarize(scored(d).map(r=>r.by[d]),cost)}));
@@ -1831,7 +3191,25 @@ function start() {
       return {delay:d,grade:g,total:all.length,...VTCore.summarize(sc.map(r=>r.by[d]),cost)};}).filter(x=>x.total));
     // Price-path features ride on a copy of each call: the fill vs the price the call went out at, and the run-up before it.
     const moveInto=(r,d)=>r.pre.close>0&&r.by[d].status==='scored'?(r.by[d].entry/r.pre.close-1)*100:null;
-    const items=scored(delay).map(r=>({call:{...r.call,entryMove:moveInto(r,delay),runUp15:r.pre.runUp15},score:r.by[delay]}));
+    // Rug checks at the alert, plus whether the dev or its funder showed up on an earlier call.
+    // Only checks saved from 4.2 on (v3). Holder figures only when verified; dev/launch/funder only with a usable creator.
+    const rugFeat=r=>{const x=r.rug;if(!x?.done||x.empty||!(x.v>=3))return null;const cOk=x.creatorVerified&&x.creatorCheck!=='conflict', hOk=x.holders==='verified';
+      const s=cOk?rugSeen(r.call.id,r.call.messageAt,x.creator,x.funder):{dev:0,fund:0};
+      const f={top10:hOk?x.top10:null,devPct:hOk&&cOk?x.devPct:null,devSold:hOk&&cOk?x.devSold:null,launchBuyers:cOk?x.launchBuyers:null,launchPct:cOk?x.launchPct:null,
+        seen:cOk&&(x.creator||x.funder)?s.dev+s.fund>0:null,seenDev:cOk?s.dev:null,seenFund:cOk?s.fund:null};
+      return {...f,grade:hOk&&cOk?VTCore.rugGradeAt(f,s).code:null};};
+    for(const r of rows)r.rf=rugFeat(r);
+    // Live-score features only for entries made after the score was saved (no peeking: a score saved 40s after the
+    // alert cannot group an entry at the alert).
+    const gmAt=(r,d)=>r.gm&&r.gm.at<=r.call.messageAt+d*60000?r.gm:null;
+    const items=scored(delay).map(r=>({call:{...r.call,entryMove:moveInto(r,delay),runUp15:r.pre.runUp15,rug:r.rf,gm:gmAt(r,delay)},score:r.by[delay]}));
+    // Stale marks: still open at the end of the window and priced on a trade 15+ min old. They are a price, not proof the
+    // exit could fill. Kept in the main numbers (they are never wins, so dropping them would flatter the win rate) and
+    // shown separately with the numbers without them.
+    const isStale=r=>r.by[delay].exit==='stale-mark', staleExits=scored(delay).filter(isStale).length;
+    const fresh=VTCore.summarize(items.filter(i=>i.score.exit!=='stale-mark').map(i=>i.score),cost), staleSum=VTCore.summarize(items.filter(i=>i.score.exit==='stale-mark').map(i=>i.score),cost);
+    // Worst case: every stale exit could not be sold at all (-100%).
+    const worst=VTCore.summarize(items.map(i=>i.score.exit==='stale-mark'?{...i.score,ret:-100,outcome:'loss'}:i.score),cost);
     // Exit rules on the same calls (paired: the difference is per call, so it is tighter than comparing averages).
     const exitRule=(key,label,list)=>{const ok=list.filter(r=>r.ex[key].status==='scored'&&r.ex.plain.status==='scored'), x=VTCore.summarize(ok.map(r=>r.ex[key]),cost), d=ok.map(r=>r.ex[key].ret-r.ex.plain.ret);
       const m=d.length?d.reduce((a,b)=>a+b,0)/d.length:null, sd=d.length>1?Math.sqrt(d.reduce((a,b)=>a+(b-m)**2,0)/(d.length-1)):null;
@@ -1842,6 +3220,8 @@ function start() {
     const all=VTCore.summarize(items.map(i=>i.score),cost);
     set('bt.summary',{n:all.n,winRate:all.winRate,ev:all.ev,evLo:all.evLo,evHi:all.evHi,be:VTCore.breakeven(tp,sl,cost),tp,sl,cost,delay,at:Date.now()});
     showReport(VTCore.backtestReport(items,cost),items,{tp,sl,cost,noData,delay,exit,fill,entries,grades,rows,moveInto,runUps:rows.filter(r=>r.pre.runUp15!=null).length,
+      rug:{n:rows.filter(r=>r.rf).length,cut:rows.filter(r=>r.rf&&r.rug.holders!=='verified').length,old:rows.filter(r=>r.rug?.done&&!r.rug.empty&&!(r.rug.v>=3)).length},gmN:rows.filter(r=>r.gm).length,gmUsed:rows.filter(r=>gmAt(r,delay)).length,
+      noExit,incomplete,staleExits,fresh,staleSum,worst,legacyCache:rows.filter(r=>!get('bt.f.'+r.call.id,null)).length,
       exits:exitRules(rows),forward:{n:fwd.length,rules:fwd.length?exitRules(fwd):[]}});
   }
   function showReport(rep,items,o){
@@ -1863,14 +3243,20 @@ function start() {
         'outcome_min','trough_min','r1','r2','r3','early5_outcome','early5_return','tp50_outcome','tp50_return','set_entry_min','set_tp','set_sl','set_cost','set_fill','set_early_exit',
         ...later.flatMap(d=>['grade','outcome','trade_return','peak','peak_min','r15','r60'].map(x=>'buy'+d+'_'+x)),
         'bots_pre_share','bots_pre_wallets','bots_pre_buyers','bots_2m_share','bots_2m_wallets','bots_2m_buyers','bots_trades','bots_truncated','live_bots_60s','live_bots_120s','live_buyers_120s','live_bots_complete',
-        'entry_move','run_up_15','migrated','trail_outcome','trail_return','bots_2m_organic_share','bots_2m_organic_trades','live_organic_120s'];
+        'entry_move','run_up_15','migrated','trail_outcome','trail_return','bots_2m_organic_share','bots_2m_organic_trades','live_organic_120s',
+        'rug_top10','rug_dev_pct','rug_dev_buy_pct','rug_dev_sold','rug_launch_buyers','rug_launch_pct','rug_seen_dev','rug_seen_funder','rug_complete','rug_creator','rug_funder','rug_grade',
+        'live_grade','live_score','live_checks','live_delay_s','live_insider_bag','live_bundlers','live_snipers','live_real_traders','live_fresh','live_dev_launches','live_vol_mc','live_smart','live_top10','live_dev_pct','live_cluster_wallets','live_cluster_pct','live_holders','live_first70_hold','live_dev_status',
+        'live_rules','live_risk','live_demand','live_entry','live_confidence','live_exit_cost','live_trade_sol','live_retention','live_profit_share','live_move'];
       const q=v=>v==null?'':/[",\n]/.test(String(v))?'"'+String(v).replace(/"/g,'""')+'"':String(v);
       const lines=o.rows.map(r=>{const {call:c,by,ex,late,hb,ft}=r, s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
         c.holders>0&&c.bots!=null?(100*c.bots/c.holders).toFixed(1):null,c.holders>0&&c.fresh!=null?(100*c.fresh/c.holders).toFixed(1):null,c.topHolder,c.holders,s.outcome,f(s.ret),f(s.peakPct),f(s.peakMin),f(s.troughPct),f(s.r5),f(s.r10),f(s.r15),f(s.r30),f(s.r60),
         f(s.outcomeMin),f(s.troughMin),f(s.r1),f(s.r2),f(s.r3),ex.early5.outcome,f(ex.early5.ret),ex.tp50.outcome,f(ex.tp50.ret),o.delay,o.tp,o.sl,o.cost,o.fill,o.exit||0,
         ...later.flatMap(d=>{const x=by[d];return [late[d],...(x.status==='scored'?[x.outcome,f(x.ret),f(x.peakPct),f(x.peakMin),f(x.r15),f(x.r60)]:[null,null,null,null,null,null])];}),
         hb?.pre?.share,hb?.pre?.bots,hb?.pre?.buyers,hb?.post?.share,hb?.post?.bots,hb?.post?.buyers,hb?.trades,hb?hb.truncated:null,ft?.vb60?.share,ft?.vb120?.share,ft?.vb120?.buyers,ft?.vb120?ft.vb120.complete:null,
-        f(o.moveInto(r,0)),f(r.pre.runUp15),c.migrated,ex.trail.outcome,f(ex.trail.ret),hb?.post?.org,hb?.post?.orgN,ft?.vb120?.org].map(q).join(',');});
+        f(o.moveInto(r,0)),f(r.pre.runUp15),c.migrated,ex.trail.outcome,f(ex.trail.ret),hb?.post?.org,hb?.post?.orgN,ft?.vb120?.org,
+        ...(r.rf?[r.rf.top10,r.rf.devPct,r.rug.devBuyPct,r.rf.devSold,r.rf.launchBuyers,r.rf.launchPct,r.rf.seenDev,r.rf.seenFund,r.rug.complete,r.rug.creator,r.rug.funder,['clean','risky','avoid'][r.rf.grade]??null]:Array(12).fill(null)),
+        ...(r.gm?[r.gm.grade,r.gm.score,r.gm.known,r.gm.delay,r.gm.insiderHold,r.gm.bundlerPct,r.gm.sniperPct,r.gm.platformRate,r.gm.freshRate,r.gm.launches,r.gm.volMc,r.gm.smart,r.gm.top10,r.gm.devPct,r.gm.clusterN,r.gm.clusterPct,r.gm.holders,r.gm.first70Hold,r.gm.devStatus,
+          r.gm.v>=2?'4.3':'old',r.gm.risk,r.gm.demand,r.gm.entry,r.gm.conf,r.gm.exitCost,r.gm.tradeSol,r.gm.retention,r.gm.profitShare,r.gm.move]:Array(29).fill(null))].map(q).join(',');});
       const url=URL.createObjectURL(new Blob([[cols.join(','),...lines].join('\n')],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='voltrak-backtest-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     };
     const a=rep.all, t=rep.timing;
@@ -1906,6 +3292,12 @@ function start() {
       if(o.noData&&!o.delay)box.append(el('p','margin:0 0 10px;color:'+C.muted,'Survivorship check: '+o.noData+' call'+(o.noData===1?'':'s')+' had no price data and '+(o.noData===1?'is':'are')+' left out above. If '+(o.noData===1?'it':'they all')+' had lost the stop, the average would be '
         +pct((a.ev*a.n+(o.sl-o.cost)*o.noData)/(a.n+o.noData))+' per trade over '+(a.n+o.noData)+' calls.'));
       if(a.n<30)box.append(el('p','margin:0 0 12px;padding:8px 10px;border-radius:8px;background:#3d3214;color:'+C.amber,'Only '+a.n+' calls scored: too few to trust any pattern. Scroll further back in the channel and score again; 100+ calls gives usable ranges.'));
+      // Three ways to count the exits that were only a stale price.
+      box.append(el('h3','margin:4px 0 4px;font-size:14px','Three ways to count the exits'));
+      table('Counting',[[['Fills only',String(o.fresh.n),rate(o.fresh),pct(o.fresh.ev),pct(o.fresh.medianPeak),'stale exits left out'],''],
+        [['All (the numbers above)',String(a.n),rate(a),pct(a.ev),pct(a.medianPeak),o.staleExits?o.staleExits+' at their last price':'no stale exits'],''],
+        [['Worst case',String(o.worst.n),rate(o.worst),pct(o.worst.ev),pct(o.worst.medianPeak),o.staleExits?o.staleExits+' counted as −100%':'same as all'],o.staleExits?C.amber:'']]);
+      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'A stale exit is a coin still open at the end of the window with no trade in its last 15+ min: the price is a mark, not proof you could sell. Left out of all three: '+o.noExit+' with no trade after the entry, '+o.incomplete+' with candles that stop early.'));
     }
     // Same calls bought at the alert, +10 and +30 min: does waiting for the first dump help?
     box.append(el('h3','margin:4px 0 4px;font-size:14px','When to buy: same calls, same target and stop'));
@@ -1967,6 +3359,13 @@ function start() {
     box.append(el('p','margin:0 0 4px;color:'+C.muted,'Peaks (from entry): '+t.peakWithin5.toFixed(0)+'% of calls peaked within 5 min, '+t.peakWithin15.toFixed(0)+'% within 15, '+t.peakWithin60.toFixed(0)+'% within 60.'));
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'Win = target hit before the stop. Each bucket\'s average per trade is compared with the rest of the calls. With '+rep.tested+' buckets tested, a few always look different by chance, so a bucket only "stands out" (green or red) when it and the rest have 15+ calls each and the gap clears a bar corrected for all '+rep.tested+' tests (about a 5% chance per report of any false find). Past calls only: a filter is worth using only if it keeps working on new calls.'));
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'"Move into entry" = your fill vs the last trade before the alert: how far the call\'s own crowd had already pushed the price (the live panel\'s "vs call MC" number). "Run-up" = the 15 min before the alert; '+o.runUps+' of '+o.rows.length+' calls have those prices so far (older calls get them on the next "Score calls").'));
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Rug checks: '+o.rug.n+' of '+o.rows.length+' calls have one'+(o.rug.cut?' ('+o.rug.cut+' busy coins have only the launch block and funder)':'')+'. The rules (top 10 over 25%, dev over 5% or selling, 4+ launch-block wallets) come from an article and are untested; the tables below show whether they mattered on your calls. Add checks to more calls with "Add rug checks to past calls".'));
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Live score at the call (GMGN numbers + chain checks): '+o.gmN+' of '+o.rows.length+' calls have one; '+o.gmUsed+' of them were saved before this entry time and are used (a score saved after the entry is left out, so it cannot peek). Usually saved 10 to 40s after the alert: choose "Buy at 1 min" to test it. GMGN only gives today'+String.fromCharCode(8217)+'s numbers, so this builds up from calls that open on GMGN from 3.9 on; the "Live grade" and "Live score" tables need about 100 of them before they say much.'));
+    const pf=v=>v==null?'n/a':(v>=0?'+':'')+v.toFixed(0)+'%';
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'Exit data: '+o.noExit+' call'+(o.noExit===1?'':'s')+' had no trade after the entry and '+o.incomplete+' had candles that did not reach the end of the 2h window; both are left out, not counted as flat. '
+      +o.staleExits+' scored call'+(o.staleExits===1?'':'s')+' ended still open with no trade in the last 15+ min, so the exit is a stale price, not a fill'+(o.staleExits?': they average '+pf(o.staleSum.ev)+' and are kept above (never as wins); without them the win rate is '+(o.fresh.winRate==null?'n/a':o.fresh.winRate.toFixed(0)+'%')+' and the average '+pf(o.fresh.ev)+'.':'.')
+      +' Coverage assumes GeckoTerminal is at most 5 min behind when the candles were fetched'+(o.legacyCache?'; '+o.legacyCache+' older caches have no fetch time and are counted as covered':'')+'.'
+      +(o.rug.old?' '+o.rug.old+' rug checks were saved before 4.2 and are not used in the tables until re-checked ("Add rug checks to past calls").':'')));
     const gap=r=>r.diff==null?'':(r.diff>=0?'+':'')+r.diff.toFixed(0)+' pts vs the rest';
     for(const f of rep.features){
       box.append(el('h3','margin:16px 0 4px;font-size:14px',f.name));
@@ -1989,9 +3388,14 @@ function start() {
         const call=get('latest',null), receipts=get('receipts',{});
         const action=VTCore.handoff(call,receipts,VTCore.mintFromURL(location.href),Date.now());
         if(action!=='navigate'&&action!=='already-open')return;
+        // One tab shows one coin, so the newest call wins. Older live calls that never opened here are marked skipped
+        // (they keep their background checks and pings, and stay in Calls) and named, so a fast double call is not silent.
+        const skipped=calls().filter(c=>!c.historical&&!c.manual&&!c.unverified&&c.id!==call.id&&!receipts[c.id]&&c.messageAt<call.messageAt&&Date.now()-c.messageAt<120000);
+        for(const c of skipped)receipts[c.id]=-Date.now();
         // Durable receipt BEFORE navigation: startup replay cannot reload this call again.
-        receipts[call.id]=Date.now();set('receipts',Object.fromEntries(Object.entries(receipts).sort((a,b)=>b[1]-a[1]).slice(0,1000)));
-        notice('Received '+call.name+' once');
+        latMark(call.mint,'handoff');
+        receipts[call.id]=Date.now();set('receipts',Object.fromEntries(Object.entries(receipts).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,1000)));
+        notice(skipped.length?'Opened '+call.name+' (newest); skipped '+skipped.map(c=>c.name).join(', ')+': see Calls':'Received '+call.name+' once');
         if(action==='navigate')openToken(call.mint);
       });
     }finally{receiving=false;}
@@ -2085,7 +3489,8 @@ function start() {
   GM_addValueChangeListener(PREFIX+'marketSnap',()=>{if(!(GMGN&&isReceiver))renderMarket();});
   GM_addValueChangeListener(PREFIX+'bt.done',()=>renderBt());
   GM_addValueChangeListener(PREFIX+'late',()=>renderLate());
-  every(5000,lateChecks);every(15000,renderLate);
+  every(5000,lateChecks);every(15000,renderLate);every(5000,rugTick);
+  GM_addValueChangeListener(PREFIX+'rugIds',()=>{rugIdx=null;});
   if(GMGN){
     GM_addValueChangeListener(PREFIX+'latest',()=>receiveLatest());
     VTLive.on(frame=>{
@@ -2094,15 +3499,20 @@ function start() {
       if(live.mint!==pageMint)switchLive(pageMint);
       let changed=false;
       for(const x of frame.items){
-        // Only the token on screen. Rows without an address are trusted once the page has been on its token for 3s.
-        const a=VTCore.addrOf(x);if(a?a!==pageMint:now-live.since<3000)continue;
+        // Only the token on screen. GMGN's rows carry the token address; a row without one is never assumed to match.
+        const a=VTCore.addrOf(x);if(a!==pageMint)continue;
         if(frame.channel==='token_stat'){live.stat=VTCore.gmgnStat(x,now);changed=true;continue;}
+        // Maker info: GMGN's label for the wallet behind each trade (the trade itself also comes on token_activity).
+        if(frame.channel==='token_activity_info_all'){putProf(VTCore.gmgnMaker(x));const it=VTCore.gmgnTrade(x);if(it)gmOnTrade(it,pageMint);changed=true;continue;}
         const t=VTCore.gmgnTrade(x), key=t&&tradeKey(t);if(!t||key&&live.keys.has(key))continue;
         if(key)live.keys.add(key);live.trades.push(t);changed=true;
+        // Rug checks: every trade updates the holders live; a dev sale alerts at once.
+        const RL=rugLive.get(pageMint);if(RL?.status==='ok'){const ev=rugFeed(RL,t);if(ev)devAlert(RL,ev);}
+        gmOnTrade(t,pageMint);
         if(t.sol>0&&t.usd>0){solUsd=t.usd/t.sol;solAt=now;}
       }
       if(!changed)return;
-      live.at=now;live.first=live.first||now;
+      live.at=now;live.first=live.first||now;latMark(pageMint,'feed');
       if(now-live.prunedAt>10000){live.prunedAt=now;live.trades=live.trades.filter(t=>now-t.at<=360000).slice(-3000);live.keys=new Set(live.trades.map(tradeKey).filter(Boolean));}
       soon();
     });
@@ -2121,7 +3531,9 @@ function start() {
           marketConnect();refreshSol();
           if(Date.now()-lastSnap>=10000){lastSnap=Date.now();tape.prune(lastSnap);if(ppSince)set('marketSnap',marketView());}
         }else if(pp)marketDisconnect();
-        recordBots();poll();pollFlow();render();
+        if(current&&live.mint===current&&!live.fill)backfillTrades(current);
+        if(current)latMark(current,'open');
+        recordBots();rugAuto();rugCatchTick();gmTick();jupTick();rcTick();poll();pollFlow();render();
       }finally{ticking=false;}
     }
     // Short delay lets a duplicated tab learn it needs a fresh ID before it can act as the receiver.
@@ -2137,6 +3549,12 @@ function start() {
       if(name!==AUTHOR)return false;
       return !AUTHOR_ID||h.li.querySelector('img[src*="/avatars/"]')?.src.match(/\/avatars\/(\d+)\//)?.[1]===AUTHOR_ID;
     };
+    // VolTrak's sender ID (the number in its avatar URL), learned from the alerts on screen (the most common one) unless
+    // AUTHOR_ID is set. A "VolTrak" alert from another ID is saved but flagged unverified: it is not opened on GMGN and
+    // not pinged. Settings → "Re-learn VolTrak sender" resets it (e.g. if VolTrak changes its bot).
+    const authorIdOf=li=>headerOf(li)?.li.querySelector('img[src*="/avatars/"]')?.src.match(/\/avatars\/(\d+)\//)?.[1]||null;
+    const trustedId=()=>AUTHOR_ID||get('authorId','');
+    const senderMode=()=>AUTHOR_ID?'':get('authorMode','');
     const originalTime=li=>{const t=li.querySelector('time[datetime]');if(t)return Date.parse(t.getAttribute('datetime'));const id=li.id.match(/-(\d+)$/)?.[1];try{return id?Number(BigInt(id)>>22n)+1420070400000:NaN;}catch(_){return NaN;}};
     const alertText=li=>{const title=li.querySelector('[class*="embedTitle"]')?.textContent?.trim();if(!title)return li.innerText||'';const labels=[...li.querySelectorAll('[class*="embedFieldName"]')];
       const desc=li.querySelector('[class*="embedDescription"]')?.textContent||'';
@@ -2151,20 +3569,31 @@ function start() {
         const lis=[...document.querySelectorAll('li[id^="chat-messages-"]')];
         // Never arm from an empty/loading message list: first complete screen is history.
         if(!lis.length)return;
+        // Learn the sender from the alerts on screen: the most common avatar ID among VolTrak-named alerts (3+ needed).
+        // Learn the sender from the alerts on screen: the most common account ID among VolTrak-named alerts (3+ needed).
+        // If 3+ VolTrak alerts carry no account ID at all, VolTrak cannot be told apart by account: "name-only" mode,
+        // shown in Settings. Until either is learned, no alert is opened or pinged automatically.
+        if(!trustedId()&&!senderMode()){const n=new Map();let none=0;for(const li of lis){if(fromVolTrak(li)!==true||!VTCore.parseAlert(alertText(li)))continue;const a=authorIdOf(li);if(a)n.set(a,(n.get(a)||0)+1);else none++;}
+          const best=[...n].sort((a,b)=>b[1]-a[1])[0];if(best&&best[1]>=3)set('authorId',best[0]);else if(!n.size&&none>=3)set('authorMode','name-only');}
         for(const li of lis){
           const id=li.id.match(/-(\d+)$/)?.[1];if(!id||existing.has(id)||others.has(id))continue;
           const who=fromVolTrak(li);if(who===false)others.add(id);if(!who)continue;
           const parsed=VTCore.parseAlert(alertText(li));if(!parsed)continue;
           const messageAt=originalTime(li), now=Date.now();if(!Number.isFinite(messageAt))continue;
           const historical=initial||now-messageAt>30000||messageAt>now+5000;
-          const call={...parsed,id,messageAt,receivedAt:now,historical};
+          const aid=authorIdOf(li), trust=VTCore.senderTrust(aid,trustedId(),senderMode()), unverified=trust!=='ok';
+          const call={...parsed,id,messageAt,receivedAt:now,historical,...(unverified?{unverified:true,sender:trust,authorId:aid}:{})};
           if(!await addCall(call))continue;existing.add(id);
-          if(!historical){
+          if(!historical&&unverified){
+            const why={mismatch:'sent by a different account than usual',['no-id']:'its account could not be read',unknown:'the VolTrak account is not learned yet'}[call.sender]||'sender not verified';
+            GM_notification({title:'Unverified VolTrak sender · '+call.name,text:'Named VolTrak but '+why+'. Saved in Calls; not opened, pinged or checked. If VolTrak changed its bot, use Settings → Re-learn VolTrak sender.',timeout:15000});
+          }else if(!historical){
             await locked('publish',()=>{
               const sent=get('published',{});if(now-(sent[call.mint]||0)<60000)return;
               sent[call.mint]=now;set('published',Object.fromEntries(Object.entries(sent).filter(([,t])=>now-t<600000)));set('latest',call);
               GM_setClipboard(call.mint,'text');announce(call);
               GM_notification({title:'VolTrak · '+call.name,text:receiverAlive(receiver())?'Context sent to GMGN.':'No GMGN receiver. Open GMGN to review.',timeout:6000});
+              tgCall(call);
             });
           }
         }
