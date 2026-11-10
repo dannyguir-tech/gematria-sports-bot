@@ -44,6 +44,17 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.test.mjs`
 
+### 4.4.1
+
+Fixes for defects an independent review found in 4.4.0.
+
+- **Your position.** The card shows only the position held now: an earlier round trip on the same coin is no longer blended into the entry, the profit or the 5-minute rule. A sale of tokens the tab never saw bought counts only for the part it did see, so it cannot appear as profit. The 5-minute notification fires once per entry, across tabs and reloads. A wallet saved in one tab is picked up by the others; a different address starts with clean fills.
+- **Speed table.** A Helius window cut short at 40 pages no longer saves "price did not move": the two minutes after the alert are read again on their own. Rows whose SOL amount is only fees are left out. Speed prices saved by 4.4.0 are not used until "Add trades to past calls" reads those calls again.
+- **Backtest.** A small bucket that happens to hold no winner no longer "stands out" (the test now uses the larger of the Welch and the pooled error).
+- **Volume bots.** A held earlier buy can no longer take the sell of a 10-second round trip (which turned counted bots into "possible"). A slow flat trip from a trading-app wallet is not marked.
+- **Discord.** The follow-up scan no longer re-arms itself (it scanned about 8 times a second forever); the panel refreshes on its own again; an alert whose embed arrives in parts is read when its text arrives.
+- **UI.** Dial arcs render in Firefox; position row, state title, check values and grade title are no longer cut off.
+
 ### 4.4.0
 
 - **Speed.** Discord alerts are read on the first page change instead of after a restarted 120ms wait. In a simulated busy channel the time from alert to published call went from 1.7–3.9s to about 5ms.

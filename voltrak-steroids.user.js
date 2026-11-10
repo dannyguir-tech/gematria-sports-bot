@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VolTrak Steroids 4.3
 // @namespace    voltrak-alert
-// @version      4.4.0
+// @version      4.4.1
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), live rug checks (dev, top 10, launch block, funder), GMGN holder data, insider-exit alerts, a live coin score, Telegram pings, market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -298,13 +298,15 @@ const VTCore = (() => {
   // Prices are SOL per token, volume-weighted over a short window, so one small trade's fees and tips do not move them
   // (a row's SOL includes them; right after an alert most trades are buys, so these read 1-2% high: that is what a
   // buyer paid). pre = the 10s before the alert, else the last traded second before it. pct[s] = % above pre in the 3
-  // seconds from alert+s (else carried forward from the last traded second). entry[s] = that price as a multiple of the
+  // seconds from alert+s (else carried forward from the last traded second). Rows under 0.02 SOL are left out (a swap
+  // paid in another token shows only its fees as SOL) and 3 seconds with under 0.05 SOL traded are not a price: both
+  // would give a price far from the real one. entry[s] = that price as a multiple of the
   // last price in its own minute: the report multiplies that minute's candle close by it, so the fill is on the candles'
   // own price scale. Block times have 1s resolution: a trade in the alert's own second counts as before the alert.
   const SPEED_AT = [2, 5, 10, 15, 30, 60];
   function pricePath(rows, alertAt) {
-    const ok = (rows || []).filter(r => r && r.sol > 0 && r.amount > 0 && Number.isFinite(r.at)).sort((a, b) => a.at - b.at);
-    const vwap = (from, to) => { let s = 0, a = 0; for (const r of ok) if (r.at >= from && r.at < to) { s += r.sol; a += r.amount; } return a > 0 ? s / a : null; };
+    const ok = (rows || []).filter(r => r && r.sol >= 0.02 && r.amount > 0 && Number.isFinite(r.at)).sort((a, b) => a.at - b.at);
+    const vwap = (from, to) => { let s = 0, a = 0; for (const r of ok) if (r.at >= from && r.at < to) { s += r.sol; a += r.amount; } return a > 0 && s >= 0.05 ? s / a : null; };
     // Carry-forward: the latest second before t that traded 0.05 SOL or more (big enough for fees and tips not to
     // matter), else the latest second with any trade.
     const lastBefore = t => { let any = null, i = ok.length - 1; while (i >= 0 && ok[i].at >= t) i--;
@@ -324,17 +326,31 @@ const VTCore = (() => {
   // ---- Your own fills (4.4): one wallet's trades on a coin → position ----
   // rows: that wallet's trades {at, side, usd, amount, price}. avg = USD paid per token. pnl (%, before fees) =
   // (USD received + what is left at `price`) / USD paid - 1; mark = `price` vs avg. open = more than 1% still held.
-  function position(rows, price) {
-    let tokIn = 0, tokOut = 0, usdIn = 0, usdOut = 0, entryAt = null, last = null, n = 0;
-    for (const t of rows || []) {
-      const tok = tradeTokens(t);
-      if (!(tok > 0) || !(t.usd > 0) || (t.side !== 'buy' && t.side !== 'sell')) continue;
-      n++; last = Math.max(last ?? t.at, t.at);
-      if (t.side === 'buy') { tokIn += tok; usdIn += t.usd; entryAt = Math.min(entryAt ?? t.at, t.at); } else { tokOut += tok; usdOut += t.usd; }
+  // Fills are read oldest first (same second: buys first). A sale only counts for tokens bought earlier in these rows:
+  // the part of a sale that sells tokens bought elsewhere (a buy that was never seen, or one outside the rows) is left
+  // out with its dollars, and `partial` is set, so it cannot show up as profit. latest = true: only the position held
+  // now, i.e. from the first buy after the wallet was last flat (1% or less left); an older round trip is not part of it.
+  function position(rows, price, latest = false) {
+    const list = (rows || []).filter(t => t && (t.side === 'buy' || t.side === 'sell') && t.usd > 0 && tradeTokens(t) > 0 && Number.isFinite(t.at))
+      .sort((a, b) => a.at - b.at || (b.side === 'buy') - (a.side === 'buy'));
+    let tokIn = 0, tokOut = 0, usdIn = 0, usdOut = 0, entryAt = null, last = null, n = 0, partial = false;
+    for (const t of list) {
+      const tok = tradeTokens(t), left = tokIn - tokOut;
+      if (t.side === 'buy') {
+        if (latest && tokIn > 0 && left <= tokIn * 0.01) { tokIn = tokOut = usdIn = usdOut = n = 0; entryAt = null; partial = false; }
+        tokIn += tok; usdIn += t.usd; entryAt = entryAt ?? t.at;
+      } else {
+        if (!(tokIn > 0)) continue; // nothing bought in these rows yet: not part of this position
+        const part = left > 0 ? Math.min(1, left / tok) : 0;
+        if (part < 0.98) partial = true;
+        if (!part) continue;
+        tokOut += tok * part; usdOut += t.usd * part;
+      }
+      n++; last = t.at;
     }
     if (!(usdIn > 0) || !(tokIn > 0)) return null;
     const held = Math.max(0, tokIn - tokOut), avg = usdIn / tokIn, open = held > tokIn * 0.01, value = price > 0 ? held * price : null;
-    return {n, entryAt, last, usdIn, usdOut, avg, held, heldFrac: held / tokIn, open, mark: price > 0 ? (price / avg - 1) * 100 : null,
+    return {n, entryAt, last, usdIn, usdOut, avg, held, heldFrac: held / tokIn, open, partial, mark: price > 0 ? (price / avg - 1) * 100 : null,
       pnl: !open ? (usdOut / usdIn - 1) * 100 : value == null ? null : ((value + usdOut) / usdIn - 1) * 100};
   }
   // Win rate needed to break even when every trade ends at +tp or sl (sl negative), after a round-trip cost in %.
@@ -426,7 +442,7 @@ const VTCore = (() => {
     return edgeLabel(cuts[i - 1], unit) + '–' + edgeLabel(cuts[i], unit);
   }
   // items [{call, score}] (scored only) → baseline, per-field buckets and timing. Each bucket is compared with the rest
-  // of the calls on the average per trade (Welch t). With dozens of buckets some differ by chance (the old rule, CI vs
+  // of the calls on the average per trade (a t-test with the larger of the Welch and the pooled error). With dozens of buckets some differ by chance (the old rule, CI vs
   // baseline win rate, flagged at least one bucket in about a third of reports on data with no effect at all), so a
   // bucket only "stands out" when it and the rest each have 15+ calls and |t| clears the Bonferroni bar for every
   // bucket tested: about a 5% chance per report of any false find. Two families (4.4): the primary hypotheses share a
@@ -445,7 +461,10 @@ const VTCore = (() => {
       let diff = null, t = null, bar = null;
       if (testable(r)) {
         const [s, q] = sums(list), n2 = all.n - r.n, m1 = s / r.n, m2 = (T[0] - s) / n2;
-        const a = Math.max(0, q - r.n * m1 * m1) / (r.n - 1) / r.n, b = Math.max(0, T[1] - q - n2 * m2 * m2) / (n2 - 1) / n2, se = Math.sqrt(a + b);
+        const ss1 = Math.max(0, q - r.n * m1 * m1), ss2 = Math.max(0, T[1] - q - n2 * m2 * m2), a = ss1 / (r.n - 1) / r.n, b = ss2 / (n2 - 1) / n2;
+        // The larger of the Welch and the pooled error: a small bucket whose calls all ended the same way (all stopped
+        // out) has almost no spread of its own, and on that alone it would "stand out" by chance.
+        const se = Math.sqrt(Math.max(a + b, (ss1 + ss2) / (r.n + n2 - 2) * (1 / r.n + 1 / n2)));
         const df = a + b > 0 ? (a + b) ** 2 / (a * a / (r.n - 1) + b * b / (n2 - 1)) : r.n + n2 - 2;
         diff = m1 - m2; t = se > 0 ? diff / se : diff ? Math.sign(diff) * Infinity : 0; bar = tFor(p, Math.max(2, df));
       }
@@ -542,12 +561,14 @@ const VTCore = (() => {
     const tokens = t => t.amount > 0 ? t.amount : null, byWallet = group(rows.filter(t => !arbLegs.has(t)), t => t.wallet);
     for (const list of byWallet.values()) {
       const used = new Set();
-      for (const b of list) {
+      // Two passes: sells within 10s first (counted bots), then within 60s (possible). In one pass an earlier buy
+      // could take the sell that closes a later buy's 10-second round trip.
+      for (const win of [o.fastSec, o.suspectSec]) for (const b of list) {
         if (b.side !== 'buy' || rule.has(b) || !(b.usd > 0)) continue;
         let tok = 0, usd = 0, end = null; const legs = [];
         for (const s of list) {
           if (s.side !== 'sell' || used.has(s) || rule.has(s) || s.at < b.at - 999) continue; // 1s timestamps: a sell stamped in the buy's second may pair
-          if (s.at - b.at > o.suspectSec * 1000) break;
+          if (s.at - b.at > win * 1000) break;
           legs.push(s); tok += tokens(s) ?? 0; usd += s.usd || 0; end = s.at;
           if (tokens(b) ? tok >= o.tokFrac * tokens(b) : usd >= (1 - o.flatTol) * b.usd) break;
         }
@@ -555,8 +576,11 @@ const VTCore = (() => {
         const back = tokens(b) ? tok >= o.tokFrac * tokens(b) && tok <= (2 - o.tokFrac) * tokens(b) : legs.length > 0;
         const flat = tokens(b) && tok > 0 ? Math.abs((usd / tok) / (b.usd / tokens(b)) - 1) <= o.flatTol : Math.abs(usd - b.usd) <= o.flatTol * b.usd;
         if (!back || !flat) continue;
+        // A slow flat trip from a trading-app wallet is a person who changed their mind, as in the other "possible" rules.
+        const fast = end - b.at <= o.fastSec * 1000;
+        if (!fast && isApp(P(b.wallet))) continue;
         legs.forEach(s => used.add(s));
-        if (end - b.at <= o.fastSec * 1000) { mark(b, 'fastTrip'); legs.forEach(s => mark(s, 'fastTrip')); } else { suspectUsd += b.usd + usd; mark(b, 'slowTrip'); legs.forEach(s => mark(s, 'slowTrip')); }
+        if (fast) { mark(b, 'fastTrip'); legs.forEach(s => mark(s, 'fastTrip')); } else { suspectUsd += b.usd + usd; mark(b, 'slowTrip'); legs.forEach(s => mark(s, 'slowTrip')); }
       }
     }
     // 2) Possible (heuristics): many trades on this coin with a flat lifetime position, mirrored sizes across two wallets,
@@ -567,12 +591,13 @@ const VTCore = (() => {
       if (p.tt >= o.heavyAny || p.tt >= o.heavyTt && flatness(p) >= o.heavyFlat) mark(t, 'heavy');
       else if (p.tt >= o.lifeTt && flatness(p) >= o.lifeFlat && !isApp(p)) mark(t, 'lifeChurn');
     }
+    const taken = t => rule.has(t) && rule.get(t) !== 'slowTrip'; // a slow round trip can still be one half of a mirror
     for (let i = 0; i < rows.length; i++) {
       const a = rows[i];
-      if (rule.has(a) || arbLegs.has(a) || !(a.amount > 0) || isApp(P(a.wallet))) continue;
+      if (taken(a) || arbLegs.has(a) || !(a.amount > 0) || isApp(P(a.wallet))) continue;
       for (let j = i + 1; j < rows.length && rows[j].at - a.at <= o.mirrorSec * 1000; j++) {
         const b = rows[j];
-        if (b.side === a.side || b.wallet === a.wallet || rule.has(b) || arbLegs.has(b) || !(b.amount > 0) || isApp(P(b.wallet))) continue;
+        if (b.side === a.side || b.wallet === a.wallet || taken(b) || arbLegs.has(b) || !(b.amount > 0) || isApp(P(b.wallet))) continue;
         if (Math.abs(b.amount / a.amount - 1) <= o.mirrorTol) { mark(a, 'mirror'); mark(b, 'mirror'); break; }
       }
     }
@@ -1832,6 +1857,7 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .pt.bad::before,#vts-root .pt.conf.low::before{background:var(--sell)}
 #vts-root .pt b{font-size:18px}
 #vts-root .ck{border-radius:8px;padding:6px 8px}
+#vts-root .ck b{flex-shrink:0}
 #vts-root .ck i{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#ffffff0a;font-size:10.5px}
 #vts-root .ck.pass i{background:var(--buy-bg);box-shadow:inset 0 0 0 1px var(--buy-line)}
 #vts-root .ck.warn i{background:var(--warn);color:var(--warn-ink)}
@@ -1850,7 +1876,8 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .mypos.up::before{background:var(--buy);box-shadow:0 0 12px var(--buy)}
 #vts-root .mypos.down{border-color:var(--sell-line);background:linear-gradient(90deg,var(--sell-bg),var(--card) 72%)}
 #vts-root .mypos.down::before{background:var(--sell);box-shadow:0 0 12px var(--sell)}
-#vts-root .mypos .row1{display:flex;align-items:baseline;gap:10px;min-width:0}
+#vts-root .mypos .row1{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;min-width:0}
+#vts-root .mypos .row1 .lbl,#vts-root .mypos .row1 b{flex:none}
 #vts-root .mypos .row1 b{font:850 26px/1 var(--sans);font-variant-numeric:tabular-nums;letter-spacing:-.02em;white-space:nowrap}
 #vts-root .mypos .row1 b.pos::before{content:"\25B2";margin-right:4px;font-size:.5em;vertical-align:.3em}
 #vts-root .mypos .row1 b.neg::before{content:"\25BC";margin-right:4px;font-size:.5em;vertical-align:.3em}
@@ -1897,9 +1924,9 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .hero::after{content:"";position:absolute;inset:5px;pointer-events:none;background-repeat:no-repeat;
   background-image:linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0);
   background-position:right top,right top,left bottom,left bottom,right bottom,right bottom;background-size:14px 2px,2px 14px,14px 2px,2px 14px,14px 2px,2px 14px}
-#vts-root[data-tone=sell] .hero::after,#vts-root[data-tone=caution] .hero::after{background-position:right 200px top,right 200px top,left bottom,left bottom,right bottom,right bottom}
+#vts-root[data-tone=sell] .hero::after,#vts-root[data-tone=caution] .hero::after{background-size:0 0,0 0,14px 2px,2px 14px,14px 2px,2px 14px}
 #vts-root .band{min-height:62px;overflow:hidden;position:relative}
-#vts-root .band [data-vts=state]{font-size:clamp(16px,5.8cqi,23px);letter-spacing:.05em}
+#vts-root .band [data-vts=state]{font-size:clamp(15px,5.3cqi,21px);letter-spacing:0}
 /* the dial */
 #vts-root .cockpit{grid-template-columns:150px minmax(0,1fr);align-items:center;column-gap:14px;padding:12px 14px 4px 10px}
 #vts-root .dial{position:relative;width:150px;height:136px;--p:0}
@@ -1907,8 +1934,8 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .dial circle{fill:none;transform:rotate(135deg);transform-origin:60px 60px}
 #vts-root .dial .tk{stroke:#ffffff40;stroke-width:3.5;stroke-dasharray:.5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 24.5}
 #vts-root .dial .tr{stroke:#03060a;stroke-width:12;stroke-dasharray:75 100;filter:drop-shadow(0 1px 0 #ffffff14)}
-#vts-root .dial .sl{stroke:var(--sell);stroke-width:8;stroke-dasharray:calc((100 - var(--p))*.75) 100;stroke-dashoffset:calc(var(--p)*-.75);opacity:.9;transition:stroke-dasharray .5s ease,stroke-dashoffset .5s ease}
-#vts-root .dial .by{stroke:var(--buy);stroke-width:8;stroke-dasharray:calc(var(--p)*.75) 100;filter:drop-shadow(0 0 5px var(--buy));transition:stroke-dasharray .5s ease}
+#vts-root .dial .sl{stroke:var(--sell);stroke-width:8;stroke-dasharray:calc((100 - var(--p))*.75px) 100;stroke-dashoffset:calc(var(--p)*-.75px);opacity:.9}
+#vts-root .dial .by{stroke:var(--buy);stroke-width:8;stroke-dasharray:calc(var(--p)*.75px) 100;filter:drop-shadow(0 0 5px var(--buy))}
 #vts-root .dial.empty .sl{stroke:#1a2430}
 #vts-root .dial.empty .by{stroke:transparent;filter:none}
 #vts-root .dial .mid{stroke:#fff;stroke-width:2.5;stroke-linecap:round;filter:drop-shadow(0 0 3px #fff)}
@@ -1936,6 +1963,7 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .grade.g-avoid{--gc:color-mix(in srgb,var(--sell) 65%,transparent)}
 #vts-root .grade.g-avoid .gl{background:repeating-linear-gradient(135deg,var(--sell) 0 6px,#b72c40 6px 12px);color:#fff}
 #vts-root .grade strong{font:900 18px/1 var(--sans);letter-spacing:.09em;text-transform:uppercase}
+#vts-root .grade.few strong{font-size:13px;letter-spacing:.04em}
 /* the four parts: bar meters */
 #vts-root .pt::after{content:"";display:block;height:4px;margin-top:6px;border-radius:2px;background:linear-gradient(90deg,var(--pc,var(--line3)) var(--w,0%),#ffffff14 var(--w,0%))}
 #vts-root .pt.ok,#vts-root .pt.conf.high{--pc:var(--buy)}
@@ -1945,6 +1973,7 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .pt.conf b{font:850 15px/1.3 var(--sans);text-transform:uppercase;letter-spacing:.04em}
 #vts-root .kpi b,#vts-root .bots .bv b,#vts-root .ins .row1 b{font-family:var(--mono);letter-spacing:-.03em}
 @media (prefers-reduced-motion:no-preference){
+  #vts-root .dial .sl,#vts-root .dial .by{transition:stroke-dasharray .5s ease,stroke-dashoffset .5s ease}
   #vts-root .band::after{content:"";position:absolute;top:0;bottom:0;left:-40%;width:34%;pointer-events:none;background:linear-gradient(100deg,transparent,#ffffff14,transparent);animation:vts-sheen 5s linear infinite}
   @keyframes vts-sheen{0%,55%{left:-40%}100%{left:120%}}
 }
@@ -1954,6 +1983,7 @@ const PANEL_CSS = String.raw`/* ================================================
   #vts-root .dial svg{width:132px;height:132px}
   #vts-root .dial .dc{top:29px}
   #vts-root .dial .big{font-size:40px}
+  #vts-root .dial .side{font-size:7.5px;letter-spacing:0;padding:2px 4px}
 }`;
 const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusable="false">
 <symbol id="vts-i-up" viewBox="0 0 16 16"><path d="M8 2.2 15.2 13.8H.8z"/></symbol>
@@ -2147,7 +2177,7 @@ function start() {
   // Your own fills (4.4): the trades of the wallet set in Settings, kept per coin ('mine.<mint>') so a position survives
   // leaving the coin and coming back. Read from GMGN's public trade feed and trades list; nothing else is fetched.
   let myWallet=String(get('myWallet','')||'').trim();
-  const resetLive=mint=>{live={mint,since:Date.now(),first:0,at:0,stat:null,trades:[],keys:new Set(),prunedAt:Date.now(),prof:new Map(),profVer:0,fill:null,mine:mint&&myWallet?get('mine.'+mint,[]):[],posNoted:false};};resetLive(current);
+  const resetLive=mint=>{live={mint,since:Date.now(),first:0,at:0,stat:null,trades:[],keys:new Set(),prunedAt:Date.now(),prof:new Map(),profVer:0,fill:null,mine:mint&&myWallet?get('mine.'+mint,[]):[],posNoted:null};};resetLive(current);
   function mineAdd(t,mint){
     if(!myWallet||t.wallet!==myWallet||live.mint!==mint)return;
     const id=t.hash?t.hash+'|'+t.side:t.at+'|'+t.side+'|'+t.usd;
@@ -2298,7 +2328,13 @@ function start() {
   if(tgReady())tgStatus('Connected: pings go to your Telegram bot.');
   $('my-wallet').value=myWallet;$('pos-rule').checked=get('posRule',true);$('pos-rule').onchange=()=>set('posRule',$('pos-rule').checked);
   $('my-save').onclick=()=>{const v=$('my-wallet').value.trim();if(v&&!VTCore.MINT.test(v)){$('my-status').textContent='That is not a Solana address.';return;}
-    myWallet=v;set('myWallet',v);live.mine=v&&live.mint?get('mine.'+live.mint,[]):[];$('my-status').textContent=v?'Saved. Your fills on the coin on screen show under the gauge from your next trade there.':'Removed.';render();};
+    // Saved fills belong to one wallet. A different address starts clean; removing the address keeps them for when
+    // the same one is put back.
+    const owner=get('mineWallet','')||myWallet, swap=!!(v&&owner&&v!==owner);
+    if(swap){for(const m of get('mineIds',[]))GM_deleteValue(PREFIX+'mine.'+m);if(live.mint)GM_deleteValue(PREFIX+'mine.'+live.mint);set('mineIds',[]);set('posNoted',{});live.posNoted=null;}
+    if(v)set('mineWallet',v);
+    myWallet=v;set('myWallet',v);live.mine=v&&live.mint?get('mine.'+live.mint,[]):[];
+    $('my-status').textContent=v?'Saved. Your fills on the coin on screen show under the gauge from your next trade there.'+(swap?' Fills saved for the previous wallet were cleared.':''):'Removed.';render();};
   $('edge').onclick=()=>showTab('calls');
   $('mint-copy').onclick=()=>{if(current){GM_setClipboard(current,'text');notice('Contract copied');render();}};
   // Default round-trip cost 5%: about 1% pump.fun/PumpSwap + 1% GMGN per side, plus priority fee/tip and price impact
@@ -2369,7 +2405,8 @@ function start() {
   }
   // Your position on the coin on screen: profit, how late and how far above the call you bought, and the 5-minute rule.
   function renderPos(c,now,price){
-    const box=$('pos'), p=myWallet&&live.mint===current?VTCore.position(live.mine,price):null;
+    // Only the position held now: an older round trip on this coin is not blended in (position(..., true)).
+    const box=$('pos'), p=myWallet&&live.mint===current?VTCore.position(live.mine,price,true):null;
     if(!p){box.hidden=true;return;}
     const v=p.pnl, top=node('div','row1'), parts=[];
     top.append(node('span','lbl',p.open?'Your position':'Your trade · closed'),node('b',v==null?'':v>=0?'pos':'neg',v==null?'—':signed(v,1)+'%'),
@@ -2379,15 +2416,21 @@ function start() {
       const sup=gmS.mint===current&&gmS.G?.supply||1e9;if(c.callMc>0)parts.push(signed((p.avg*sup/c.callMc-1)*100)+'% vs the call price');
     }
     parts.push('held '+sinceText(Math.max(0,(p.open?now:p.last)-p.entryAt)).slice(1));
+    if(p.partial)parts.push('you sold more than this tab saw you buy: only the part it saw is counted');
     const due=p.entryAt+300000, rule=node('div','rule');
     if(!p.open)rule.textContent='Before fees: your platform fee, priority fees and tips come off this.';
     else if(now<due)rule.textContent='5-min check in '+mmss(due-now)+(p.mark!=null?' · now '+signed(p.mark,1)+'% vs your entry':'');
     else if(p.mark!=null&&p.mark<=0){rule.className='rule bad';rule.textContent='5-min rule: not above your entry ('+signed(p.mark,1)+'%). Your backtest’s early-exit rule sells here (unproven: see the forward test).';}
-    else{rule.className='rule ok';rule.textContent='5-min check passed: '+(p.mark==null?'no price':signed(p.mark,1)+'% vs your entry');}
+    else if(p.mark==null)rule.textContent='5-min check: no price right now';
+    else{rule.className='rule ok';rule.textContent='5-min check passed: '+signed(p.mark,1)+'% vs your entry';}
     box.className='mypos'+(v==null?'':v>=0?' up':' down');box.replaceChildren(top,node('div','meta',parts.join(' · ')),rule);box.hidden=false;
     // One notification, at the 5-minute mark, when the position is not up (only while this coin is on screen).
-    if(p.open&&get('posRule',true)&&!live.posNoted&&now>=due&&now-due<60000&&p.mark!=null&&p.mark<=0){live.posNoted=true;flash();
-      GM_notification({title:'5-min rule · '+(c?.name||'your position'),text:'Not above your entry after 5 min ('+signed(p.mark,1)+'%). Your backtest’s early-exit rule sells here.',timeout:15000});}
+    // Kept per coin and entry, so a new position on the same coin is checked again, and leaving the coin and coming
+    // back, a reload or a second tab does not notify twice.
+    if(p.open&&live.posNoted!==p.entryAt&&now>=due&&now-due<60000&&p.mark!=null&&p.mark<=0&&get('posRule',true)){live.posNoted=p.entryAt;
+      const noted=get('posNoted',{});
+      if(noted[live.mint]!==p.entryAt){set('posNoted',{...Object.fromEntries(Object.entries(noted).slice(-19)),[live.mint]:p.entryAt});flash();
+        GM_notification({title:'5-min rule · '+(c?.name||'your position'),text:'Not above your entry after 5 min ('+signed(p.mark,1)+'%). Your backtest’s early-exit rule sells here.',timeout:15000});}}
   }
   // What the backtest says, on the Live tab: the result of following every call, and which rules (if any) held up.
   function renderEdge(){
@@ -2396,7 +2439,7 @@ function start() {
     const so=b.standouts||[];
     e.className='edge '+(b.evHi!=null&&b.evHi<0?'bad':b.evLo!=null&&b.evLo>0?'ok':'');
     e.replaceChildren(node('span','lbl','Backtest'),node('b','',signed(b.ev,1)+'%'),node('span','',' per trade'+(b.evLo!=null?' ('+signed(b.evLo)+' to '+signed(b.evHi)+')':'')+' · '+b.n+' call'+(b.n===1?'':'s')+' · '
-      +(so.length?'held up: '+so.slice(0,2).map(x=>x.name+' '+x.label+' '+signed(x.diff)+' pts').join('; '):'no rule has held up yet')));
+      +(so.length?'held up: '+so.slice(0,2).map(x=>x.name+' '+x.label+' '+signed(x.diff)+' pts').join('; '):b.standouts?'no rule has held up yet':'open the report again to list the rules that held up')));
   }
   let botCache={key:'',vb:null};
   function renderBots(now){
@@ -2818,14 +2861,23 @@ function start() {
     const rows=w.txs.flatMap(tx=>VTCore.txTrades(tx,c.mint,solUsd));
     // Speed table (4.4): where the price was 2 to 60s after the alert, from the real trades only (taken before the
     // in-transaction legs below are given an estimated size).
-    const pp=VTCore.pricePath(rows,c.messageAt), rnd=o=>Object.fromEntries(Object.entries(o).map(([k,v])=>[k,v==null?null:+v.toPrecision(4)]));
+    // A window cut short (40 pages, oldest first) is missing its end, which is the part after the alert. Then the 2
+    // min the speed prices need are read again on their own; if that is cut short too, no speed prices are saved.
+    const endOf=x=>x.txs.length?Number(x.txs[x.txs.length-1]?.blockTime)||0:0;
+    let pxRows=rows, pxPages=0;
+    if(w.truncated&&endOf(w)<t+125){
+      const w2=await txWindow(c.mint,t-15,t+125);
+      if(w2.error)return {err:w2.error};
+      pxPages=w2.pages;pxRows=!w2.truncated||endOf(w2)>=t+125?w2.txs.flatMap(tx=>VTCore.txTrades(tx,c.mint,solUsd)):null;
+    }
+    const pp=pxRows&&VTCore.pricePath(pxRows,c.messageAt), rnd=o=>Object.fromEntries(Object.entries(o).map(([k,v])=>[k,v==null?null:+v.toPrecision(4)]));
     // Legs of in-transaction round trips have no SOL size: price them at the window's median price per token.
     const per=rows.filter(r=>r.usd>0&&r.amount>0).map(r=>r.usd/r.amount).sort((a,b)=>a-b), med=per.length?per[per.length>>1]:null;
     for(const r of rows)if(r.usd==null){r.usd=med!=null?r.amount*med:0;r.sol=solUsd>0?r.usd/solUsd:null;}
     const pre=VTCore.botFlow(rows,c.messageAt-300000,c.messageAt), post=VTCore.botFlow(rows,c.messageAt,c.messageAt+120000);
     // Transactions but no trades parsed: the transaction format may have changed. Keep one so the user can share it.
     if(w.txs.length&&!rows.length)rpcSample=w.txs.find(t=>t?.meta&&!t.meta.err)||w.txs[0];
-    return {v:2,px:pp&&{pct:rnd(pp.pct),entry:rnd(pp.entry),n:pp.n},pre:packBots(pre,!w.truncated),post:packBots(post,!w.truncated),txs:w.txs.length,trades:rows.length,pages:w.pages,truncated:!!w.truncated,err:w.error||null};
+    return {v:3,px:pp?{pct:rnd(pp.pct),entry:rnd(pp.entry),n:pp.n}:null,pre:packBots(pre,!w.truncated),post:packBots(post,!w.truncated),txs:w.txs.length,trades:rows.length,pages:w.pages+pxPages,truncated:!!w.truncated,err:w.error||null};
   }
   async function testKey(){
     const st=$('rpc-status');if(!rpcUrl()){st.textContent='Add a key first.';return;}
@@ -2846,7 +2898,7 @@ function start() {
     hbRunning=true;hbStop=false;
     try{
       await refreshSol();
-      const done=get('bt.done',{}), todo=btCandidates().filter(c=>done[c.id]==='ok'&&!(get('hb.'+c.id,null)?.v>=2)).sort((a,b)=>b.messageAt-a.messageAt);
+      const done=get('bt.done',{}), todo=btCandidates().filter(c=>done[c.id]==='ok'&&!(get('hb.'+c.id,null)?.v>=3)).sort((a,b)=>b.messageAt-a.messageAt);
       if(!todo.length){hbNote=btCandidates().some(c=>done[c.id]==='ok')?'Trades: every scored call already has them':'Score calls first: trades are added to scored calls';return;}
       for(let i=0;i<todo.length&&!hbStop;i++){
         hbNote='Reading trades: '+(i+1)+' of '+todo.length;renderBt();
@@ -3179,7 +3231,7 @@ function start() {
   // Data check (4.4): the field names of each GMGN response read here (three levels deep, one short sample value each)
   // and the API paths GMGN's own page has loaded (from the browser's resource list). Added to the data report so
   // fields this script does not use yet can be found. Public token data; addresses are blanked.
-  const apiFields={}, noAddr=v=>String(v).replace(/[1-9A-HJ-NP-Za-km-z]{32,44}/g,'<addr>');
+  const apiFields={}, noAddr=v=>String(v).replace(/0x[0-9a-fA-F]{40,64}|[1-9A-HJ-NP-Za-km-z]{32,44}/g,'<addr>');
   function apiNote(k,data){
     if(apiFields[k])return;
     const keys=apiFields[k]=[];
@@ -3506,7 +3558,8 @@ function start() {
       for(const d of LATE_AT){const at=c.messageAt+d*60000;late[d]=VTCore.lateGrade(by[0]['r'+d],cs.some(k=>k.t>=at-300000&&k.t+60000<=at));}
       // Speed table: a fill at the trade price N seconds after the alert (Helius trades), put on this call's candle scale
       // through the close of the minute it falls in.
-      const hb=get('hb.'+c.id,null), sp={};
+      // Speed prices saved before 4.4.1 are not used: they could come from a cut-short window or from dust trades.
+      const hb0=get('hb.'+c.id,null), hb=hb0?.px&&!(hb0.v>=3)?{...hb0,px:null}:hb0, sp={};
       if(hb?.px)for(const s of VTCore.SPEED_AT){const k=cs.find(q=>q.t===Math.floor((c.messageAt+s*1000)/60000)*60000), ratio=hb.px.entry?.[s];if(k&&ratio>0)sp[s]=VTCore.scoreCall(cs,c.messageAt,{...cb,delay:s/60,entryPrice:k.c*ratio});}
       // Your own fills on this call: trades from the alert to the end of the window; anything still held is marked at
       // the last candle. Before fees.
@@ -3555,7 +3608,7 @@ function start() {
       standouts:report.features.flatMap(f=>f.rows.filter(r=>r.standsOut).map(r=>({name:f.name,label:r.label,dir:r.standsOut,diff:r.diff,n:r.n})))});
     showReport(report,items,{my:{n:mineRows.length,delay:med(mineRows.map(r=>r.mine.delay)),prem:med(mineRows.map(r=>r.mine.prem))},tp,sl,cost,noData,delay,exit,fill,entries,grades,rows,moveInto,runUps:rows.filter(r=>r.pre.runUp15!=null).length,
       rug:{n:rows.filter(r=>r.rf).length,cut:rows.filter(r=>r.rf&&r.rug.holders!=='verified').length,old:rows.filter(r=>r.rug?.done&&!r.rug.empty&&!(r.rug.v>=3)).length},gmN:rows.filter(r=>r.gm).length,gmUsed:rows.filter(r=>gmAt(r,delay)).length,
-      speed,speedN:rows.filter(r=>r.hb?.px).length,allIn:{n:allIns.length,med:med(allIns)},lat,
+      speed,speedN:rows.filter(r=>r.hb?.px).length,speedOld:rows.filter(r=>r.hb&&!(r.hb.v>=3)).length,allIn:{n:allIns.length,med:med(allIns)},lat,
       noExit,incomplete,staleExits,fresh,staleSum,worst,legacyCache:rows.filter(r=>!get('bt.f.'+r.call.id,null)).length,
       exits:exitRules(rows),forward:{n:fwd.length,rules:fwd.length?exitRules(fwd):[]}});
   }
@@ -3643,11 +3696,12 @@ function start() {
     box.append(el('p','margin:4px 0 12px;color:'+C.muted,'"Dead" = no trades within 5 min of the entry time, so there was nothing to buy. Change "Buy at" in the Calls tab to see the splits below for another entry time.'));
     // Speed (4.4): the same calls bought at the trade price N seconds after the alert.
     box.append(el('h3','margin:4px 0 4px;font-size:14px','Speed: what each second after the alert costs'));
+    const old=o.speedOld?' '+o.speedOld+' call'+(o.speedOld===1?' has':'s have')+' trades read before 4.4.1: their speed prices are left out until "Add trades to past calls" reads them again.':'';
     if(o.speed.some(x=>x.n)){
       table('Buy',o.speed.filter(x=>x.n).map(x=>[['+'+x.s+'s after the alert',String(x.n),rate(x),pct(x.ev),pct(x.medianPeak),'fill '+pct(x.fill)+' · minute close '+pct(x.base.ev)],x.evHi!=null&&x.evHi<0?C.red:x.evLo!=null&&x.evLo>0?C.green:'']));
       const you=o.lat.open!=null?' Your own median (Speed table, Calls tab): coin open on GMGN '+o.lat.open.toFixed(1)+'s after the alert'+(o.lat.grade!=null?', first grade at '+o.lat.grade.toFixed(1)+'s':'')+'. Add your reaction time and read the row nearest to that.':'';
-      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'From every trade Helius returned around each alert ('+o.speedN+' calls). "Fill" = the median volume-weighted price in the 3 seconds from that moment, against the price just before the alert. "Minute close" = the average on the same calls when buying at the close of the alert minute, which is what the rest of this report assumes. Same target, stop and costs. Red = the whole 95% range is below zero; green = above. If every row is red, no entry speed a person can reach makes these calls pay.'+you));
-    }else box.append(el('p','margin:4px 0 12px;color:'+C.muted,'No trade data yet. Press "Add trades to past calls" in the Calls tab (needs a Helius key): it reads every trade from 5 min before to 3 min after each alert and fills this table.'));
+      box.append(el('p','margin:4px 0 12px;color:'+C.muted,'From every trade Helius returned around each alert ('+o.speedN+' calls). "Fill" = the median volume-weighted price in the 3 seconds from that moment, against the price just before the alert. "Minute close" = the average on the same calls when buying at the close of the alert minute, which is what the rest of this report assumes. Same target, stop and costs. Red = the whole 95% range is below zero; green = above. If every row is red, no entry speed a person can reach makes these calls pay.'+you+old));
+    }else box.append(el('p','margin:4px 0 12px;color:'+C.muted,'No trade data yet. Press "Add trades to past calls" in the Calls tab (needs a Helius key): it reads every trade from 5 min before to 3 min after each alert and fills this table.'+old));
     // Your real trades (4.4) next to what this report's rule made on the same calls.
     if(o.my.n){
       const mine=o.rows.filter(r=>r.mine), my=VTCore.summarize(mine.map(r=>({ret:r.mine.pnl,outcome:r.mine.pnl>0?'win':'loss',peakPct:null})),o.cost), same=VTCore.summarize(mine.map(r=>r.by[0]),o.cost);
@@ -3837,6 +3891,8 @@ function start() {
     const url=URL.createObjectURL(new Blob([JSON.stringify(payload,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='voltrak-steroids-'+Date.now()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
   };
   GM_addValueChangeListener(PREFIX+'calls',()=>{callsCache=null;render();});
+  // The wallet is set in one tab's Settings: every other open tab follows without a reload.
+  GM_addValueChangeListener(PREFIX+'myWallet',(k,o,v,remote)=>{if(!remote)return;myWallet=String(v||'').trim();$('my-wallet').value=myWallet;live.mine=myWallet&&live.mint?get('mine.'+live.mint,[]):[];render();});
   GM_addValueChangeListener(PREFIX+'manual',()=>{callsCache=null;render();});
   GM_addValueChangeListener(PREFIX+'marketSnap',()=>{if(!(GMGN&&isReceiver))renderMarket();});
   GM_addValueChangeListener(PREFIX+'bt.done',()=>renderBt());
@@ -3892,7 +3948,7 @@ function start() {
     kick=()=>tick();setTimeout(tick,300);every(1000,tick);
   }
   if(DISCORD){
-    let initial=true,lastChannel='',timer=null,scanning=false,again=false,others=new Set();
+    let initial=true,lastChannel='',timer=null,scanning=false,again=false,others=new Set(),firstSeen=new Map(),settle=null;
     const headerOf=li=>{for(let n=li,i=0;n&&i<500;n=n.previousElementSibling,i++){const u=n.querySelector?.('[id^="message-username-"]');if(u)return {u,li:n};}return null;};
     // true = VolTrak, false = someone else (cached), null = header not rendered yet (retry next scan).
     const fromVolTrak=li=>{
@@ -3930,10 +3986,13 @@ function start() {
           const best=[...n].sort((a,b)=>b[1]-a[1])[0];if(best&&best[1]>=3)set('authorId',best[0]);else if(!n.size&&none>=3)set('authorMode','name-only');}
         for(const li of lis){
           const id=li.id.match(/-(\d+)$/)?.[1];if(!id||existing.has(id)||others.has(id))continue;
-          const who=fromVolTrak(li);if(who===false)others.add(id);if(!who)continue;
+          // "Someone else" is only final once the message's own header is there (or it is 2s old): Discord can add it late.
+          const who=fromVolTrak(li);if(who===false&&(li.querySelector('[id^="message-username-"]')||Date.now()-originalTime(li)>2000))others.add(id);if(!who)continue;
           const parsed=VTCore.parseAlert(alertText(li));if(!parsed)continue;
           const messageAt=originalTime(li), now=Date.now();if(!Number.isFinite(messageAt))continue;
           const historical=initial||now-messageAt>30000||messageAt>now+5000;
+          // A live alert with no numbers yet: its embed may still be rendering. Give it up to 150ms, then take it as it is.
+          if(!historical&&parsed.callMc==null&&parsed.holders==null){const t0=firstSeen.get(id)||now;firstSeen.set(id,t0);if(now-t0<150){if(!settle)settle=setTimeout(()=>{settle=null;request();},160);continue;}}
           const aid=authorIdOf(li), trust=VTCore.senderTrust(aid,trustedId(),senderMode()), unverified=trust!=='ok';
           const call={...parsed,id,messageAt,receivedAt:now,historical,...(unverified?{unverified:true,sender:trust,authorId:aid}:{})};
           if(!await addCall(call))continue;existing.add(id);added=true;
@@ -3957,11 +4016,13 @@ function start() {
     }
     // A new alert is read on the first change to the page (4.4). Before, every further change restarted a 120ms wait,
     // so a busy channel could hold a call back until the 5s safety scan, and in a background tab (timers throttled to
-    // 1s or more) the wait itself was slow. Now: scan at once (cheap when nothing is new), once more 120ms later for
-    // an embed that rendered in parts, and again right after a scan that was running when the page changed.
-    const request=()=>{if(scanning){again=true;return;}scan();if(!timer)timer=setTimeout(()=>{timer=null;request();},120);};
+    // 1s or more) the wait itself was slow. Now: scan at once (cheap when nothing is new), once more 120ms after the
+    // last change for an embed that rendered in parts, and again right after a scan that was running when the page
+    // changed. The follow-up calls scan directly: going through request() would arm itself again, forever.
+    const request=()=>{if(scanning){again=true;return;}scan();clearTimeout(timer);timer=setTimeout(()=>{if(scanning)again=true;else scan();},120);};
     const mo=new MutationObserver(mutations=>{if(mutations.every(m=>root.contains(m.target)))return;request();});
-    mo.observe(document.body,{childList:true,subtree:true});setTimeout(scan,2000);every(5000,scan);
+    // Text changes count too: an embed whose text is filled in after its elements would otherwise wait for the 5s scan.
+    mo.observe(document.body,{childList:true,subtree:true,characterData:true});setTimeout(scan,2000);every(5000,()=>{scan();render();});
   }
   render();
 }

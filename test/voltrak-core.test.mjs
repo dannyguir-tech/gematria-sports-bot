@@ -119,7 +119,7 @@ test('backtestReport rarely finds edges in data with none', () => {
 });
 
 // Win rate 30% → 10% in the quarter of calls with the biggest move into entry. With ~40 buckets tested this is found
-// in ~60% of 200-call reports and ~93% of 400-call ones: the price of not crowning noise.
+// in ~50% of 200-call reports and ~92% of 400-call ones: the price of not crowning noise.
 test('backtestReport still finds a real planted effect at 400 calls', () => {
   const r = rng(5);
   let found = 0;
@@ -195,4 +195,93 @@ test('botFlow: counted share is a floor; one-use-wallet wash is "possible", real
   assert.deepEqual(kind('flip'), []);
   assert.ok(vb.organic.some(t => t.wallet === 'once3'), 'possible trades stay in the organic flow');
   assert.ok(vb.organic.every(t => t.wallet !== 'WASH'));
+});
+
+// ---- 4.4.1: defects found by the review of 4.4 ----
+test('position(latest): a new buy after the bag was sold is a new position', () => {
+  const t = (side, usd, amount, at) => ({side, usd, amount, price: usd / amount, at});
+  // Bought $100 at 1e-5 and sold all for $200; later bought $100 at 2.4e-5; price now 2.1e-5 (down 12.5%).
+  const rows = [t('buy', 100, 1e7, 1000), t('sell', 200, 1e7, 60000), t('buy', 100, 100 / 2.4e-5, 700000)];
+  const now = V.position(rows, 2.1e-5, true);
+  assert.equal(now.entryAt, 700000);
+  assert.equal(now.usdIn, 100);
+  assert.equal(now.usdOut, 0);
+  assert.ok(Math.abs(now.pnl + 12.5) < 1e-6 && Math.abs(now.mark + 12.5) < 1e-6, 'pnl ' + now.pnl);
+  assert.ok(now.open && now.heldFrac === 1 && !now.partial);
+  // Same rows in any order (the feed is newest first); a buy and its sale in one second is not a new entry.
+  assert.equal(V.position([...rows].reverse(), 2.1e-5, true).entryAt, 700000);
+  const flip = V.position([t('sell', 120, 1e7, 5000), t('buy', 100, 1e7, 5000)], 1e-5, true);
+  assert.ok(!flip.open && Math.abs(flip.pnl - 20) < 1e-9 && flip.entryAt === 5000, 'pnl ' + flip.pnl);
+  // The last 0.8% of a bag is still part of the trade it came from.
+  const moon = V.position([t('buy', 100, 1e6, 1000), t('sell', 150, 992000, 2000), t('sell', 40, 8000, 3000)], 1e-4, true);
+  assert.ok(!moon.open && Math.abs(moon.pnl - 90) < 1e-9, 'pnl ' + moon.pnl);
+  // Without `latest` (the report) both round trips add up as before.
+  assert.equal(V.position(rows, 2.1e-5).usdIn, 200);
+});
+test('position: a sale of tokens bought elsewhere is not profit', () => {
+  const t = (side, usd, amount, at) => ({side, usd, amount, price: usd / amount, at});
+  // $100 buy never seen; the tab saw a $20 add and then everything sold for $110 (really -8%).
+  const over = V.position([t('buy', 20, 2e5, 1000), t('sell', 110, 1.2e6, 9000)], 1e-4);
+  assert.equal(over.partial, true);
+  assert.ok(!over.open && over.usdIn === 20 && Math.abs(over.usdOut - 110 / 6) < 1e-9, 'only the seen sixth of the sale counts');
+  assert.ok(Math.abs(over.pnl - (110 / 6 / 20 - 1) * 100) < 1e-9 && over.pnl < 0, 'pnl ' + over.pnl);
+  // An old bag sold before a new buy: the sale is not part of the new position, which is still open.
+  const old = V.position([t('sell', 100, 1e6, 1000), t('buy', 50, 1e6, 2000)], 5e-5);
+  assert.ok(old.open && old.usdOut === 0 && old.pnl === 0 && !old.partial && old.n === 1);
+  // A sale of exactly what was bought is not partial.
+  assert.equal(V.position([t('buy', 20, 1e6, 1000), t('sell', 15, 1e6, 5000)], 9e-5).partial, false);
+});
+test('pricePath: fee-only rows and a lone dust trade are not a price', () => {
+  const A = Date.UTC(2026, 9, 20, 12, 0, 20), row = (s, sol, amount) => ({at: A + s * 1000, sol, amount});
+  // A swap paid in USDC shows only its fee as SOL (0.001 for 1e7 tokens): 1000x too cheap. A 0.03 SOL trade alone at +10s.
+  const p = V.pricePath([row(-5, 1, 1e7), row(-4, 0.001, 1e7), row(2, 1.5, 1e7), row(3, 0.001, 1e7), row(10, 0.03, 1e5), row(40, 1.5, 1e7)], A);
+  assert.ok(Math.abs(p.pre - 1e-7) < 1e-12, 'pre ' + p.pre);
+  assert.equal(Math.round(p.pct[2]), 50);
+  assert.equal(Math.round(p.pct[10]), 50, 'under 0.05 SOL in the 3 seconds: the last real price carries forward, got ' + p.pct[10]);
+});
+test('botFlow: a held earlier buy cannot take the sell of a 10-second round trip', () => {
+  const rows = [], add = (at, side, usd, wallet, hash) => rows.push({at, side, usd, amount: usd / 2e-5, price: 2e-5, wallet, hash, ex: 'pump'});
+  add(T0, 'buy', 100, 'BOT', 'hold');
+  for (let i = 1; i <= 5; i++) { add(T0 + i * 45000, 'buy', 100, 'BOT', 'b' + i); add(T0 + i * 45000 + 2000, 'sell', 100, 'BOT', 's' + i); }
+  for (let i = 0; i < 4; i++) add(T0 + 10000 + i * 30000, 'buy', 40, 'p' + i, 'p' + i);
+  const vb = V.botFlow(rows, T0 - 1000, T0 + 300000);
+  assert.equal(vb.byRule.fastTrip, 10);
+  assert.equal(vb.byRule.slowTrip, 0);
+  assert.equal(vb.buyers, 4);
+  assert.ok(vb.botShare > 75 && vb.possibleShare === 0, vb.botShare + ' / ' + vb.possibleShare);
+});
+test('botFlow: slow flat trips keep their mirror partners, and a trading-app wallet is not "possible"', () => {
+  const rows = [], add = (at, side, amount, wallet, hash, usd = amount * 2e-5) => rows.push({at, side, usd, amount, price: usd / amount, wallet, hash, ex: 'pump'});
+  // A ring of one-use wallets: A buys, B sells the same size 1s later, A sells 30s later, C buys the same size 1s after.
+  for (let i = 0; i < 5; i++) { const t = T0 + i * 40000, n = 5e6 + i * 1e5;
+    add(t, 'buy', n, 'A' + i, 'a' + i); add(t + 1000, 'sell', n, 'B' + i, 'b' + i); add(t + 30000, 'sell', n, 'A' + i, 'c' + i); add(t + 31000, 'buy', n, 'C' + i, 'd' + i); }
+  const ring = V.botFlow(rows, T0 - 1000, T0 + 300000);
+  assert.equal(ring.byRule.slowTrip, 10);
+  assert.equal(ring.byRule.mirror, 10);
+  assert.equal(Math.round(ring.possibleTradeShare), 100);
+  // A wallet GMGN tags as a trading app buys $100 and sells $99 20s later: a person, counted as app volume.
+  const app = [{at: T0, side: 'buy', usd: 100, amount: 5e6, wallet: 'AX', hash: 'x1', ex: 'pump'}, {at: T0 + 20000, side: 'sell', usd: 99, amount: 5e6, wallet: 'AX', hash: 'x2', ex: 'pump'}];
+  const prof = new Map([['AX', {wallet: 'AX', tags: ['axiom'], eventTags: [], tt: 2, bought: 5e6, sold: 5e6}]]);
+  const vb = V.botFlow(app, T0 - 1000, T0 + 60000, V.VB, prof);
+  assert.equal(vb.byRule.slowTrip, 0);
+  assert.equal(Math.round(vb.appShare), 100);
+  // The same trip 2s apart is still a counted bot, app tag or not.
+  app[1].at = T0 + 2000;
+  assert.equal(V.botFlow(app, T0 - 1000, T0 + 60000, V.VB, prof).byRule.fastTrip, 2);
+});
+test('backtestReport: a small bucket that happens to hold no winner does not stand out', () => {
+  // 120 calls, 10 winners, nothing related to anything; the 16 calls with a 25%+ move into entry hold no winner.
+  const r = rng(9), items = fakeItems(r, 120, false);
+  items.forEach((it, i) => { it.call.entryMove = i < 16 ? 30 : 5 + r() * 10; const win = i >= 16 && i < 26; it.score = {...it.score, outcome: win ? 'win' : 'loss', ret: win ? 100 : -50}; });
+  const row = V.backtestReport(items, 5).features.find(f => f.name === 'Move into entry').rows.find(x => x.label === '≥25%');
+  assert.equal(row.n, 16);
+  assert.equal(row.standsOut, null, 't ' + row.t + ' vs bar ' + row.bar);
+  // Winners that are rare overall: the starred tables stay quiet on data with no effect.
+  let flagged = 0;
+  for (let k = 0; k < 150; k++) {
+    const it = fakeItems(r, 200, false);
+    it.forEach(x => { const win = r() < 0.05; x.score = {...x.score, outcome: win ? 'win' : 'loss', ret: win ? 100 : -50}; });
+    if (V.backtestReport(it, 5).features.some(f => f.primary && f.rows.some(x => x.standsOut))) flagged++;
+  }
+  assert.ok(flagged / 150 < 0.06, 'starred false-find rate with 5% winners: ' + flagged / 150);
 });
