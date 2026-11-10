@@ -285,3 +285,19 @@ test('backtestReport: a small bucket that happens to hold no winner does not sta
   }
   assert.ok(flagged / 150 < 0.06, 'starred false-find rate with 5% winners: ' + flagged / 150);
 });
+
+// ---- 4.4.2: found by the review of 4.4.1 ----
+test('position: the result does not depend on the order the fills arrived in', () => {
+  const t = (side, usd, amount, at) => ({side, usd, amount, price: usd / amount, at});
+  // $30 buy of 300,000; two sells in the same second that together exceed the bag the tab saw.
+  const rows = [t('buy', 30, 3e5, 2000), t('sell', 75, 5e5, 7000), t('sell', 20, 4e5, 7000)], perms = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  for (const latest of [false, true]) {
+    const out = new Set(perms.map(p => { const r = V.position(p.map(i => rows[i]), 1e-4, latest); return [r.usdOut, r.pnl, r.n, r.last, r.partial].join('|'); }));
+    assert.equal(out.size, 1, [...out].join('  vs  '));
+  }
+  // A sale after the bag is gone is not counted, also when float sums leave a remainder.
+  const a = V.position([t('buy', 41, 410035, 3000), t('sell', 150, 1230106, 20000), t('sell', 70, 700000, 95000)], 1e-4);
+  assert.ok(a.n === 2 && a.last === 20000 && a.partial, 'n ' + a.n + ' last ' + a.last);
+  const b = V.position([t('buy', 10, 100000.1, 1000), t('buy', 20, 200000.2, 2000), t('sell', 33, 300000.3, 9000), t('sell', 15, 150000, 60000)], 1e-4);
+  assert.ok(b.n === 3 && b.last === 9000 && !b.open && Math.abs(b.pnl - 10) < 1e-9, 'n ' + b.n + ' last ' + b.last + ' pnl ' + b.pnl);
+});

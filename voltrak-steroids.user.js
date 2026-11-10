@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         VolTrak Steroids 4.3
 // @namespace    voltrak-alert
-// @version      4.4.1
+// @version      4.4.2
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), live rug checks (dev, top 10, launch block, funder), GMGN holder data, insider-exit alerts, a live coin score, Telegram pings, market-wide pump.fun activity and a call backtest. Analysis only; never submits trades.
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -326,13 +326,14 @@ const VTCore = (() => {
   // ---- Your own fills (4.4): one wallet's trades on a coin → position ----
   // rows: that wallet's trades {at, side, usd, amount, price}. avg = USD paid per token. pnl (%, before fees) =
   // (USD received + what is left at `price`) / USD paid - 1; mark = `price` vs avg. open = more than 1% still held.
-  // Fills are read oldest first (same second: buys first). A sale only counts for tokens bought earlier in these rows:
+  // Fills are read oldest first (same second: buys first, then the smaller sale, so the result does not depend on the
+  // order the fills arrived in). A sale only counts for tokens bought earlier in these rows:
   // the part of a sale that sells tokens bought elsewhere (a buy that was never seen, or one outside the rows) is left
   // out with its dollars, and `partial` is set, so it cannot show up as profit. latest = true: only the position held
   // now, i.e. from the first buy after the wallet was last flat (1% or less left); an older round trip is not part of it.
   function position(rows, price, latest = false) {
     const list = (rows || []).filter(t => t && (t.side === 'buy' || t.side === 'sell') && t.usd > 0 && tradeTokens(t) > 0 && Number.isFinite(t.at))
-      .sort((a, b) => a.at - b.at || (b.side === 'buy') - (a.side === 'buy'));
+      .sort((a, b) => a.at - b.at || (b.side === 'buy') - (a.side === 'buy') || tradeTokens(a) - tradeTokens(b) || a.usd - b.usd);
     let tokIn = 0, tokOut = 0, usdIn = 0, usdOut = 0, entryAt = null, last = null, n = 0, partial = false;
     for (const t of list) {
       const tok = tradeTokens(t), left = tokIn - tokOut;
@@ -341,7 +342,7 @@ const VTCore = (() => {
         tokIn += tok; usdIn += t.usd; entryAt = entryAt ?? t.at;
       } else {
         if (!(tokIn > 0)) continue; // nothing bought in these rows yet: not part of this position
-        const part = left > 0 ? Math.min(1, left / tok) : 0;
+        const part = left > tokIn * 1e-12 ? Math.min(1, left / tok) : 0; // a rounding remainder is not a bag
         if (part < 0.98) partial = true;
         if (!part) continue;
         tokOut += tok * part; usdOut += t.usd * part;
@@ -1579,7 +1580,8 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .ins .exit.bad::before{content:"\25BC  "}
 #vts-root .checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
 #vts-root .ck.wide{grid-column:1/-1}
-#vts-root .ck.wide b{max-width:75%}
+#vts-root .ck.wide b{max-width:75%;flex-shrink:1;white-space:normal;text-align:right}
+#vts-root .ck.wide span{flex-shrink:0}
 #vts-root .ckh{grid-column:1/-1;margin:4px 0 0;font:700 10.5px/1.2 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
 #vts-root .parts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin:6px 0 0}
 #vts-root .parts[hidden]{display:none}
@@ -1926,7 +1928,7 @@ const PANEL_CSS = String.raw`/* ================================================
   background-position:right top,right top,left bottom,left bottom,right bottom,right bottom;background-size:14px 2px,2px 14px,14px 2px,2px 14px,14px 2px,2px 14px}
 #vts-root[data-tone=sell] .hero::after,#vts-root[data-tone=caution] .hero::after{background-size:0 0,0 0,14px 2px,2px 14px,14px 2px,2px 14px}
 #vts-root .band{min-height:62px;overflow:hidden;position:relative}
-#vts-root .band [data-vts=state]{font-size:clamp(15px,5.3cqi,21px);letter-spacing:0}
+#vts-root .band [data-vts=state]{font-size:clamp(15px,5.3cqi,21px);letter-spacing:0;white-space:normal}
 /* the dial */
 #vts-root .cockpit{grid-template-columns:150px minmax(0,1fr);align-items:center;column-gap:14px;padding:12px 14px 4px 10px}
 #vts-root .dial{position:relative;width:150px;height:136px;--p:0}
@@ -2330,7 +2332,7 @@ function start() {
   $('my-save').onclick=()=>{const v=$('my-wallet').value.trim();if(v&&!VTCore.MINT.test(v)){$('my-status').textContent='That is not a Solana address.';return;}
     // Saved fills belong to one wallet. A different address starts clean; removing the address keeps them for when
     // the same one is put back.
-    const owner=get('mineWallet','')||myWallet, swap=!!(v&&owner&&v!==owner);
+    const owner=get('mineWallet','')||myWallet, swap=!!(v&&owner&&v!==owner);if(owner&&!v)set('mineWallet',owner);
     if(swap){for(const m of get('mineIds',[]))GM_deleteValue(PREFIX+'mine.'+m);if(live.mint)GM_deleteValue(PREFIX+'mine.'+live.mint);set('mineIds',[]);set('posNoted',{});live.posNoted=null;}
     if(v)set('mineWallet',v);
     myWallet=v;set('myWallet',v);live.mine=v&&live.mint?get('mine.'+live.mint,[]):[];
@@ -3948,7 +3950,7 @@ function start() {
     kick=()=>tick();setTimeout(tick,300);every(1000,tick);
   }
   if(DISCORD){
-    let initial=true,lastChannel='',timer=null,scanning=false,again=false,others=new Set(),firstSeen=new Map(),settle=null;
+    let initial=true,lastChannel='',timer=null,scanning=false,again=false,others=new Set(),firstSeen=new Map();
     const headerOf=li=>{for(let n=li,i=0;n&&i<500;n=n.previousElementSibling,i++){const u=n.querySelector?.('[id^="message-username-"]');if(u)return {u,li:n};}return null;};
     // true = VolTrak, false = someone else (cached), null = header not rendered yet (retry next scan).
     const fromVolTrak=li=>{
@@ -3986,13 +3988,14 @@ function start() {
           const best=[...n].sort((a,b)=>b[1]-a[1])[0];if(best&&best[1]>=3)set('authorId',best[0]);else if(!n.size&&none>=3)set('authorMode','name-only');}
         for(const li of lis){
           const id=li.id.match(/-(\d+)$/)?.[1];if(!id||existing.has(id)||others.has(id))continue;
-          // "Someone else" is only final once the message's own header is there (or it is 2s old): Discord can add it late.
-          const who=fromVolTrak(li);if(who===false&&(li.querySelector('[id^="message-username-"]')||Date.now()-originalTime(li)>2000))others.add(id);if(!who)continue;
+          // "Someone else" is only final once the message's own header is there (or 2s after it was first seen here):
+          // Discord can add the header late.
+          const who=fromVolTrak(li);if(who===false){const k='o'+id,t=firstSeen.get(k)||Date.now();if(li.querySelector('[id^="message-username-"]')||Date.now()-t>2000){others.add(id);firstSeen.delete(k);}else firstSeen.set(k,t);}if(!who)continue;
           const parsed=VTCore.parseAlert(alertText(li));if(!parsed)continue;
           const messageAt=originalTime(li), now=Date.now();if(!Number.isFinite(messageAt))continue;
           const historical=initial||now-messageAt>30000||messageAt>now+5000;
           // A live alert with no numbers yet: its embed may still be rendering. Give it up to 150ms, then take it as it is.
-          if(!historical&&parsed.callMc==null&&parsed.holders==null){const t0=firstSeen.get(id)||now;firstSeen.set(id,t0);if(now-t0<150){if(!settle)settle=setTimeout(()=>{settle=null;request();},160);continue;}}
+          if(!historical&&parsed.callMc==null&&parsed.holders==null){const t0=firstSeen.get(id)||now;if(!firstSeen.has(id)){for(const [k,t] of firstSeen)if(now-t>60000)firstSeen.delete(k);firstSeen.set(id,t0);setTimeout(request,160);}if(now-t0<150)continue;}
           const aid=authorIdOf(li), trust=VTCore.senderTrust(aid,trustedId(),senderMode()), unverified=trust!=='ok';
           const call={...parsed,id,messageAt,receivedAt:now,historical,...(unverified?{unverified:true,sender:trust,authorId:aid}:{})};
           if(!await addCall(call))continue;existing.add(id);added=true;
@@ -4020,8 +4023,9 @@ function start() {
     // last change for an embed that rendered in parts, and again right after a scan that was running when the page
     // changed. The follow-up calls scan directly: going through request() would arm itself again, forever.
     const request=()=>{if(scanning){again=true;return;}scan();clearTimeout(timer);timer=setTimeout(()=>{if(scanning)again=true;else scan();},120);};
-    const mo=new MutationObserver(mutations=>{if(mutations.every(m=>root.contains(m.target)))return;request();});
-    // Text changes count too: an embed whose text is filled in after its elements would otherwise wait for the 5s scan.
+    const mo=new MutationObserver(mutations=>{if(mutations.every(m=>root.contains(m.target)||m.type==='characterData'&&!m.target.parentElement?.closest('li[id^="chat-messages-"]')))return;request();});
+    // Text changes inside a message count too: an embed whose text is filled in after its elements would otherwise
+    // wait for the 5s scan. Text changing elsewhere on the page (typing indicator, clocks) is ignored.
     mo.observe(document.body,{childList:true,subtree:true,characterData:true});setTimeout(scan,2000);every(5000,()=>{scan();render();});
   }
   render();

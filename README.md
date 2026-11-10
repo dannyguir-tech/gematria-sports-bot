@@ -44,6 +44,15 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.test.mjs`
 
+### 4.4.2
+
+Eight small edge cases found by a second review of 4.4.1, all rated low.
+
+- **Your position.** Two sells in the same second give the same result whichever order they arrived in; a rounding remainder is not counted as a bag still held.
+- **Wallet.** Removing the address and later entering a different one starts with clean fills (entering the same one again keeps them).
+- **Discord.** Text changing outside the message list (typing indicator, clocks) no longer triggers a scan. Two alerts with no numbers arriving together each wait at most about 160ms. A message whose header arrives late is judged from when it was first seen, not from its send time.
+- **UI.** The state title wraps instead of being cut once the clock shows hours; a long check value wraps on a narrow panel.
+
 ### 4.4.1
 
 Fixes for defects an independent review found in 4.4.0.
