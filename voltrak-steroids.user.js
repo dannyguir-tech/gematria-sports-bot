@@ -1879,6 +1879,81 @@ const PANEL_CSS = String.raw`/* ================================================
 @media (prefers-reduced-motion:no-preference){
   #vts-root .fresh:not(.stale):not(.off)::before{animation:vts-pulse 1.6s ease-in-out infinite}
   @keyframes vts-pulse{50%{opacity:.35}}
+}
+/* ===================== 4.4 cockpit =====================
+   The top of the Live tab as an instrument cluster: a 270-degree buy-share dial (green = buys, red = sells, white
+   tick = 50%), the move since the call beside it, a hex grade badge, bar meters for the four parts, corner brackets
+   on the hero and a two-colour frame. The dial arc and the bars are driven by --p / --w set from JS (CSSOM). */
+#vts-root{--accent2:#a78bfa;
+  background:radial-gradient(120% 50% at 50% -8%,var(--glow2),transparent 62%),repeating-linear-gradient(0deg,#ffffff05 0 1px,transparent 1px 26px),repeating-linear-gradient(90deg,#ffffff05 0 1px,transparent 1px 26px),linear-gradient(180deg,#0a0f16,var(--bg) 42%)}
+#vts-root::after{padding:1.5px;box-shadow:none;background:linear-gradient(140deg,var(--accent),transparent 30%,transparent 64%,var(--accent2));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box exclude,linear-gradient(#000 0 0)}
+#vts-root .brand b{background:linear-gradient(90deg,#fff 10%,var(--accent) 60%,var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+#vts-root .brand::after{content:"STEROIDS";padding:3px 5px;border-radius:4px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#04070b;font:900 8.5px/1 var(--mono);letter-spacing:.14em}
+#vts-root[data-tone]:not([data-tab=live]) .brand::after,#vts-root.vts-collapsed .brand::after{display:none}
+#vts-root .tabs button.on::after{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+#vts-root .ckh::before,#vts-root .sect::before{background:linear-gradient(135deg,var(--accent),var(--accent2))}
+/* hero frame: corner brackets */
+#vts-root .hero{position:relative}
+#vts-root .hero::after{content:"";position:absolute;inset:5px;pointer-events:none;background-repeat:no-repeat;
+  background-image:linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0),linear-gradient(var(--tone) 0 0);
+  background-position:right top,right top,left bottom,left bottom,right bottom,right bottom;background-size:14px 2px,2px 14px,14px 2px,2px 14px,14px 2px,2px 14px}
+#vts-root[data-tone=sell] .hero::after,#vts-root[data-tone=caution] .hero::after{background-position:right 200px top,right 200px top,left bottom,left bottom,right bottom,right bottom}
+#vts-root .band{min-height:62px;overflow:hidden;position:relative}
+#vts-root .band [data-vts=state]{font-size:clamp(16px,5.8cqi,23px);letter-spacing:.05em}
+/* the dial */
+#vts-root .cockpit{grid-template-columns:150px minmax(0,1fr);align-items:center;column-gap:14px;padding:12px 14px 4px 10px}
+#vts-root .dial{position:relative;width:150px;height:136px;--p:0}
+#vts-root .dial svg{position:absolute;left:0;top:0;width:150px;height:150px;overflow:visible}
+#vts-root .dial circle{fill:none;transform:rotate(135deg);transform-origin:60px 60px}
+#vts-root .dial .tk{stroke:#ffffff40;stroke-width:3.5;stroke-dasharray:.5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 3.25 .5 24.5}
+#vts-root .dial .tr{stroke:#03060a;stroke-width:12;stroke-dasharray:75 100;filter:drop-shadow(0 1px 0 #ffffff14)}
+#vts-root .dial .sl{stroke:var(--sell);stroke-width:8;stroke-dasharray:calc((100 - var(--p))*.75) 100;stroke-dashoffset:calc(var(--p)*-.75);opacity:.9;transition:stroke-dasharray .5s ease,stroke-dashoffset .5s ease}
+#vts-root .dial .by{stroke:var(--buy);stroke-width:8;stroke-dasharray:calc(var(--p)*.75) 100;filter:drop-shadow(0 0 5px var(--buy));transition:stroke-dasharray .5s ease}
+#vts-root .dial.empty .sl{stroke:#1a2430}
+#vts-root .dial.empty .by{stroke:transparent;filter:none}
+#vts-root .dial .mid{stroke:#fff;stroke-width:2.5;stroke-linecap:round;filter:drop-shadow(0 0 3px #fff)}
+#vts-root .dial .dc{position:absolute;left:0;right:0;top:34px;display:flex;flex-direction:column;align-items:center;gap:3px}
+#vts-root .dial .dc .lbl{font-size:8.5px;letter-spacing:.14em}
+#vts-root .dial .big{margin:0;font:850 46px/.95 var(--sans);letter-spacing:-.04em;overflow:visible}
+#vts-root .dial .big small{font-size:.4em}
+#vts-root .dial .side{margin-top:2px;font-size:8.5px;padding:3px 5px}
+#vts-root .mcbox{min-width:0;display:flex;flex-direction:column;align-items:flex-end;text-align:right}
+#vts-root .mcbox .big{font-size:clamp(34px,12.5cqi,46px);margin-top:3px}
+#vts-root .mcbox .big.long{font-size:clamp(24px,9cqi,34px)}
+#vts-root .mcbox .hsub{margin-top:4px}
+#vts-root .mcbox .spark{margin-top:16px;height:22px}
+#vts-root .mcbox .spark+.spark{margin-top:18px}
+#vts-root .meter{height:14px;gap:2px;padding:3px 4px;margin:6px 12px 0;border-radius:6px}
+#vts-root .meter::after{top:-3px;bottom:-3px}
+#vts-root .scale{padding:8px 22px 13px}
+/* grade: a hex badge */
+#vts-root .grade .gb{gap:12px;margin-top:9px;filter:drop-shadow(0 0 8px var(--gc,transparent))}
+#vts-root .grade .gl,#vts-root .grade.few .gl,#vts-root .grade.none .gl,#vts-root .grade.unproven .gl{width:46px;height:52px;border:0;border-radius:0;clip-path:polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);background:#1a2430;color:var(--muted);box-shadow:none;font-size:24px}
+#vts-root .grade.g-clean{--gc:color-mix(in srgb,var(--buy) 55%,transparent)}
+#vts-root .grade.g-clean .gl{background:linear-gradient(160deg,#9dffd0,var(--buy));color:var(--buy-ink)}
+#vts-root .grade.g-risky{--gc:color-mix(in srgb,var(--warn) 50%,transparent)}
+#vts-root .grade.g-risky .gl{background:linear-gradient(160deg,#ffe596,var(--warn));color:var(--warn-ink)}
+#vts-root .grade.g-avoid{--gc:color-mix(in srgb,var(--sell) 65%,transparent)}
+#vts-root .grade.g-avoid .gl{background:repeating-linear-gradient(135deg,var(--sell) 0 6px,#b72c40 6px 12px);color:#fff}
+#vts-root .grade strong{font:900 18px/1 var(--sans);letter-spacing:.09em;text-transform:uppercase}
+/* the four parts: bar meters */
+#vts-root .pt::after{content:"";display:block;height:4px;margin-top:6px;border-radius:2px;background:linear-gradient(90deg,var(--pc,var(--line3)) var(--w,0%),#ffffff14 var(--w,0%))}
+#vts-root .pt.ok,#vts-root .pt.conf.high{--pc:var(--buy)}
+#vts-root .pt.warn,#vts-root .pt.conf.medium{--pc:var(--warn)}
+#vts-root .pt.bad,#vts-root .pt.conf.low{--pc:var(--sell)}
+#vts-root .pt b{font:850 19px/1.1 var(--mono)}
+#vts-root .pt.conf b{font:850 15px/1.3 var(--sans);text-transform:uppercase;letter-spacing:.04em}
+#vts-root .kpi b,#vts-root .bots .bv b,#vts-root .ins .row1 b{font-family:var(--mono);letter-spacing:-.03em}
+@media (prefers-reduced-motion:no-preference){
+  #vts-root .band::after{content:"";position:absolute;top:0;bottom:0;left:-40%;width:34%;pointer-events:none;background:linear-gradient(100deg,transparent,#ffffff14,transparent);animation:vts-sheen 5s linear infinite}
+  @keyframes vts-sheen{0%,55%{left:-40%}100%{left:120%}}
+}
+@container vts (max-width:372px){
+  #vts-root .cockpit{grid-template-columns:132px minmax(0,1fr);column-gap:10px;padding:10px 10px 4px 8px}
+  #vts-root .dial{width:132px;height:120px}
+  #vts-root .dial svg{width:132px;height:132px}
+  #vts-root .dial .dc{top:29px}
+  #vts-root .dial .big{font-size:40px}
 }`;
 const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusable="false">
 <symbol id="vts-i-up" viewBox="0 0 16 16"><path d="M8 2.2 15.2 13.8H.8z"/></symbol>
@@ -1915,11 +1990,14 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
   </div>
   <div class="hero">
     <div class="band"><span class="ti" aria-hidden="true"><svg class="i t-buy" aria-hidden="true"><use href="#vts-i-up"/></svg><svg class="i t-sell" aria-hidden="true"><use href="#vts-i-down"/></svg><svg class="i t-caution" aria-hidden="true"><use href="#vts-i-warn"/></svg><svg class="i t-wait" aria-hidden="true"><use href="#vts-i-pause"/></svg><svg class="i t-unk" aria-hidden="true"><use href="#vts-i-unk"/></svg></span><span class="bt"><span data-vts="state">Unknown</span><span class="sub"><b class="fresh" data-vts="fresh" hidden></b><span data-vts="momentum"></span><span data-vts="state-why" hidden></span></span></span><span class="clock" data-vts="clock" title="time since the alert"><span class="lbl">Since alert</span><b><svg class="i" aria-hidden="true"><use href="#vts-i-clock"/></svg><span data-vts="since">—</span></b></span></div>
-    <div class="score">
-      <span class="lbl">Buy share</span><span class="lbl r">vs call MC</span>
-      <b class="big na" data-vts="share">—</b><b class="big r na" data-vts="move">—</b>
-      <span class="hsub"><span class="side" data-vts="side" hidden></span></span><span class="hsub r" data-vts="mc-line">no call MC</span>
-      <div class="spark none" data-vts="share-spark" title="Buy share over the last 60s; dotted line = 50%"><div class="plot"><svg viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"><polygon class="ar" points=""/><line class="ref" x1="0" y1="12" x2="100" y2="12"/><polyline class="ln" points=""/></svg><i class="end"></i></div><span class="cap l"></span></div><div class="spark r none" data-vts="mc-spark" title="Market cap since the alert; dashed line = call MC"><div class="plot"><svg viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"><polygon class="ar" points=""/><line class="ref" x1="0" y1="12" x2="100" y2="12"/><polyline class="ln" points=""/></svg><i class="end"></i><span class="cap pk"></span></div><span class="cap cl"></span></div>
+    <div class="score cockpit">
+      <div class="dial empty" data-vts="dial" title="Buy share of dollar volume: green = buys, red = sells, white tick = 50%">
+        <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="tk" cx="60" cy="60" r="56" pathLength="100"/><circle class="tr" cx="60" cy="60" r="46" pathLength="100"/><circle class="sl" cx="60" cy="60" r="46" pathLength="100"/><circle class="by" cx="60" cy="60" r="46" pathLength="100"/><path class="mid" d="M60 7v13"/></svg>
+        <div class="dc"><span class="lbl">Buy share</span><b class="big na" data-vts="share">—</b><span class="side" data-vts="side" hidden></span></div>
+      </div>
+      <div class="mcbox"><span class="lbl">vs call MC</span><b class="big r na" data-vts="move">—</b><span class="hsub" data-vts="mc-line">no call MC</span>
+        <div class="spark r none" data-vts="mc-spark" title="Market cap since the alert; dashed line = call MC"><div class="plot"><svg viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"><polygon class="ar" points=""/><line class="ref" x1="0" y1="12" x2="100" y2="12"/><polyline class="ln" points=""/></svg><i class="end"></i><span class="cap pk"></span></div><span class="cap cl"></span></div>
+        <div class="spark none" data-vts="share-spark" title="Buy share over the last 60s; dotted line = 50%"><div class="plot"><svg viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true"><polygon class="ar" points=""/><line class="ref" x1="0" y1="12" x2="100" y2="12"/><polyline class="ln" points=""/></svg><i class="end"></i></div><span class="cap l"></span></div></div>
     </div>
     <div class="meter empty" data-vts="meter" role="meter" aria-label="Buy share" aria-valuemin="0" aria-valuemax="100"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
     <div class="scale"><span class="b" data-vts="split-buy"></span><span data-vts="basis" title="">no data yet</span><span class="s" data-vts="split-sell"></span></div>
@@ -2399,6 +2477,7 @@ function start() {
     if(share!=null&&(!shareHist.length||now-shareHist[shareHist.length-1].t>=2000))shareHist.push({t:now,v:share});
     shareHist=shareHist.filter(q=>now-q.t<=60000);
     if(mc>0&&(!mcHist.length||now-mcHist[mcHist.length-1].t>=5000)){mcHist.push({t:now,v:mc});if(mcHist.length>360)mcHist=mcHist.filter((_,i)=>i%2===0||i===mcHist.length-1);}
+    {const dial=$('dial');dial.classList.toggle('empty',share==null);dial.style.setProperty('--p',share==null?'0':share.toFixed(1));}
     const sh=$('share');sh.className='big'+(share==null?' na':share>=60?' pos':share<=40?' neg':'');sh.replaceChildren(...(share==null?['—']:[String(Math.round(share)),node('small','','%')]));
     const side=$('side');side.hidden=share==null;side.textContent=share>=60?'▲ Buy side':share<=40?'▼ Sell side':'≈ Mixed';side.className='side'+(share>=60?' pos':share<=40?' neg':'');
     const mv=$('move');mv.className='big r'+(move==null?' na':move>=0?' pos up':' neg down')+(move!=null&&Math.abs(move)>=1000?' long':'');mv.replaceChildren(...(move==null?['—']:[signed(move),node('small','','%')]));
@@ -3310,10 +3389,10 @@ function start() {
     else if(jupS.mint===current&&jupS.res?.noRoute)detail.exitcost='no Jupiter route (unknown, not unsellable)';
     const parts=$('parts'), PART={risk:'Risk',demand:'Demand',entry:'Entry'}, sgn=v=>(v>0?'+':v<0?'−':'')+Math.abs(v);
     if(score.known){
-      const cells=Object.entries(PART).map(([cat,lbl])=>{const v=score[cat], worst=score.checks.filter(k=>k.cat===cat&&k.pts<0).sort((a,b)=>a.pts-b.pts)[0], d=node('div','pt '+(v<=-2?'bad':v<0?'warn':'ok'));
+      const cells=Object.entries(PART).map(([cat,lbl])=>{const v=score[cat], worst=score.checks.filter(k=>k.cat===cat&&k.pts<0).sort((a,b)=>a.pts-b.pts)[0], d=node('div','pt '+(v<=-2?'bad':v<0?'warn':'ok'));d.style.setProperty('--w',Math.min(100,25*Math.abs(v))+'%');
         d.append(node('span','lbl',lbl),node('b','',sgn(v)),node('small','',worst?worst.label:score.checks.some(k=>k.cat===cat&&k.status!=='na')?'no flags':'no data'));
         d.title=lbl+': '+score.checks.filter(k=>k.cat===cat&&k.status!=='na').map(k=>(k.pts>0?'+':'')+k.pts+' '+k.label).join(', ');return d;});
-      const cf=score.confidence, dc=node('div','pt conf '+cf.level);dc.append(node('span','lbl','Data'),node('b','',cf.level),node('small','',cf.reasons[0]||'complete and current'));dc.title='Confidence: '+cf.level+(cf.reasons.length?'\n'+cf.reasons.join('\n'):'');
+      const cf=score.confidence, dc=node('div','pt conf '+cf.level);dc.style.setProperty('--w',{high:'100%',medium:'60%',low:'25%'}[cf.level]);dc.append(node('span','lbl','Data'),node('b','',cf.level),node('small','',cf.reasons[0]||'complete and current'));dc.title='Confidence: '+cf.level+(cf.reasons.length?'\n'+cf.reasons.join('\n'):'');
       parts.replaceChildren(...cells,dc);parts.hidden=false;
     }else parts.hidden=true;
     const out=[];

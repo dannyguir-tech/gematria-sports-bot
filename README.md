@@ -44,6 +44,17 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.test.mjs`
 
+### 4.4.0
+
+- **Speed.** Discord alerts are read on the first page change instead of after a restarted 120ms wait. In a simulated busy channel the time from alert to published call went from 1.7–3.9s to about 5ms.
+- **Speed table.** "Add trades to past calls" (Helius) now also prices a buy 2, 5, 10, 15, 30 and 60s after each alert from the real trades, and the report scores each: what every second of delay costs.
+- **Real costs.** All-in round trip = Jupiter pool cost + platform fee + priority fee and tip (Settings). The report compares its measured median with the Costs setting.
+- **Your own fills.** Optional wallet address: a live position card (profit, entry delay, entry vs the call price, 5-minute rule) and a "Your real trades" section in the report.
+- **Backtest.** Five primary hypotheses (late fill, late call, the two grades, exit cost) are tested as their own family, so a real effect in them is easier to detect.
+- **Volume bots.** The counted share is a floor (shown as ≥). Flat round trips taking 10–60s, the pattern of wash trading spread over one-use wallets, are reported as "possible".
+- **GMGN data report.** Settings → Copy GMGN data report lists every field GMGN returns, to find data the script does not use yet.
+- **UI.** Radial buy-share dial, hex grade badge, bar meters for risk / demand / entry / data, new frame.
+
 ### 3.7.0
 
 - Live gauge reads organic (bot-free) flow first. Wash trades are ~50/50 by construction and dragged every other source toward 50%. Flags when bot-like trades are 40%+ of volume.
