@@ -1548,6 +1548,9 @@ const VTMon = (() => {
   const FIELDS = ['symbol', 'name', 'href', 'vol', 'liq', 'holders', 'top10', 'bundler', 'dev', 'rug', 'buys', 'sells', 'smart', 'migrated', 'vol5m', 'vol1h', 'buys5m', 'sells5m', 'dexPair', 'dexId'];
   let dirty = false, parseSec = 0, parseMs = 0, shown = [], lastRefresh = 0, busy = false;
   const isList = () => PHOTON ? !/\/lp\//.test(location.pathname) : !/\/sol\/token\//.test(location.pathname);
+  // Full: drop the coin seen longest ago that is not on the list.
+  function evict() { const listed = new Set(shown); let old = null; for (const w of map.values()) if (!listed.has(w) && (!old || (w.seen || w.first) < (old.seen || old.first))) old = w; if (old) drop(old.key, old); else map.delete(map.keys().next().value); }
+  const drop = (k, w) => { map.delete(k); if (w.pool && byPool.get(w.pool) === k) byPool.delete(w.pool); };
   function ingest(t, now) {
     const key = t.mint || byPool.get(t.pool) || 'p:' + t.pool, pk = t.pool ? 'p:' + t.pool : null, dex = t.src === 'dex', dom = /-dom$/.test(t.src || '');
     let w = map.get(key);
@@ -1555,7 +1558,7 @@ const VTMon = (() => {
     if (t.mint && pk && pk !== key && map.has(pk)) { const old = map.get(pk); map.delete(pk);
       if (!w) { w = old; w.key = key; map.set(key, w); }
       else { for (const k of FIELDS) if (w[k] == null && old[k] != null) w[k] = old[k]; if (!w.snaps.length) w.snaps = old.snaps; w.ticks += old.ticks; w.seen = Math.max(w.seen || 0, old.seen || 0); w.first = Math.min(w.first, old.first); } }
-    if (!w) { if (map.size >= CAP) map.delete(map.keys().next().value); w = {key, first: now, ticks: 0, snaps: []}; map.set(key, w); }
+    if (!w) { if (map.size >= CAP) evict(); w = {key, first: now, ticks: 0, snaps: []}; map.set(key, w); }
     if (t.mint) w.mint = t.mint;
     if (t.pool && !w.pool) w.pool = t.pool;
     if (t.pool) byPool.set(t.pool, key);
@@ -1625,7 +1628,7 @@ const VTMon = (() => {
       const sym = firstText(a).split(/\s+/)[0].replace(/^\$/, '').slice(0, 14); if (sym && !/^\$?[\d.,]+\s*[KMBsmhd%]?$/i.test(sym)) t.symbol = sym;
       if (PHOTON) { t.pool = m[1]; try { t.href = new URL(href, location.origin).href; } catch (_) {}
         // The mint, when the row carries it (copy button or data attribute): any other base58 address in the row's attributes.
-        for (const el of row.querySelectorAll('[data-address],[data-mint],[data-token],[data-token-address],[data-clipboard-text],[data-copy]')) { const v = [...el.attributes].map(x => x.value).find(x => VTCore.MINT.test(x) && x !== m[1]); if (v) { t.mint = v; break; } }
+        for (const el of [row, ...row.querySelectorAll('[data-address],[data-mint],[data-token],[data-token-address],[data-clipboard-text],[data-copy]')]) { const v = [...el.attributes].map(x => x.value).find(x => VTCore.MINT.test(x) && x !== m[1]); if (v) { t.mint = v; break; } }
       } else t.mint = m[1];
       ingest(t, now); n++;
     }
@@ -1694,9 +1697,9 @@ const VTMon = (() => {
   function evaluate(now) {
     const out = [];
     for (const [k, w] of map) {
-      if (now - (w.seen || w.first) > 900000) { map.delete(k); if (w.pool && byPool.get(w.pool) === k) byPool.delete(w.pool); continue; }
+      if (now - (w.seen || w.first) > 900000) { drop(k, w); continue; }
       w.ev = VTCore.monEval(w, now); w.pass = VTCore.monPass(w);
-      if (w.pass && now - (w.seen || 0) <= 600000) out.push(w);
+      if (w.pass && now - (w.seen || 0) <= 300000) out.push(w);
     }
     out.sort((a, b) => (b.ev.wake - a.ev.wake) || (b.ev.score - a.ev.score) || ((b.ev.velPct || 0) - (a.ev.velPct || 0)));
     shown = out.slice(0, SHOW);
@@ -1710,11 +1713,11 @@ const VTMon = (() => {
     return shown;
   }
   const emit = force => { for (const fn of subs) try { fn(force); } catch (_) {} };
-  const pickForDex = () => { const now = Date.now(), need = [...map.values()].filter(w => (!w.mint || (w.pass && now - (w.dexAt || 0) > 30000)) && now - (w.seen || 0) < 300000);
+  const pickForDex = () => { const now = Date.now(), need = [...map.values()].filter(w => (!w.mint || (!(w.mc > 0) && now - (w.dexAt || 0) > 60000) || (w.pass && now - (w.dexAt || 0) > 30000)) && now - (w.seen || 0) < 300000);
     return [...need.filter(w => !w.mint).slice(0, 30), ...need.filter(w => w.mint).sort((a, b) => (b.ev?.score || 0) - (a.ev?.score || 0)).slice(0, 30)]; };
   async function refresh() {
     const now = Date.now();
-    for (const [k, w] of map) if (now - (w.seen || w.first) > 300000) { map.delete(k); if (w.pool && byPool.get(w.pool) === k) byPool.delete(w.pool); }
+    for (const [k, w] of map) if (now - (w.seen || w.first) > 300000) drop(k, w);
     scanDom(true); evaluate(Date.now());
     try { await enrich(pickForDex()); await enrich(shown.filter(w => Date.now() - (w.dexAt || 0) > 5000).slice(0, 30)); } catch (_) {}
     lastRefresh = Date.now(); evaluate(lastRefresh); dirty = false; emit(true);
@@ -1729,7 +1732,7 @@ const VTMon = (() => {
     if (n % 5 === 0 && (isList() || subs.size) && map.size) enrich(pickForDex()).catch(() => {});
     if (n % 10 === 0) settle().catch(() => {});
   }, 3000);
-  return {list: () => shown, size: () => map.size, stats: () => ({...stats, coins: map.size, lastRefresh}), refresh, on(fn) { subs.add(fn); return () => subs.delete(fn); },
+  return {list: () => shown, size: () => map.size, stats: () => { let priced = 0; for (const w of map.values()) if (w.mc > 0) priced++; return {...stats, coins: map.size, priced, lastRefresh}; }, refresh, on(fn) { subs.add(fn); return () => subs.delete(fn); },
     board: () => VTCore.monStats(get('log', [])), log: () => get('log', []), feed, ingest: (t, now = Date.now()) => ingest(t, now), evaluate: () => evaluate(Date.now()), isList, site: PHOTON ? 'photon' : 'gmgn'};
 })();
 
@@ -1773,8 +1776,8 @@ function monUI(box, opts) {
   bRef.type = bCopy.type = 'button'; bRef.title = 'Read the page again, drop coins not seen for 5 min and pull fresh numbers from DEX Screener';
   head.append(title, bRef, bCopy); box.replaceChildren(head, chips, note, list, board);
   if (!M) { note.textContent = 'The monitor runs on GMGN and Photon pages.'; return {render() {}}; }
-  const FILTERS = [['wake', 'Waking'], ['prime', 'Score 4+'], ['smart', 'Smart buys'], ['migrated', 'Migrated'], ['all', 'All']];
-  let filter = GM_getValue('vts3.mon.filter', 'wake'), inside = false, said = '';
+  const FILTERS = [['all', 'All'], ['wake', 'Waking'], ['prime', 'Score 4+'], ['smart', 'Smart buys'], ['migrated', 'Migrated']];
+  let filter = GM_getValue('vts3.mon.filter', 'all'), inside = false, said = '';
   for (const [k, label] of FILTERS) { const b = el('button', k === filter ? 'on' : '', label); b.type = 'button'; b.dataset.f = k;
     b.onclick = () => { filter = k; GM_setValue('vts3.mon.filter', k); for (const x of chips.children) x.classList.toggle('on', x === b); render(true); }; chips.append(b); }
   list.addEventListener('wheel', e => e.stopPropagation(), {passive: true});
@@ -1822,11 +1825,11 @@ function monUI(box, opts) {
   function render(force) {
     if (box.hidden || box.closest('[hidden]')) return;
     const all = M.list(), rows = all.filter(keep).slice(0, 25), s = M.stats(), waking = all.filter(w => w.ev.wake).length;
-    title.textContent = 'Monitor · ' + s.coins + ' watched · ' + waking + ' waking';
+    title.textContent = 'Monitor · ' + s.priced + ' watched · ' + waking + ' waking';
     // While the pointer is on the list only the numbers change: cards do not move or vanish under the cursor.
     if (inside && !force) { for (const w of all) if (cards.has(w.key) && cards.get(w.key).root.isConnected) card(w); }
     else { const top = list.scrollTop; list.replaceChildren(...rows.map(card)); list.scrollTop = top; for (const k of [...cards.keys()]) if (!cards.get(k).root.isConnected) cards.delete(k); }
-    note.textContent = [said, inside && !force ? 'Order is paused while the pointer is on the list.' : '', !rows.length ? (all.length ? 'No coin matches this filter right now (' + all.length + ' pass the safety filter).' : s.coins ? s.coins + ' coins watched, none passes the filter yet.' : opts.site === 'photon' ? 'Waiting for rows: open Memescope or Discover, or press Refresh.' : 'Waiting for rows: open GMGN Trenches or New Pairs, or press Refresh.') : ''].filter(Boolean).join(' ');
+    note.textContent = [said, inside && !force ? 'Order is paused while the pointer is on the list.' : '', !rows.length ? (all.length ? 'No coin matches this filter right now (' + all.length + ' pass the safety filter).' : s.coins ? s.coins + ' coins seen, none with a market cap that passes the safety filter yet.' : opts.site === 'photon' ? 'Waiting for rows: open Memescope or Discover, or press Refresh.' : 'Waiting for rows: open GMGN Trenches or New Pairs, or press Refresh.') : ''].filter(Boolean).join(' ');
     note.hidden = !note.textContent;
     const b = M.board(), line = (label, x) => { const d = el('div'), f = (m, r) => r.n ? m + ' min: median ' + sg(r.median) + ', ' + Math.round(r.up) + '% higher' + (r.big >= 1 ? ', ' + Math.round(r.big) + '% up 50%+' : '') + ' (' + r.n + ')' : m + ' min: none checked yet';
       d.append(el('b', '', label + ' '), f(10, x[10]) + ' · ' + f(30, x[30])); return d; };
