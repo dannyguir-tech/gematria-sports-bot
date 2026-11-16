@@ -481,3 +481,19 @@ test('backtestReport: the 4.9 tables read what was saved with the call', () => {
   assert.deepEqual(f('Smart money holding minus dumping').rows.map(x => x.label), ['<0', '0–1', '≥1']);
   assert.deepEqual(f('Same-size buys at the call').rows.map(x => [x.label, x.n]), [['no', 96], ['yes', 24]]);
 });
+test('gmBase: a saved score the 4.3 rules could not have produced is recognised', () => {
+  const x = scoreIn({insiderHold: 41, top10: 46}), s = V.scoreCoin(x), rec = o => ({v: 2, grade: s.grade, hard: [], insiderHold: 41, top10: 46, devPct: 2, bundlerPct: 8, smart: 0, volMc: 2, move: 5, checks: Object.fromEntries(s.checks.map(k => [k.key, k.status === 'na' ? null : k.pts])), ...o});
+  assert.equal(V.gmBase(rec({})), true, 'what 4.4 and 4.9 save');
+  assert.equal(V.gmBase(rec({checks: {...rec({}).checks, insiders: 0, top10: 0}})), false, '4.8 "holding bundle": 41% insiders scored 0');
+  assert.equal(V.gmBase(rec({devPct: 0, checks: {...rec({}).checks, dev: 1}})), false, '4.8.4 DS point');
+  assert.equal(V.gmBase(rec({smart: 4, checks: {...rec({}).checks, smart: -2}})), false);
+  assert.equal(V.gmBase(rec({hard: ['Inorganic tape: Clone buys (8x ~$16 (8w))']})), false);
+  assert.equal(V.gmBase(rec({checks: {...rec({}).checks, organic: -2}})), false);
+  assert.equal(V.gmBase(rec({insiderHold: 15, checks: {...rec({}).checks, insiders: 0}})), true, 'a number stored on a band edge is not judged (rounding)');
+  assert.equal(V.gmBase({v: 1, checks: {insiders: 9}}), true, 'older records are not judged');
+  assert.equal(V.gmBase(null), true);
+  // the backtest's 4.3 table leaves an altered record out
+  const items = fakeItems(rng(8), 40, false); items.forEach((it, i) => { it.call.gm = i < 10 ? rec({code: 0, checks: {...rec({}).checks, insiders: 0}}) : rec({code: 2}); });
+  const row = V.backtestReport(items, 5).features.find(f => f.name === 'Live grade at the call (4.3 rules)').rows;
+  assert.deepEqual(row.map(r => [r.label, r.n]), [['avoid', 30], ['unknown', 10]]);
+});

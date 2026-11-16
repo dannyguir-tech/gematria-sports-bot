@@ -387,6 +387,8 @@ const VTCore = (() => {
   // primary (4.4): five hypotheses with a mechanism behind them, fixed on Nov 10 2026 before any outcome was looked at:
   // a late fill, a late call, the two grades this tool shows, and the cost of getting out. They are tested as their own
   // small family; everything else is exploratory and has to clear a much higher bar.
+  // The saved live score of a call, when it is one the 4.3 rules produced (see gmBase).
+  const g43 = c => c.gm?.v >= 2 && gmBase(c.gm) ? c.gm : null;
   const FEATURES = [
     ['Largest cluster', c => c.clusters?.length ? Math.max(...c.clusters) : null, [10, 20, 30], '%'],
     ['Bot/high-risk share', c => c.holders > 0 && c.bots != null ? 100 * c.bots / c.holders : null, [20, 40], '%'],
@@ -415,11 +417,11 @@ const VTCore = (() => {
     // Live score (3.9): GMGN's numbers + chain checks + volume bots, saved when the call first opened on GMGN
     // (c.gm, forward only: GMGN gives today's numbers, not past ones).
     // Grade and parts: 4.3 rules only (v2 snapshots); older snapshots used different weights and would blur the test.
-    ['Live grade at the call (4.3 rules)', c => c.gm?.v >= 2 ? c.gm.code ?? null : null, [1, 2], 'grade', 1],
-    ['Risk score at the call', c => c.gm?.v >= 2 ? c.gm.risk ?? null : null, [-3, -1, 0], ''],
-    ['Demand score at the call', c => c.gm?.v >= 2 ? c.gm.demand ?? null : null, [-1, 0, 1], ''],
-    ['Entry score at the call', c => c.gm?.v >= 2 ? c.gm.entry ?? null : null, [-2, -1, 0], ''],
-    ['Data confidence at the call', c => c.gm?.v >= 2 ? {high: 0, medium: 1, low: 2}[c.gm.conf] ?? null : null, [1, 2], 'conf'],
+    ['Live grade at the call (4.3 rules)', c => g43(c)?.code ?? null, [1, 2], 'grade', 1],
+    ['Risk score at the call', c => g43(c)?.risk ?? null, [-3, -1, 0], ''],
+    ['Demand score at the call', c => g43(c)?.demand ?? null, [-1, 0, 1], ''],
+    ['Entry score at the call', c => g43(c)?.entry ?? null, [-2, -1, 0], ''],
+    ['Data confidence at the call', c => ({high: 0, medium: 1, low: 2})[g43(c)?.conf] ?? null, [1, 2], 'conf'],
     ['Round trip at your size (Jupiter)', c => c.gm?.exitCost ?? null, [5, 10, 25], '%', 1],
     ['First 70 buyers still holding', c => c.gm?.retention ?? null, [25, 50, 75], '%'],
     ['Holders at 2×+ profit (by supply)', c => c.gm?.profitShare ?? null, [25, 50], '%'],
@@ -1186,6 +1188,25 @@ const VTCore = (() => {
   // is saved with each call ('gm.<id>'.x49) so the backtest report can show whether they separate winners from losers.
   // The base grade ("4.3 rules") is still computed and saved unchanged, so its own forward test stays clean.
 
+  // ---- Saved live scores written while the 4.5-4.8 add-ons were installed ----
+  // Those add-ons changed the points of a score but saved the raw numbers next to them, under the same "4.3 rules"
+  // label. A record whose points the 4.3 rules cannot give for its own numbers is such a record: it is left out of the
+  // "4.3 rules" backtest tables, so that forward test stays clean. Records from 4.4 and from 4.9 on always pass.
+  // (A number within 0.006 of a band edge is not judged: the record stores it rounded to two decimals.)
+  function gmBase(g) {
+    if (!g || !(g.v >= 2) || !g.checks) return true;
+    if ((g.hard || []).some(h => /^Inorganic tape/.test(String(h)))) return false;
+    const c = g.checks, bad = (key, v, edges, pts) => c[key] != null && v != null && !edges.some(e => Math.abs(v - e) < 0.006) && c[key] !== pts, ih = g.insiderHold, t10 = g.top10, dv = g.devPct, bp = g.bundlerPct;
+    return !(bad('insiders', ih, [10, 15, 25, 40], ih >= 40 ? -3 : ih >= 25 ? -2 : ih >= 15 ? -1 : ih < 10 ? 1 : 0)
+      || bad('top10', t10, [15, 25, 35], t10 > 35 ? -2 : t10 > 25 ? -1 : t10 < 15 ? 1 : 0)
+      || bad('dev', dv, [5, 10], dv >= 10 ? -2 : dv > 5 ? -1 : 0)
+      || bad('bundlers', bp, [10, 20], ih != null ? 0 : bp >= 20 ? -2 : bp >= 10 ? -1 : 0)
+      || bad('smart', g.smart, [], g.smart >= 3 ? 1 : 0)
+      || bad('volmc', g.volMc, [10], g.volMc >= 10 ? -1 : 0)
+      || bad('move', g.move, [100], g.move >= 100 ? -1 : 0)
+      || c.organic < 0);
+  }
+
   // ---- Trade tape: same-size buys, a tape with almost no sells, one wallet behind the last minute's buying ----
   // A size a person gets from an app's buy buttons: a round SOL amount, or one with an app fee of up to 1.5% taken off.
   // Five people pressing "0.1 SOL" are not a bot, so round sizes never count as same-size buys.
@@ -1401,7 +1422,7 @@ const VTCore = (() => {
       out[kind].seen = rows.length; }
     return out;
   }
-  return {roundSol,tapeTraps,stealthScan,adjustScore,verdict,monNorm,MON,monPass,monEval,monStats,MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
+  return {gmBase,roundSol,tapeTraps,stealthScan,adjustScore,verdict,monNorm,MON,monPass,monEval,monStats,MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
     candles,mergeCandles,scoreCall,preAlert,SPEED_AT,pricePath,position,breakeven,wilson,summarize,zFor,tFor,backtestReport,VB,botFlow,gmgnMaker,gmgnApiTrade,APP_TAG,BOT_RULES,BOT_SURE,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff,
     RUG,SYSTEM_PROGRAM,txMint,rugState,rugHolding,rugTx,tradeTokens,rugTrade,rugPrune,rugCatch,rugVerify,HOLDER_GAP_MAX,holderTrust,devNowVerified,creatorCheck,creatorUsable,senderTrust,rugRanked,rugTop,rugLaunch,rugSnap,rugScan,funderOf,rugGrade,rugGradeAt,rugLine,FEATURES,gmgnParse,roleOfTags,insiderGroup,EXIT,exitStats,scoreCoin,b58decode,b58encode,pumpCreator,devFlow,WSOL_MINT};
 })();
@@ -4417,7 +4438,7 @@ function start() {
       standouts:report.features.flatMap(f=>f.rows.filter(r=>r.standsOut).map(r=>({name:f.name,label:r.label,dir:r.standsOut,diff:r.diff,n:r.n})))});
     showReport(report,items,{my:{n:mineRows.length,delay:med(mineRows.map(r=>r.mine.delay)),prem:med(mineRows.map(r=>r.mine.prem))},tp,sl,cost,noData,delay,exit,fill,entries,grades,rows,moveInto,runUps:rows.filter(r=>r.pre.runUp15!=null).length,
       rug:{n:rows.filter(r=>r.rf).length,cut:rows.filter(r=>r.rf&&r.rug.holders!=='verified').length,old:rows.filter(r=>r.rug?.done&&!r.rug.empty&&!(r.rug.v>=3)).length},gmN:rows.filter(r=>r.gm).length,gmUsed:rows.filter(r=>gmAt(r,delay)).length,
-      speed,speedN:rows.filter(r=>r.hb?.px).length,x49N:rows.filter(r=>r.gm?.x49).length,speedOld:rows.filter(r=>r.hb&&!(r.hb.v>=3)).length,allIn:{n:allIns.length,med:med(allIns)},lat,
+      speed,speedN:rows.filter(r=>r.hb?.px).length,x49N:rows.filter(r=>r.gm?.x49).length,altered:rows.filter(r=>r.gm&&!VTCore.gmBase(r.gm)).length,speedOld:rows.filter(r=>r.hb&&!(r.hb.v>=3)).length,allIn:{n:allIns.length,med:med(allIns)},lat,
       noExit,incomplete,staleExits,fresh,staleSum,worst,legacyCache:rows.filter(r=>!get('bt.f.'+r.call.id,null)).length,
       exits:exitRules(rows),forward:{n:fwd.length,rules:fwd.length?exitRules(fwd):[]}});
   }
@@ -4453,7 +4474,7 @@ function start() {
         f(o.moveInto(r,0)),f(r.pre.runUp15),c.migrated,ex.trail.outcome,f(ex.trail.ret),hb?.post?.org,hb?.post?.orgN,ft?.vb120?.org,
         ...(r.rf?[r.rf.top10,r.rf.devPct,r.rug.devBuyPct,r.rf.devSold,r.rf.launchBuyers,r.rf.launchPct,r.rf.seenDev,r.rf.seenFund,r.rug.complete,r.rug.creator,r.rug.funder,['clean','risky','avoid'][r.rf.grade]??null]:Array(12).fill(null)),
         ...(r.gm?[r.gm.grade,r.gm.score,r.gm.known,r.gm.delay,r.gm.insiderHold,r.gm.bundlerPct,r.gm.sniperPct,r.gm.platformRate,r.gm.freshRate,r.gm.launches,r.gm.volMc,r.gm.smart,r.gm.top10,r.gm.devPct,r.gm.clusterN,r.gm.clusterPct,r.gm.holders,r.gm.first70Hold,r.gm.devStatus,
-          r.gm.v>=2?'4.3':'old',r.gm.risk,r.gm.demand,r.gm.entry,r.gm.conf,r.gm.exitCost,r.gm.tradeSol,r.gm.retention,r.gm.profitShare,r.gm.move]:Array(29).fill(null)),r.gm?.allIn,...VTCore.SPEED_AT.flatMap(s=>[r.hb?.px?.pct?.[s],r.sp[s]?.status==='scored'?f(r.sp[s].ret):null]),r.mine?Math.round(r.mine.delay):null,f(r.mine?.prem),f(r.mine?.pnl),r.mine?r.mine.open:null,...(r.gm?.x49?[r.gm.x49.verdict,r.gm.x49.grade,r.gm.x49.holding,r.gm.x49.stealth,r.gm.x49.smartNet,r.gm.x49.clone,r.gm.x49.zeroSell,r.gm.x49.top1]:Array(8).fill(null))].map(q).join(',');});
+          r.gm.v>=2?(VTCore.gmBase(r.gm)?'4.3':'4.5-4.8 add-ons'):'old',r.gm.risk,r.gm.demand,r.gm.entry,r.gm.conf,r.gm.exitCost,r.gm.tradeSol,r.gm.retention,r.gm.profitShare,r.gm.move]:Array(29).fill(null)),r.gm?.allIn,...VTCore.SPEED_AT.flatMap(s=>[r.hb?.px?.pct?.[s],r.sp[s]?.status==='scored'?f(r.sp[s].ret):null]),r.mine?Math.round(r.mine.delay):null,f(r.mine?.prem),f(r.mine?.pnl),r.mine?r.mine.open:null,...(r.gm?.x49?[r.gm.x49.verdict,r.gm.x49.grade,r.gm.x49.holding,r.gm.x49.stealth,r.gm.x49.smartNet,r.gm.x49.clone,r.gm.x49.zeroSell,r.gm.x49.top1]:Array(8).fill(null))].map(q).join(',');});
       const url=URL.createObjectURL(new Blob([[cols.join(','),...lines].join('\n')],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='voltrak-backtest-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     };
     const a=rep.all, t=rep.timing;
@@ -4575,7 +4596,7 @@ function start() {
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'Win = target hit before the stop. Each bucket\'s average per trade is compared with the rest of the calls. With '+(rep.tested.primary+rep.tested.explore)+' buckets tested, a few always look different by chance, so a bucket only "stands out" (green or red) when it and the rest have 15+ calls each and the gap clears a bar corrected for the number of tests (about a 5% chance per report of any false find). The tables marked ★ are the primary hypotheses, fixed before looking at any result (late fill, late call, the two grades, exit cost and, from 4.9, the verdict): their '+rep.tested.primary+' buckets share most of that 5% and so clear a lower bar; the other '+rep.tested.explore+' are exploratory and need a much bigger gap. Past calls only: a filter is worth using only if it keeps working on new calls.'));
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'"Move into entry" = your fill vs the last trade before the alert: how far the call\'s own crowd had already pushed the price (the live panel\'s "vs call MC" number). "Run-up" = the 15 min before the alert; '+o.runUps+' of '+o.rows.length+' calls have those prices so far (older calls get them on the next "Score calls").'));
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'Rug checks: '+o.rug.n+' of '+o.rows.length+' calls have one'+(o.rug.cut?' ('+o.rug.cut+' busy coins have only the launch block and funder)':'')+'. The rules (top 10 over 25%, dev over 5% or selling, 4+ launch-block wallets) come from an article and are untested; the tables below show whether they mattered on your calls. Add checks to more calls with "Add rug checks to past calls".'));
-    box.append(el('p','margin:0 0 8px;color:'+C.muted,'4.9 rules (verdict, adjusted grade, holding bundle, stealth bundles, smart-money flow, same-size buys, top buyer): '+o.x49N+' of '+o.rows.length+' calls have them, saved from 4.9 on while the verdict bar is on. They are trader rules nobody has tested: these tables are the test. The "4.3 rules" grade is saved unchanged next to them.'));
+    box.append(el('p','margin:0 0 8px;color:'+C.muted,'4.9 rules (verdict, adjusted grade, holding bundle, stealth bundles, smart-money flow, same-size buys, top buyer): '+o.x49N+' of '+o.rows.length+' calls have them, saved from 4.9 on while the verdict bar is on. They are trader rules nobody has tested: these tables are the test. The "4.3 rules" grade is saved unchanged next to them.'+(o.altered?' '+o.altered+' saved score'+(o.altered===1?' was':'s were')+' written while the 4.5–4.8 add-ons altered the grade (the points do not match the record’s own numbers): left out of the 4.3-rules tables.':'')));
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'Live score at the call (GMGN numbers + chain checks): '+o.gmN+' of '+o.rows.length+' calls have one; '+o.gmUsed+' of them were saved before this entry time and are used (a score saved after the entry is left out, so it cannot peek). Usually saved 10 to 40s after the alert: choose "Buy at 1 min" to test it. GMGN only gives today'+String.fromCharCode(8217)+'s numbers, so this builds up from calls that open on GMGN from 3.9 on; the "Live grade" and "Live score" tables need about 100 of them before they say much.'));
     const pf=v=>v==null?'n/a':(v>=0?'+':'')+v.toFixed(0)+'%';
     box.append(el('p','margin:0 0 8px;color:'+C.muted,'Exit data: '+o.noExit+' call'+(o.noExit===1?'':'s')+' had no trade after the entry and '+o.incomplete+' had candles that did not reach the end of the 2h window; both are left out, not counted as flat. '
