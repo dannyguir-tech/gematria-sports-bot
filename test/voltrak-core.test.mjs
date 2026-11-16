@@ -301,3 +301,183 @@ test('position: the result does not depend on the order the fills arrived in', (
   const b = V.position([t('buy', 10, 100000.1, 1000), t('buy', 20, 200000.2, 2000), t('sell', 33, 300000.3, 9000), t('sell', 15, 150000, 60000)], 1e-4);
   assert.ok(b.n === 3 && b.last === 9000 && !b.open && Math.abs(b.pnl - 10) < 1e-9, 'n ' + b.n + ' last ' + b.last + ' pnl ' + b.pnl);
 });
+
+// ---- 4.9: the add-on rules (tape checks, stealth bundles, adjusted grade, verdict, monitor) ----
+const SOLP = 150, tb = (side, sol, wallet, at, usd = sol * SOLP) => ({side, sol, usd, wallet, at, hash: wallet + at});
+test('roundSol: button sizes are round, with or without an app fee taken off', () => {
+  for (const s of [0.01, 0.05, 0.1, 0.099, 0.0985, 0.25, 0.4925, 0.5, 1, 0.99, 2, 4.95, 10]) assert.equal(V.roundSol(s), true, String(s));
+  for (const s of [0.0937, 0.1234, 0.0667, 0.777, 1.13, 0.004]) assert.equal(V.roundSol(s), false, String(s));
+});
+test('tapeTraps: same-size buys are odd sizes from many wallets, never people pressing the same button', () => {
+  const now = T0, people = [];
+  // 40 buys from 40 people using 0.1 / 0.5 / 1 SOL buttons (some apps take 1% off), 12 sells
+  for (let i = 0; i < 40; i++) people.push(tb('buy', [0.1, 0.5, 1][i % 3] * (i % 2 ? 0.99 : 1), 'p' + i, now - 200000 + i * 4000));
+  for (let i = 0; i < 12; i++) people.push(tb('sell', 0.3, 's' + i, now - 150000 + i * 9000));
+  const plain = V.tapeTraps(people, now);
+  assert.equal(plain.clone, null, 'preset sizes are not clones');
+  assert.equal(plain.zeroSell, false);
+  // six wallets buying 0.0937 SOL (about $14) within 1%
+  const bots = [...people]; for (let i = 0; i < 6; i++) bots.push(tb('buy', 0.0937 * (1 + i * 0.001), 'bot' + i, now - 60000 + i * 5000));
+  const c = V.tapeTraps(bots, now).clone;
+  assert.ok(c && c.count === 6 && c.wallets === 6 && Math.abs(c.sol - 0.0937) < 0.001, JSON.stringify(c));
+  // the same six buys from one wallet are one trader, not a ring
+  const one = [...people]; for (let i = 0; i < 6; i++) one.push(tb('buy', 0.0937, 'solo', now - 60000 + i * 5000));
+  assert.equal(V.tapeTraps(one, now).clone, null);
+  // a full tape with almost no sells, and one wallet behind the last minute's buying
+  const green = []; for (let i = 0; i < 44; i++) green.push(tb('buy', 0.2, 'g' + i, now - 58000 + i * 1200)); green.push(tb('buy', 30, 'whale', now - 5000));
+  const g = V.tapeTraps(green, now);
+  assert.equal(g.zeroSell, true);
+  assert.ok(g.top1.share > 76 && g.top1.share < 79, 'whale share ' + g.top1.share);
+  assert.equal(V.tapeTraps(green.slice(0, 25), now).zeroSell, false, 'the first trades of a launch are nearly all buys: not flagged under 40 trades');
+  assert.equal(V.tapeTraps([], now).top1, null);
+});
+const holder = (i, pct, o = {}) => ({address: 'H' + i, addr_type: 0, amount_percentage: pct / 100, maker_token_tags: [], total_trade: 4, avg_cost: 1e-5, native_transfer: {timestamp: 1700000000 + i * 86400, name: null}, open_timestamp: 1760000000 + i * 600, ...o});
+test('stealthScan: wallets funded together count; one ordinary signature alone does not', () => {
+  // 30 ordinary holders: every bag a different size, funded days apart, bought minutes apart
+  const plain = Array.from({length: 30}, (_, i) => holder(i, 2.4 - i * 0.07));
+  const s0 = V.stealthScan(plain, 2e-5, 1e9);
+  assert.equal(s0.stealthPct, 0);
+  assert.equal(s0.wallets, 0);
+  assert.ok(Math.abs(s0.floor.mult - 2) < 1e-9 && /top-12/.test(s0.floor.basis) && s0.floor.mc === 1e4);
+  // five of them funded inside the same 10 minutes
+  const fund = plain.map((h, i) => i >= 10 && i < 15 ? {...h, native_transfer: {timestamp: 1750000000 + i * 60, name: 'Binance 2'}} : h), s1 = V.stealthScan(fund, 2e-5, 1e9);
+  assert.equal(s1.wallets, 5);
+  assert.ok(Math.abs(s1.stealthPct - [10, 11, 12, 13, 14].reduce((t, i) => t + 2.4 - i * 0.07, 0)) < 1e-9, 'pct ' + s1.stealthPct);
+  assert.match(s1.kind, /5w funded together \(Binance 2\)/);
+  // six equal bags alone (people pressing the same button at the same price): not stealth
+  const equal = plain.map((h, i) => i >= 20 && i < 26 ? {...h, amount_percentage: 0.0061} : h), s2 = V.stealthScan(equal, 2e-5, 1e9);
+  assert.equal(s2.det.equal.n, 6);
+  assert.equal(s2.stealthPct, 0);
+  // the same six also bought in the same second: two signatures, counted
+  const both = equal.map((h, i) => i >= 20 && i < 26 ? {...h, open_timestamp: 1765000000} : h), s3 = V.stealthScan(both, 2e-5, 1e9);
+  assert.equal(s3.wallets, 6);
+  assert.ok(Math.abs(s3.stealthPct - 3.66) < 1e-9);
+  // wallets GMGN already tagged are the insider bag, not stealth; smart money is counted from their tags
+  const tagged = fund.map((h, i) => i === 10 ? {...h, maker_token_tags: ['bundler']} : i === 0 ? {...h, tags: ['smart_degen'], history_bought_amount: 100, history_sold_amount: 85} : i === 1 ? {...h, tags: ['renowned'], history_bought_amount: 100, history_sold_amount: 55} : i === 2 ? {...h, tags: ['not_smart', 'kolibri_fan']} : h);
+  const s4 = V.stealthScan(tagged, 2e-5, 1e9);
+  assert.equal(s4.wallets, 4);
+  assert.deepEqual(s4.smart, {holding: 1, dumping: 1}, 'sold 85% = dumping, sold 55% = still holding, look-alike tags are not smart money');
+  assert.ok(Math.abs(s4.taggedPct - 1.7) < 1e-9);
+  assert.equal(V.stealthScan([], 1, 1), null);
+});
+const scoreIn = o => ({exit: {wallets: 0, pct: 0, coordinated: false}, devSellingNow: false, insiderHold: 12, devPct: 2, devSold: false, launches: 2, sameDev: false, funderSeen: 0, top10: 20, bundlerPct: 8, sniperPct: 3, cluster: {n: 0},
+  launchBuyers: 1, platformRate: 40, freshRate: 10, smart: 0, holderGrowth: 2, volMc: 2, botShare: 5, botTrades: 10, orgShare: 60, orgN: 40, retention: 55, profitShare: 10, moveSinceCall: 5, exitCost: 4, conf: {}, ...o});
+test('adjustScore: a holding bundle is RISKY, not AVOID and not CLEAN; missing data never counts as good data', () => {
+  // insiders 40%, top 10 46%, nobody selling, organic buy share 60%, first buyers holding 55%
+  const x = scoreIn({insiderHold: 40, top10: 46}), base = V.scoreCoin(x), adj = V.adjustScore(base, x, {});
+  assert.equal(base.grade, 'AVOID');
+  assert.equal(adj.grade, 'RISKY');
+  assert.equal(adj.holding, true);
+  assert.equal(adj.risk, -2, 'insider bag and top 10 capped at -1 each');
+  assert.equal(adj.baseGrade, 'AVOID');
+  assert.equal(base.checks.find(k => k.key === 'insiders').pts, -3, 'the base score object is not changed');
+  // the same coin with the organic buy share unknown, 40%, or 100% from three trades: no waiver (4.8 treated unknown as 56%)
+  for (const o of [{orgShare: null}, {orgShare: 40}, {orgShare: 100, orgN: 3}]) { const y = scoreIn({insiderHold: 40, top10: 46, ...o}), a = V.adjustScore(V.scoreCoin(y), y, {}); assert.equal(a.holding, false); assert.equal(a.grade, 'AVOID', JSON.stringify(o)); }
+  // a dev sale on the live feed in the last minutes counts as selling, with or without a chain key
+  assert.equal(V.adjustScore(base, x, {devExitRecent: true}).holding, false);
+  // insiders selling now: no waiver either
+  const sell = scoreIn({insiderHold: 40, top10: 46, exit: {wallets: 2, pct: 2.1, coordinated: false}});
+  assert.equal(V.adjustScore(V.scoreCoin(sell), sell, {}).grade, 'AVOID');
+  // untagged stealth bundles are added to the bag when it is not a holding bundle
+  const st = scoreIn({insiderHold: 12, orgShare: 40}), a2 = V.adjustScore(V.scoreCoin(st), st, {stealth: {stealthPct: 16, smart: {holding: 0, dumping: 0}}});
+  assert.equal(a2.checks.find(k => k.key === 'insiders').pts, -2, '12% + 16% = 28% is the 25%+ band');
+  assert.equal(a2.total, 28);
+});
+test('adjustScore: chasing is monotonic, DS adds a point, tape traps are a penalty and not a hard stop', () => {
+  const entry = move => { const x = scoreIn({moveSinceCall: move}); return V.adjustScore(V.scoreCoin(x), x, {}).checks.find(k => k.key === 'move').pts; };
+  assert.deepEqual([20, 50, 90, 150].map(entry), [0, -1, -2, -2], '+90% must not score worse than +150%');
+  const dev = (o, ctx = {}) => { const y = scoreIn({devPct: 0, ...o}); return V.adjustScore(V.scoreCoin(y), y, ctx).checks.find(k => k.key === 'dev'); };
+  assert.equal(dev({devSoldAgoMin: 45}).pts, 1);
+  assert.match(dev({devSoldAgoMin: 45}).value, /DS/);
+  assert.equal(dev({devSoldAgoMin: 5}).pts, 0, 'a dump five minutes ago earns nothing');
+  assert.equal(dev({}).pts, 0, 'sale time unknown: no bonus');
+  assert.equal(dev({devSoldAgoMin: 45}, {devExitRecent: true}).pts, 0);
+  assert.ok(dev({devSoldAgoMin: 45, devSellingNow: true}).pts <= 0);
+  // a dev whose earlier coins mostly rugged
+  const rg = scoreIn({}), ra = V.adjustScore(V.scoreCoin(rg), rg, {rugRatio: 0.9});
+  assert.equal(ra.checks.find(k => k.key === 'launches').pts, -2);
+  assert.equal(ra.grade, 'RISKY');
+  const x = scoreIn({}), clone = V.adjustScore(V.scoreCoin(x), x, {traps: {clone: {count: 6, wallets: 6, sol: 0.0937, usd: 14}, zeroSell: false, buys: 30, sells: 9}});
+  assert.equal(clone.checks.find(k => k.key === 'organic').pts, -2);
+  assert.match(clone.checks.find(k => k.key === 'organic').value, /^60% · 6 same-size buys/, 'the real organic share stays visible');
+  assert.equal(clone.demand, V.scoreCoin(x).demand - 3, 'organic buys go from +1 to -2');
+  assert.equal(clone.hard.length, 0, 'no hard stop: the verdict bar says stay away, the grade follows the points');
+  const zero = V.adjustScore(V.scoreCoin(x), x, {traps: {clone: null, zeroSell: true, buys: 28, sells: 1}});
+  assert.equal(zero.checks.find(k => k.key === 'organic').pts, -1);
+  assert.equal(zero.grade, 'CLEAN', 'a fresh launch with few sells yet is not graded down to RISKY by that alone');
+  // volume/MC 15x with few bots is not held against the coin; with 40% bot trades it is
+  const vm = bots => { const y = scoreIn({volMc: 15, botTrades: bots}); return V.adjustScore(V.scoreCoin(y), y, {}).checks.find(k => k.key === 'volmc').pts; };
+  assert.deepEqual([vm(10), vm(40), vm(null)], [0, -1, -1], 'forgiven only when the bot share is known and low');
+});
+test('verdict: dump, avoid, wait and buy in that order', () => {
+  const base = {grade: 'CLEAN', share: 64, move: 10, coordinated: false, smart: {holding: 1, dumping: 0}, top1: null, clone: null, zeroSell: false, rugRatio: 0.1, curvePct: 40, migrated: false, floor: {mult: 1.4, mc: 20000, basis: 'top holders avg'}, holding: false, total: 12};
+  assert.equal(V.verdict(base).mode, 'buy');
+  assert.equal(V.verdict({...base, grade: 'RISKY'}).mode, 'wait');
+  assert.equal(V.verdict({...base, grade: 'RISKY', holding: true, total: 33}).mode, 'buy');
+  assert.equal(V.verdict({...base, share: 57}).mode, 'wait');
+  assert.equal(V.verdict({...base, share: 52}).title, 'WAIT — do not chase');
+  assert.equal(V.verdict({...base, move: 45}).mode, 'wait');
+  assert.equal(V.verdict({...base, curvePct: 90}).mode, 'wait');
+  assert.equal(V.verdict({...base, zeroSell: true, buys: 30, sells: 1}).mode, 'wait');
+  assert.equal(V.verdict({...base, grade: 'AVOID'}).mode, 'avoid');
+  assert.equal(V.verdict({...base, top1: {share: 70, usd: 900, total: 1280}}).mode, 'wait', 'one big buyer is a reason to wait, not an alarm');
+  assert.equal(V.verdict({...base, caution: 'No positive indexed liquidity'}).mode, 'wait');
+  assert.equal(V.verdict({...base, weakShare: true}).mode, 'wait');
+  assert.equal(V.verdict({...base, rugRatio: 0.6}).mode, 'avoid');
+  assert.equal(V.verdict({...base, clone: {count: 6, wallets: 6}}).mode, 'avoid');
+  assert.equal(V.verdict({...base, move: 120}).mode, 'avoid');
+  assert.equal(V.verdict({...base, coordinated: true}).mode, 'dump');
+  assert.equal(V.verdict({...base, grade: 'AVOID', smart: {holding: 1, dumping: 3}}).mode, 'dump');
+  assert.equal(V.verdict({...base, smart: {holding: 1, dumping: 2}}).mode, 'buy', 'two wallets taking profit is not a dump');
+  assert.equal(V.verdict({grade: null, share: null}).mode, 'scan');
+  assert.equal(V.verdict({...base, share: null}).mode, 'wait');
+});
+test('monNorm: "address" is the token on GMGN and the pool on Photon; GMGN shares are fractions', () => {
+  const M1 = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', P1 = '9wFFyRfZBsuAha4YcuxcXLKwMxJR43S7fPfQLusDBzvT';
+  const g = V.monNorm({address: M1, symbol: 'DOG', market_cap: '26000', top_10_holder_rate: 0.21, bundler_rate: 0.008, creator_hold_rate: 0, holder_count: 412, smart_degen_count: 2, dev: {rug_ratio: 0.1, cto_flag: 1}}, 'gmgn-http');
+  assert.ok(g.mint === M1 && g.pool === null && g.mc === 26000 && Math.abs(g.top10 - 21) < 1e-9 && Math.abs(g.bundler - 0.8) < 1e-9 && g.dev === 0 && g.cto === true && g.rug === 0.1);
+  const p = V.monNorm({address: P1, tokenAddress: M1, symbol: 'DOG', mc: 26000, top10: 21, bundler: 12}, 'photon-ws');
+  assert.ok(p.mint === M1 && p.pool === P1 && p.top10 === 21 && p.bundler === 12);
+  const poolOnly = V.monNorm({address: P1, liquidity: 9000}, 'photon-ws');
+  assert.ok(poolOnly.pool === P1 && poolOnly.mint === null);
+  assert.equal(V.monNorm({address: M1, amount_percentage: 0.02}, 'gmgn-ws'), null, 'a holder row is not a coin');
+  assert.equal(V.monNorm({address: 'So11111111111111111111111111111111111111112', market_cap: 1}, 'gmgn-ws'), null);
+  assert.equal(V.monNorm([1, 2], 'gmgn-ws'), null);
+});
+test('monEval: waking needs a fresh rise; an unknown market cap is never a starting point', () => {
+  const now = T0, snaps = pts => pts.map(([ago, mc]) => ({t: now - ago * 1000, mc}));
+  const flat = V.monEval({snaps: snaps([[120, 20000], [60, 20100], [5, 20050]])}, now);
+  assert.equal(flat.wake, false);
+  const up = V.monEval({snaps: snaps([[90, 20000], [45, 22000], [5, 26000]])}, now);
+  assert.ok(up.wake && up.velPct > 15 && Math.round(up.gain) === 30, JSON.stringify(up));
+  // the same rise seen 5 minutes ago and nothing since: stale, not waking
+  assert.equal(V.monEval({snaps: snaps([[390, 20000], [345, 22000], [305, 26000]])}, now).wake, false);
+  // pumped earlier, sliding now: +30% off the low but falling 12%/min
+  assert.equal(V.monEval({snaps: snaps([[300, 20000], [200, 34000], [50, 29000], [5, 26000]])}, now).wake, false);
+  // one snapshot, or none with a market cap: no velocity, no gain, not waking
+  const one = V.monEval({snaps: snaps([[3, 50000]])}, now); assert.ok(!one.wake && one.velPct === null && one.gain === null);
+  assert.equal(V.monEval({snaps: []}, now).wake, false);
+  // DEX Screener 5m flow: 50 trades, 70% buys, volume 18% of market cap; half of that is ordinary activity
+  assert.equal(V.monEval({snaps: snaps([[3, 50000]]), buys5m: 35, sells5m: 15, vol5m: 9000}, now).wake, true);
+  assert.equal(V.monEval({snaps: snaps([[3, 50000]]), buys5m: 21, sells5m: 9, vol5m: 5000}, now).wake, false);
+  assert.equal(V.monPass({mc: 26000, top10: 60}), false);
+  assert.equal(V.monPass({mc: 26000}), true, 'figures that are not known do not fail the filter');
+  assert.equal(V.monPass({mc: 0}), false);
+});
+test('monStats: flagged coins against the control sample', () => {
+  const log = [{kind: 'wake', r10: 20, r30: -10}, {kind: 'wake', r10: -30, r30: null}, {kind: 'wake', r10: 60}, {kind: 'ctl', r10: -5, r30: -20}, {kind: 'ctl', r10: null}];
+  const s = V.monStats(log);
+  assert.deepEqual([s.wake.seen, s.wake[10].n, s.wake[10].median, Math.round(s.wake[10].up), Math.round(s.wake[10].big), s.wake[30].n], [3, 3, 20, 67, 33, 1]);
+  assert.deepEqual([s.ctl.seen, s.ctl[10].n, s.ctl[10].median, s.ctl[30].median], [2, 1, -5, -20]);
+  assert.equal(V.monStats([]).wake[10].median, null);
+});
+test('backtestReport: the 4.9 tables read what was saved with the call', () => {
+  const r = rng(4), items = fakeItems(r, 120, false);
+  items.forEach((it, i) => { it.call.gm = {v: 2, code: 0, x49: {verdict: ['buy', 'wait', 'avoid', 'dump'][i % 4], code: i % 3, holding: i % 2 === 0, stealth: i % 20, smartNet: (i % 3) - 1, clone: i % 5 === 0, top1: 30 + i % 50}}; });
+  const rep = V.backtestReport(items, 5), f = n => rep.features.find(x => x.name === n);
+  assert.deepEqual(f('Verdict at the call (4.9 rules)').rows.map(x => [x.label, x.n]), [['buy', 30], ['wait', 30], ['avoid', 30], ['dump', 30]]);
+  assert.equal(f('Verdict at the call (4.9 rules)').primary, true);
+  assert.deepEqual(f('Adjusted grade at the call (4.9 rules)').rows.map(x => x.label), ['clean', 'risky', 'avoid']);
+  assert.deepEqual(f('Smart money holding minus dumping').rows.map(x => x.label), ['<0', '0–1', '≥1']);
+  assert.deepEqual(f('Same-size buys at the call').rows.map(x => [x.label, x.n]), [['no', 96], ['yes', 24]]);
+});

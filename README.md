@@ -44,6 +44,17 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.test.mjs`
 
+### 4.9.0
+
+The 4.5–4.8 add-ons (wake-up monitor, Scanner tab, Photon dock, verdict bar, tape and bundle rules) rebuilt on top of the verified 4.4.2. The 4.8.3 file was a fork of 4.4.0: it had none of the 4.4.1/4.4.2 fixes and most of the backtest report had been cut out of it.
+
+- **Back from 4.4.2.** The position-card, speed-table, bucket-test, bot-pairing and Discord fixes, and the full report: speed table, your real trades, measured cost, forward test, late checks, bots on past calls, CSV export.
+- **Faster.** On a busy coin page the panel now costs about a third of the main-thread time (87 ms per second against 268, measured in Chromium on a simulated page). The causes were two endless CSS animations, four full rebuilds of the panel per second, and three add-ons that each parsed every websocket frame and every fetch response.
+- **Monitor.** One module for GMGN (Scan tab) and Photon (dock). Photon cards open the coin: they use the row's own link, and DEX Screener resolves the pool to the mint for the GMGN link. Refresh button. Token names are written as text, never as HTML. A scoreboard records what flagged coins did 10 and 30 minutes later, next to a sample of coins that were seen and not flagged.
+- **Rules.** The add-on rules are now pure functions with tests. Same-size buys ignore round button sizes (the old rule marked about 100% of ordinary tapes as a trap). A holding bundle is capped at RISKY and needs a known organic buy share from 20+ trades (the old one turned AVOID into CLEAN when the share was unknown). Stealth bundles need two signatures (the old equal-bag test fired on about 98% of ordinary holder lists). DS needs a sale that is 30+ minutes old. Chasing is monotonic.
+- **Verdict bar.** Works from the panel's real values, not from its own text. The verdict is saved with each call and the backtest report has a table for it; the bar shows your own record for the verdict on screen. The base "4.3 rules" grade is saved unchanged, so its forward test stays clean.
+- **Safety.** Quick-trade hotkeys are off by default (they press GMGN's own buttons, found by their text). The size tag copies the amount instead of typing into a GMGN field. The second PumpPortal socket per tab is gone. The link guard's OK and Cancel now do what the text says.
+
 ### 4.4.2
 
 Eight small edge cases found by a second review of 4.4.1, all rated low.
