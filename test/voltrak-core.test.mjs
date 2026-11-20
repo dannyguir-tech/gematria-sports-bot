@@ -460,9 +460,11 @@ test('monEval: waking needs a fresh rise; an unknown market cap is never a start
   // DEX Screener 5m flow: 50 trades, 70% buys, volume 18% of market cap; half of that is ordinary activity
   assert.equal(V.monEval({snaps: snaps([[3, 50000]]), buys5m: 35, sells5m: 15, vol5m: 9000}, now).wake, true);
   assert.equal(V.monEval({snaps: snaps([[3, 50000]]), buys5m: 21, sells5m: 9, vol5m: 5000}, now).wake, false);
-  assert.equal(V.monPass({mc: 26000, top10: 60}), false);
-  assert.equal(V.monPass({mc: 26000}), true, 'figures that are not known do not fail the filter');
-  assert.equal(V.monPass({mc: 0}), false);
+  assert.equal(V.monPass({mc: 26000, pad: 'pump', top10: 60}), false);
+  assert.equal(V.monPass({mc: 26000, pad: 'pump'}), true, 'figures that are not known do not fail the filter');
+  assert.equal(V.monPass({mc: 26000}), false, 'a coin whose launchpad is not known is not listed');
+  assert.equal(V.monPass({mc: 26000, pad: 'other'}), false);
+  assert.equal(V.monPass({mc: 0, pad: 'pump'}), false);
 });
 test('monStats: flagged coins against the control sample', () => {
   const log = [{kind: 'wake', r10: 20, r30: -10}, {kind: 'wake', r10: -30, r30: null}, {kind: 'wake', r10: 60}, {kind: 'ctl', r10: -5, r30: -20}, {kind: 'ctl', r10: null}];
@@ -496,4 +498,25 @@ test('gmBase: a saved score the 4.3 rules could not have produced is recognised'
   const items = fakeItems(rng(8), 40, false); items.forEach((it, i) => { it.call.gm = i < 10 ? rec({code: 0, checks: {...rec({}).checks, insiders: 0}}) : rec({code: 2}); });
   const row = V.backtestReport(items, 5).features.find(f => f.name === 'Live grade at the call (4.3 rules)').rows;
   assert.deepEqual(row.map(r => [r.label, r.n]), [['avoid', 30], ['unknown', 10]]);
+});
+
+// ---- 4.9.3: only Pumpfun, Bonk and Stonk.fun ----
+test('detectPad: Pumpfun, Bonk and Stonk.fun pass; everything else is other or unknown', () => {
+  const M = s => '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZR' + s;
+  assert.equal(V.detectPad({}, M('pump'), ''), 'pump');
+  assert.equal(V.detectPad({dexId: 'pumpswap'}, M('pump'), ''), 'pump', 'a migrated pump.fun coin is still pump');
+  assert.equal(V.detectPad({dexId: 'raydium-launchlab'}, M('bonk'), ''), 'bonk', 'letsbonk vanity mint');
+  assert.equal(V.detectPad({dexId: 'raydium'}, M('bonk'), ''), 'bonk', 'a migrated bonk coin is still bonk');
+  for (const lp of ['bonkers', 'letsbonk', 'bonk.fun']) assert.equal(V.detectPad({launchpad: lp}, M('uJos'), ''), 'bonk', lp);
+  assert.equal(V.detectPad({launchpad: 'BONK'}, M('uJos'), ''), null, 'a coin named BONK is not the launchpad');
+  assert.equal(V.detectPad({launchpad: 'stonk.fun'}, M('uJos'), ''), 'stonk');
+  assert.equal(V.detectPad({launchpad: 'bags'}, M('bonk'), ''), 'other');
+  assert.equal(V.detectPad({dexId: 'raydium'}, M('uJos'), ''), null);
+  assert.deepEqual([...V.ALLOWED_PADS].sort(), ['bonk', 'pump', 'stonk']);
+});
+test('verdict: a dump warning comes before the launchpad skip; the skip is its own mode', () => {
+  const v = {grade: 'CLEAN', share: 64, move: 10, smart: {holding: 0, dumping: 0}, badPad: 'raydium'};
+  assert.equal(V.verdict(v).mode, 'skip');
+  assert.equal(V.verdict({...v, coordinated: true}).mode, 'dump');
+  assert.equal(V.verdict({...v, badPad: null}).mode, 'buy', 'without the skip the trading rules decide');
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         VolTrak Steroids 4.8.3
+// @name         VolTrak Steroids 4.9.3
 // @namespace    voltrak-alert
-// @version      4.9.0
+// @version      4.9.3
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), live rug checks (dev, top 10, launch block, funder), GMGN holder data, insider-exit alerts, a live coin score, Telegram pings, market-wide pump.fun activity, a call backtest, a coin monitor for GMGN and Photon lists, and a verdict bar. Analysis only: it submits no trades (the quick-trade hotkeys press GMGN's own buttons and are off unless you turn them on).
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -27,7 +27,6 @@
 // @noframes
 // @run-at       document-start
 // ==/UserScript==
-
 /* CORE START — pure functions, also used by offline regression tests. */
 const VTCore = (() => {
   'use strict';
@@ -160,7 +159,7 @@ const VTCore = (() => {
     const last = trades.reduce((a, b) => !a || b.at >= a.at ? b : a, null);
     const price = last?.price > 0 && (!(stat?.price > 0) || last.at >= (stat.at ?? 0) - 2000) ? last.price : stat?.price ?? last?.price ?? null;
     // pump.fun tokens have a fixed 1B supply, so market cap = price × 1e9.
-    const marketCap = price > 0 && /pump/i.test(last?.ex || '') ? price * 1e9 : null;
+    const marketCap = price > 0 && /pump|bonk|stonk/i.test(last?.ex || '') ? price * 1e9 : null;
     return {at, stat, flow: trades.length ? windows(trades, now, ms => since <= now - ms) : null, price, marketCap, last,
       organic: bots?.organic?.length ? windows(bots.organic, now, ms => since <= now - ms) : null, botShare: bots?.botShare ?? null};
   }
@@ -442,12 +441,14 @@ const VTCore = (() => {
     ['Smart money holding minus dumping', c => c.gm?.x49?.smartNet ?? null, [0, 1], ''],
     ['Same-size buys at the call', c => c.gm?.x49 ? +!!c.gm.x49.clone : null, [1], 'bool'],
     ['Top buyer share of the last minute', c => c.gm?.x49?.top1 ?? null, [40, 65], '%'],
+    ['Launchpad at the call', c => ({pump: 0, bonk: 1, stonk: 2, other: 3})[c.gm?.x49?.pad] ?? null, [1, 2, 3], 'pad'],
   ];
   const edgeLabel = (v, unit) => unit === '$' ? '$' + (v >= 1000 ? v / 1000 + 'K' : v) : v + unit;
   function bucketOf(v, cuts, unit) {
     if (unit === 'bool') return v >= cuts[0] ? 'yes' : 'no';
     if (unit === 'grade') return v < 1 ? 'clean' : v < 2 ? 'risky' : 'avoid';
     if (unit === 'conf') return v < 1 ? 'high' : v < 2 ? 'medium' : 'low';
+    if (unit === 'pad') return ['pump', 'bonk', 'stonk', 'other'][Math.min(3, Math.max(0, Math.round(v)))];
     if (unit === 'verdict') return v < 1 ? 'buy' : v < 2 ? 'wait' : v < 3 ? 'avoid' : 'dump';
     const i = cuts.findIndex(x => v < x);
     if (i === 0) return unit === '' && cuts[0] === 1 ? '0' : '<' + edgeLabel(cuts[0], unit);
@@ -650,13 +651,14 @@ const VTCore = (() => {
   // ---- Solana transactions (getTransactionsForAddress, jsonParsed) → per-trade rows for one mint ----
   // One row per signer whose balance of the mint changed in a pump.fun or PumpSwap transaction. SOL size includes fees
   // and tips, which is fine for wash-pattern detection. Transfers and other programs are skipped.
-  const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', PUMPSWAP_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', WSOL = 'So11111111111111111111111111111111111111112';
+  const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', PUMPSWAP_PROGRAM = 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', LAUNCHLAB_PROGRAM = 'LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj', WSOL = 'So11111111111111111111111111111111111111112';
   function txTrades(tx, mint, solUsd) {
     const meta = tx?.meta, msg = tx?.transaction?.message;
     if (!meta || !msg || meta.err) return [];
     const keys = (msg.accountKeys || []).map(k => typeof k === 'string' ? {pubkey: k} : k || {}), nSig = msg.header?.numRequiredSignatures;
     const every = keys.map(k => k.pubkey).concat(meta.loadedAddresses?.writable || [], meta.loadedAddresses?.readonly || []);
-    const ex = every.includes(PUMP_PROGRAM) ? 'pump' : every.includes(PUMPSWAP_PROGRAM) ? 'pump_amm' : null;
+    const isStonk = every.includes('6BwHHDg3u1854jC8PDLXvR4spTcLNaoBxLJNGC4nTESt') || every.includes('4E876qZTE9FJMrBzgVtBrSrzz2TLivB5Y5QXPjB4gZL7') || every.includes('5CEbueQnq1Ym2uSSx2xXds3jQAqT1BDnkA59RZobSPAG');
+    const ex = every.includes(PUMP_PROGRAM) ? 'pump' : isStonk ? 'stonk' : every.includes(LAUNCHLAB_PROGRAM) ? 'bonk' : every.includes(PUMPSWAP_PROGRAM) ? 'pump_amm' : null;
     if (!ex) return [];
     const signers = new Set(keys.filter((k, i) => k.signer ?? (nSig != null ? i < nSig : i === 0)).map(k => k.pubkey));
     const bal = (list, m) => { const o = new Map(); for (const b of list || []) if (b?.mint === m && b.owner) o.set(b.owner, (o.get(b.owner) || 0) + Number(b.uiTokenAmount?.amount || 0) / 10 ** (b.uiTokenAmount?.decimals ?? 6)); return o; };
@@ -1187,7 +1189,6 @@ const VTCore = (() => {
   // and none has been tested against outcomes. They are kept, with their measurable faults fixed, and their result
   // is saved with each call ('gm.<id>'.x49) so the backtest report can show whether they separate winners from losers.
   // The base grade ("4.3 rules") is still computed and saved unchanged, so its own forward test stays clean.
-
   // ---- Saved live scores written while the 4.5-4.8 add-ons were installed ----
   // Those add-ons changed the points of a score but saved the raw numbers next to them, under the same "4.3 rules"
   // label. A record whose points the 4.3 rules cannot give for its own numbers is such a record: it is left out of the
@@ -1206,7 +1207,6 @@ const VTCore = (() => {
       || bad('move', g.move, [100], g.move >= 100 ? -1 : 0)
       || c.organic < 0);
   }
-
   // ---- Trade tape: same-size buys, a tape with almost no sells, one wallet behind the last minute's buying ----
   // A size a person gets from an app's buy buttons: a round SOL amount, or one with an app fee of up to 1.5% taken off.
   // Five people pressing "0.1 SOL" are not a bot, so round sizes never count as same-size buys.
@@ -1235,7 +1235,6 @@ const VTCore = (() => {
     return {n: rows.length, buys: buys.length, sells, zeroSell: rows.length >= 40 && (sells <= 2 || buys.length / rows.length >= 0.94),
       clone, top1: total >= 400 && by.size ? {share: 100 * top / total, usd: top, total} : null};
   }
-
   // ---- Holder list: bundles GMGN has not tagged, smart-money flow, the holders' cost floor ----
   // list = GMGN's token_holders rows. A wallet counts as "stealth" when it was first funded within 10 minutes of 3+
   // other untagged top holders (alone enough), or when it shows two of: an equal bag (5+ wallets within 3%), an entry
@@ -1279,7 +1278,6 @@ const VTCore = (() => {
       floor: floorPrice > 0 ? {price: floorPrice, basis: smW > 0 ? 'smart-money average cost' : 'top-12 holders’ average cost', mc: supply > 0 ? floorPrice * supply : null, mult: price > 0 ? price / floorPrice : null} : null,
       det: {fund: {...strip(fund), src: fund.src || null}, equal: strip(equal), entry: strip(entry), ghost: strip(ghost)}};
   }
-
   // ---- The 4.9 rule set on top of a base score ----
   // base = scoreCoin(x); x = the inputs it was given; ctx = {stealth, traps, rugRatio}. Returns a new score: the base
   // is not changed. What it does, in order:
@@ -1329,7 +1327,6 @@ const VTCore = (() => {
     return {...base, checks, grade, score: risk + demand + entry, risk, demand, entry, known, because: because?.key ?? null, code: {CLEAN: 0, RISKY: 1, AVOID: 2}[grade] ?? null,
       rules: '4.9', baseGrade: base.grade, holding, dumping, total, stealthPct: stPct};
   }
-
   // ---- The verdict bar ----
   // v: {grade, share, weakShare, caution, move, coordinated, smart:{holding,dumping}, top1, clone, zeroSell, rugRatio,
   // curvePct, migrated, floor:{mult,mc,basis}, holding, total, buys, sells}. Order: dump, avoid, wait, buy; anything
@@ -1338,8 +1335,10 @@ const VTCore = (() => {
     const f = n => !(n > 0) ? '?' : n >= 1e6 ? '$' + (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? '$' + Math.round(n / 1e3) + 'K' : '$' + Math.round(n), why = [];
     const sm = v.smart || {holding: 0, dumping: 0}, smDump = sm.dumping >= 3 && sm.dumping > sm.holding, cliff = !v.migrated && v.curvePct != null && v.curvePct >= 85;
     if (v.grade == null && v.share == null) return {mode: 'scan', title: 'Scanning…', why: ['Waiting for live trades and holder checks.']};
-    if (v.coordinated) return {mode: 'dump', title: 'DUMP WARNING — insiders exiting', why: ['Insider or bundler wallets are selling together.']};
+    if (v.coordinated) return {mode: 'dump', title: 'DUMP NOW — insiders leaving together', why: ['Insiders are selling together right now.']};
     if (smDump) return {mode: 'dump', title: 'DUMP WARNING — smart money exiting', why: [sm.dumping + ' smart-money wallets have sold 80%+ of their bags; ' + sm.holding + ' still hold.']};
+    // Launchpad filter: after the dump warnings (a coin you already hold still warns you), before every other rule.
+    if (v.badPad) return {mode: 'skip', title: 'SKIP — not Pumpfun, Bonk or Stonk.fun', why: ['Launchpad is ' + v.badPad + ' (only Pumpfun, Bonk and Stonk.fun are allowed).']};
     if (v.grade === 'AVOID') why.push('Coin grade is AVOID');
     if (v.clone) why.push(v.clone.count + ' same-size buys from ' + v.clone.wallets + ' wallets');
     if (v.rugRatio >= 0.45) why.push('Dev rug history ' + Math.round(v.rugRatio * 100) + '%');
@@ -1357,7 +1356,6 @@ const VTCore = (() => {
       return {mode: 'buy', title: 'GREEN LIGHT — passes your rules', why: [(v.holding ? 'Holding bundle (' + Math.round(v.total) + '% held, none selling)' : 'Clean holder structure'), Math.round(v.share) + '% buy share']};
     return {mode: 'wait', title: 'WAIT — observe', why: [v.grade === 'RISKY' ? 'Coin grade is RISKY' : v.grade === 'PARTIAL' || v.grade == null ? 'Checks still incomplete' : 'Buy share ' + Math.round(v.share) + '% is between 56% and 58%']};
   }
-
   // ---- Monitor: coins seen on GMGN and Photon list pages ----
   const B58_ADDR = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, pick = (o, keys) => { for (const k of keys) { const v = o?.[k]; if (v != null && v !== '') return v; } return null; };
   // One list row or stream object → a tick, or null when it is not a coin. src starts with "gmgn" or "photon".
@@ -1381,12 +1379,29 @@ const VTCore = (() => {
       buys: n(['buys', 'swaps_5m_buys', 'buys_5m', 'txns_buys']), sells: n(['sells', 'swaps_5m_sells', 'sells_5m', 'txns_sells']), smart: n(['smart_degen_count', 'renowned_count', 'smart_buys']),
       cto: number(a.cto_flag ?? a.dev?.cto_flag) === 1 || a.cto === true, migrated: a.complete === true || number(a.migrated_timestamp) > 0 || null, href: typeof a.href === 'string' ? a.href : null};
     for (const k of ['symbol', 'name']) t[k] = typeof t[k] === 'string' && t[k].trim() ? t[k].trim().slice(0, 40) : null;
-    // A coin row carries at least a market cap, a liquidity figure or a ticker; anything else with an address is not one.
+    t.pad = detectPad(a, mint, t.href);
     return t.mc > 0 || t.liq > 0 || t.symbol ? t : null;
   }
+  const STONK_MINT = '6GmAFSYs4gk3FDao5FzzySQpPZaWsa4rUJHacpMpUNgx', SPYX_MINT = 'XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W';
+  const ALLOWED_PADS = new Set(['pump', 'bonk', 'stonk']);
+  const OTHER_PAD_RE = /\b(bags|memoo|liquid|bankr|zora|surge|anoncoin|moonshot(?:_app)?|boop|believe|fourmeme|flap|clanker|heaven|moonit|wavebreak|sugar|virtuals|daos\.?fun|time\.?fun)\b/i;
+  function detectPad(a, mint, href) {
+    const rawMeta = [a?.launchpad, a?.launchpad_platform, a?.launchpad_name, a?.platform, a?.creation_platform, a?.source_platform, a?.pool_type_str, a?.factory, a?.ex, a?.exchange, a?.dexId, a?.pool?.launchpad, a?.pool?.launchpad_platform, a?.pool?.exchange, a?.pool?.pool_type_str, href].filter(Boolean).join(' ');
+    const cleanMeta = rawMeta.replace(/pumpswap|pump_amm/gi, ' ');
+    const qMint = a?.quote_address || a?.quoteToken?.address || a?.pool?.quote_address || '';
+    if (/\b(stonk\.?fun|stonkfun|stonk(?:_[a-z0-9]+)?)\b/i.test(cleanMeta) || /\/stonk_/i.test(href || '') || qMint === STONK_MINT || qMint === SPYX_MINT) return 'stonk';
+    // Bonk: GMGN's "bonkers" label, letsbonk / bonk.fun, or a mint ending in "bonk" (the letsbonk vanity suffix).
+    // A bare "bonk" word is not enough: it can be a coin's own name.
+    if (/\b(bonkers|letsbonk|bonk\.fun|bonkfun|bonk_fun)(?:_[a-z0-9]+)?\b/i.test(cleanMeta) || /\/(bonkers|letsbonk|bonk)_/i.test(href || '')) return 'bonk';
+    if (OTHER_PAD_RE.test(cleanMeta) || /\/(bags|moonshot|boop|believe)_/i.test(href || '')) return 'other';
+    if (typeof mint === 'string' && /^[1-9A-HJ-NP-Za-km-z]{28,40}bonk$/.test(mint)) return 'bonk';
+    if (/\b(pump\.?fun|pumpfun|pump_fun|pump_mayhem(?:_agent)?|pump_agent)\b/i.test(cleanMeta) || /\/pump_/i.test(href || '') || (typeof mint === 'string' && /^[1-9A-HJ-NP-Za-km-z]{28,40}pump$/.test(mint))) return 'pump';
+    return null;
+  }
   const MON = Object.freeze({mcMin: 5500, mcMax: 3500000, top10: 52, bundler: 48, dev: 15, rug: 0.5, fresh: 90000, velPct: 8, gain: 20});
-  // Whether a watched coin passes the list's filter; a figure that is not known never fails it.
-  const monPass = w => w.mc > 0 && w.mc >= MON.mcMin && w.mc <= MON.mcMax && !(w.top10 > MON.top10) && !(w.bundler > MON.bundler) && !(w.dev > MON.dev) && !(w.rug >= MON.rug);
+  // Strict launchpad filter: ONLY Pumpfun ('pump'), Bonk ('bonk') and Stonk.fun ('stonk') pass; a coin whose launchpad
+  // is not known is not listed.
+  const monPass = w => ALLOWED_PADS.has(w.pad) && w.mc > 0 && w.mc >= MON.mcMin && w.mc <= MON.mcMax && !(w.top10 > MON.top10) && !(w.bundler > MON.bundler) && !(w.dev > MON.dev) && !(w.rug >= MON.rug);
   // Where a watched coin stands now. w.snaps = [{t, mc}] oldest first (only real market caps). velPct = % per minute
   // against a snapshot 20-120s old; gain = % above the lowest market cap of the last 10 min. Waking = seen in the last
   // 90s, not falling 5%/min or faster, and velocity 8%/min+ or gain 20%+, or (DEX Screener 5m) 40+ trades, 62%+ buys
@@ -1422,17 +1437,15 @@ const VTCore = (() => {
       out[kind].seen = rows.length; }
     return out;
   }
-  return {gmBase,roundSol,tapeTraps,stealthScan,adjustScore,verdict,monNorm,MON,monPass,monEval,monStats,MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
+  return {detectPad,ALLOWED_PADS,gmBase,roundSol,tapeTraps,stealthScan,adjustScore,verdict,monNorm,MON,monPass,monEval,monStats,MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
     candles,mergeCandles,scoreCall,preAlert,SPEED_AT,pricePath,position,breakeven,wilson,summarize,zFor,tFor,backtestReport,VB,botFlow,gmgnMaker,gmgnApiTrade,APP_TAG,BOT_RULES,BOT_SURE,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff,
     RUG,SYSTEM_PROGRAM,txMint,rugState,rugHolding,rugTx,tradeTokens,rugTrade,rugPrune,rugCatch,rugVerify,HOLDER_GAP_MAX,holderTrust,devNowVerified,creatorCheck,creatorUsable,senderTrust,rugRanked,rugTop,rugLaunch,rugSnap,rugScan,funderOf,rugGrade,rugGradeAt,rugLine,FEATURES,gmgnParse,roleOfTags,insiderGroup,EXIT,exitStats,scoreCoin,b58decode,b58encode,pumpCreator,devFlow,WSOL_MINT};
 })();
 /* CORE END */
-
 // GMGN live feed: a read-only listener on the websocket GMGN's page opens itself (ws.gmgn.ai). It never sends on
 // that socket and never changes a message; it only reads token_activity and token_stat frames.
 // The monitor (VTMon, below) sets VTTap.mon; the GMGN and Photon listeners pass it frames they do not use themselves.
 const VTTap = {mon: null};
-
 const VTLive = (() => {
   const listeners = new Set(), pending = [], seen = new WeakSet();
   let attachedAt = 0, lastFrame = 0;
@@ -1472,7 +1485,6 @@ const VTLive = (() => {
   }
   return {on(fn) { listeners.add(fn); pending.splice(0).forEach(emit); }, attachedAt: () => attachedAt, lastFrame: () => lastFrame, census: () => census};
 })();
-
 // Photon probe (Photon tab only, read-only): Photon has no public API, so this records the shape of the data Photon's
 // own page receives (websocket messages and API responses) to find where its volume-bot info lives. Nothing is sent
 // anywhere; "Copy Photon report" puts a trimmed, redacted summary on the clipboard for the user to share.
@@ -1548,7 +1560,6 @@ const PhotonProbe = (() => {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ui, {once: true}); else ui();
   return {report};
 })();
-
 // Panel CSS and markup (scoped under #vts-root; no external fonts or images, so page CSP cannot block them).
 // ============ Monitor (4.9): coins seen on GMGN and Photon list pages ============
 // Replaces the 4.8 "wake-up monitor", "Scanner tab" and "Photon dock" (three overlapping modules that each parsed
@@ -1566,7 +1577,7 @@ const VTMon = (() => {
   if ((!GMGN && !PHOTON) || window.top !== window.self) return null;
   const P = 'vts3.mon.', get = (k, d) => GM_getValue(P + k, d), set = (k, v) => GM_setValue(P + k, v);
   const CAP = 1500, SHOW = 40, map = new Map(), byPool = new Map(), subs = new Set(), stats = {frames: 0, parsed: 0, skipped: 0, rows: 0, dex: 0, dexErr: 0, since: Date.now()};
-  const FIELDS = ['symbol', 'name', 'href', 'vol', 'liq', 'holders', 'top10', 'bundler', 'dev', 'rug', 'buys', 'sells', 'smart', 'migrated', 'vol5m', 'vol1h', 'buys5m', 'sells5m', 'dexPair', 'dexId'];
+  const FIELDS = ['symbol', 'name', 'href', 'vol', 'liq', 'holders', 'top10', 'bundler', 'dev', 'rug', 'buys', 'sells', 'smart', 'migrated', 'vol5m', 'vol1h', 'buys5m', 'sells5m', 'dexPair', 'dexId', 'pad'];
   let dirty = false, parseSec = 0, parseMs = 0, shown = [], lastRefresh = 0, busy = false;
   const isList = () => PHOTON ? !/\/lp\//.test(location.pathname) : !/\/sol\/token\//.test(location.pathname);
   // Full: drop the coin seen longest ago that is not on the list.
@@ -1584,7 +1595,7 @@ const VTMon = (() => {
     if (t.pool && !w.pool) w.pool = t.pool;
     if (t.pool) byPool.set(t.pool, key);
     // Names and liquidity read off the page never replace DEX Screener's once it has answered.
-    for (const k of FIELDS) { if (t[k] == null || t[k] === '' || (dom && w.dexAt && (k === 'symbol' || k === 'name' || k === 'liq'))) continue; w[k] = t[k]; }
+    for (const k of FIELDS) { if (t[k] == null || t[k] === '' || (k === 'pad' && w.pad && (dex || dom)) || (dom && w.dexAt && (k === 'symbol' || k === 'name' || k === 'liq'))) continue; w[k] = t[k]; }
     if (t.cto) w.cto = true;
     if (!dex) { w.src = t.src; w.seen = now; w.ticks++; } else w.dexAt = now;
     if (t.mc > 0) {
@@ -1643,6 +1654,7 @@ const VTMon = (() => {
       if (!m || seen.has(m[1]) || a.closest('#vts-root,#vts-dock')) continue;
       seen.add(m[1]);
       const row = a.closest('tr,li,[class*="row"],[class*="card"],[class*="item"]') || a, txt = (row.textContent || '').replace(/\s+/g, ' ').slice(0, 500);
+      const badgeStr = [href, ...[...row.querySelectorAll('img,[title],[alt],[class*="tag"],[class*="badge"],[class*="launch"]')].map(el => [el.getAttribute?.('src'), el.getAttribute?.('alt'), el.getAttribute?.('title'), el.textContent].filter(Boolean).join(' '))].join(' ');
       const t = {src: PHOTON ? 'photon-dom' : 'gmgn-dom', mc: money(txt, /(?:MC|Mkt\.?\s*Cap|Market\s*Cap)\s*:?\s*\$?\s*([\d.,]+)\s*([KMB])?/i), vol: money(txt, /(?:\bVol(?:ume)?|\bV)\s*:?\s*\$\s*([\d.,]+)\s*([KMB])?/i),
         liq: money(txt, /(?:Liq(?:uidity)?)\s*:?\s*\$?\s*([\d.,]+)\s*([KMB])?/i)};
       const bn = txt.match(/(?:Bnd|Bundl\w*)\s*:?\s*([\d.]+)\s*%/i); if (bn) t.bundler = parseFloat(bn[1]);
@@ -1651,7 +1663,9 @@ const VTMon = (() => {
         // The mint, when the row carries it (copy button or data attribute): any other base58 address in the row's attributes.
         for (const el of [row, ...row.querySelectorAll('[data-address],[data-mint],[data-token],[data-token-address],[data-clipboard-text],[data-copy]')]) { const v = [...el.attributes].map(x => x.value).find(x => VTCore.MINT.test(x) && x !== m[1]); if (v) { t.mint = v; break; } }
       } else t.mint = m[1];
-      ingest(t, now); n++;
+      t.pad = VTCore.detectPad({launchpad: badgeStr}, t.mint || m[1], href);
+      const w = ingest(t, now); n++;
+      if (w.pad === 'other') row.style.display = 'none'; else if (VTCore.ALLOWED_PADS.has(w.pad) && row.style.display === 'none') row.style.display = '';
     }
     return n;
   }
@@ -1676,11 +1690,29 @@ const VTMon = (() => {
   async function enrich(list) {
     const mints = list.filter(w => w.mint).map(w => w.mint), pools = list.filter(w => !w.mint && w.pool).map(w => w.pool);
     if (!mints.length && !pools.length) return 0;
+    if (GMGN) {
+      const needPad = list.filter(w => w.mint && !w.pad && !w.padTried).map(w => { w.padTried = 1; return w.mint; }).slice(0, 30);
+      if (needPad.length) {
+        try {
+          const r = await fetch('/api/v1/mutil_window_token_info', {method: 'POST', credentials: 'include', headers: {'content-type': 'application/json'}, body: JSON.stringify({chain: 'sol', addresses: needPad})}).then(x => x.json()).catch(() => null);
+          const rows = Array.isArray(r?.data) ? r.data : [];
+          for (const info of rows) {
+            const addr = info?.address;
+            if (!addr || !map.has(addr)) continue;
+            const det = VTCore.detectPad(info, addr, '');
+            const w = map.get(addr);
+            if (w) w.pad = det || 'other';
+          }
+        } catch (_) {}
+      }
+    }
     const pairs = await dexPairs(mints, pools), now = Date.now(), by = dexByMint(pairs);
     for (const p of pairs) if (byPool.has(p.pairAddress) || map.has('p:' + p.pairAddress)) ingest({src: 'dex', mint: p.baseToken.address, pool: p.pairAddress}, now); // a Photon pool learns its mint
     for (const o of by.values()) { const p = o.best, mc = VTCore.number(p.marketCap) ?? VTCore.number(p.fdv);
       if (!map.has(o.mint)) continue;
-      ingest({src: 'dex', mint: o.mint, symbol: p.baseToken.symbol, name: p.baseToken.name, mc, liq: o.liq, vol5m: o.vol5m, vol1h: o.vol1h, buys5m: o.buys5m, sells5m: o.sells5m, dexPair: p.pairAddress, dexId: p.dexId}, now); }
+      const qAddr = p.quoteToken?.address || '';
+      const dPad = VTCore.detectPad({dexId: p.dexId, quote_address: qAddr}, o.mint, p.url || '');
+      ingest({src: 'dex', mint: o.mint, symbol: p.baseToken.symbol, name: p.baseToken.name, mc, liq: o.liq, vol5m: o.vol5m, vol1h: o.vol1h, buys5m: o.buys5m, sells5m: o.sells5m, dexPair: p.pairAddress, dexId: p.dexId, pad: dPad}, now); }
     return by.size;
   }
   // ---- Scoreboard: flagged coins and a control sample, checked 10 and 30 minutes later ----
@@ -1734,7 +1766,7 @@ const VTMon = (() => {
     return shown;
   }
   const emit = force => { for (const fn of subs) try { fn(force); } catch (_) {} };
-  const pickForDex = () => { const now = Date.now(), need = [...map.values()].filter(w => (!w.mint || (!(w.mc > 0) && now - (w.dexAt || 0) > 60000) || (w.pass && now - (w.dexAt || 0) > 30000)) && now - (w.seen || 0) < 300000);
+  const pickForDex = () => { const now = Date.now(), need = [...map.values()].filter(w => (!w.mint || (!w.pad && !w.padTried) || (!(w.mc > 0) && now - (w.dexAt || 0) > 60000) || (w.pass && now - (w.dexAt || 0) > 30000)) && now - (w.seen || 0) < 300000);
     return [...need.filter(w => !w.mint).slice(0, 30), ...need.filter(w => w.mint).sort((a, b) => (b.ev?.score || 0) - (a.ev?.score || 0)).slice(0, 30)]; };
   async function refresh() {
     const now = Date.now();
@@ -1756,7 +1788,6 @@ const VTMon = (() => {
   return {list: () => shown, size: () => map.size, stats: () => { let priced = 0; for (const w of map.values()) if (w.mc > 0) priced++; return {...stats, coins: map.size, priced, lastRefresh}; }, refresh, on(fn) { subs.add(fn); return () => subs.delete(fn); },
     board: () => VTCore.monStats(get('log', [])), log: () => get('log', []), feed, ingest: (t, now = Date.now()) => ingest(t, now), evaluate: () => evaluate(Date.now()), isList, site: PHOTON ? 'photon' : 'gmgn'};
 })();
-
 // The monitor's list, used by the Scan tab on GMGN and by the dock on Photon. R = the CSS root ("#vts-root" / "#vts-dock").
 const MON_CSS = R => `
 ${R} .mon-head{display:flex;align-items:center;gap:6px;margin:0 0 8px}
@@ -1797,7 +1828,7 @@ function monUI(box, opts) {
   bRef.type = bCopy.type = 'button'; bRef.title = 'Read the page again, drop coins not seen for 5 min and pull fresh numbers from DEX Screener';
   head.append(title, bRef, bCopy); box.replaceChildren(head, chips, note, list, board);
   if (!M) { note.textContent = 'The monitor runs on GMGN and Photon pages.'; return {render() {}}; }
-  const FILTERS = [['all', 'All'], ['wake', 'Waking'], ['prime', 'Score 4+'], ['smart', 'Smart buys'], ['migrated', 'Migrated']];
+  const FILTERS = [['all', 'All (3 Pads)'], ['pump', 'Pumpfun'], ['bonk', 'Bonk'], ['stonk', 'Stonk.fun'], ['wake', 'Waking'], ['prime', 'Score 4+'], ['smart', 'Smart buys']];
   let filter = GM_getValue('vts3.mon.filter', 'all'), inside = false, said = '';
   for (const [k, label] of FILTERS) { const b = el('button', k === filter ? 'on' : '', label); b.type = 'button'; b.dataset.f = k;
     b.onclick = () => { filter = k; GM_setValue('vts3.mon.filter', k); for (const x of chips.children) x.classList.toggle('on', x === b); render(true); }; chips.append(b); }
@@ -1806,7 +1837,7 @@ function monUI(box, opts) {
   list.addEventListener('pointerleave', () => { inside = false; render(false); });
   bRef.onclick = async () => { bRef.disabled = true; bRef.textContent = 'Refreshing…'; try { const r = await M.refresh(); said = 'Refreshed ' + new Date().toLocaleTimeString() + ' · ' + r.shown + ' coins, ' + r.waking + ' waking'; } catch (_) { said = 'Refresh failed'; } bRef.disabled = false; bRef.textContent = '⟳ Refresh'; render(true); };
   bCopy.onclick = () => { opts.copy(JSON.stringify((typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).__MY_TRENCH_ALPHA__ || [], null, 2)); bCopy.textContent = 'Copied'; setTimeout(() => { bCopy.textContent = 'Copy JSON'; }, 1500); };
-  const cards = new Map(), keep = w => filter === 'wake' ? w.ev.wake : filter === 'prime' ? w.ev.score >= 4 : filter === 'smart' ? w.smart >= 1 : filter === 'migrated' ? w.migrated === true || w.dexId && !/pump\.?fun$/i.test(w.dexId) : true;
+  const cards = new Map(), keep = w => (filter === 'pump' || filter === 'bonk' || filter === 'stonk') ? w.pad === filter : filter === 'wake' ? w.ev.wake : filter === 'prime' ? w.ev.score >= 4 : filter === 'smart' ? w.smart >= 1 : true;
   // Where a card leads. Photon: the row's own link (always the coin), else the pool page. GMGN: the token page.
   const linkOf = w => opts.site === 'photon' ? (w.href || (w.pool || w.dexPair ? 'https://photon-sol.tinyastro.io/en/lp/' + (w.pool || w.dexPair) : w.mint ? 'https://gmgn.ai/sol/token/' + w.mint : '#')) : (w.mint ? 'https://gmgn.ai/sol/token/' + w.mint : '#');
   function card(w) {
@@ -1831,6 +1862,8 @@ function monUI(box, opts) {
     fill(0, 'MC', usd(w.mc)); fill(1, w.vol5m != null ? 'Vol 5m' : 'Vol', usd(w.vol5m != null ? w.vol5m : w.vol)); fill(2, 'Buys 5m', ev.buyShare == null ? '—' : Math.round(ev.buyShare) + '%', ev.buyShare >= 58 ? 'pos' : ev.buyShare < 45 ? 'neg' : '');
     fill(3, 'Liquidity', usd(w.liq));
     const tags = [], tag = (t, cls) => tags.push(el('span', cls || '', t));
+    const padLabel = {pump: 'PUMPFUN', bonk: 'BONK', stonk: 'STONK.FUN'}[w.pad];
+    if (padLabel) tag(padLabel, 'ok');
     if (w.smart >= 1) tag('Smart ×' + w.smart, 'ok');
     if (w.bundler > 0) tag('Bundles ' + (+w.bundler).toFixed(0) + '%' + (ev.absorbed === 'absorbed' ? ' absorbed' : ''), ev.absorbed === 'watch' ? 'warn' : 'ok');
     if (w.top10 > 0) tag('Top 10 ' + (+w.top10).toFixed(0) + '%', w.top10 < 25 ? 'ok' : '');
@@ -1909,7 +1942,6 @@ function startPhoton() {
   document.addEventListener('keydown', e => { if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyV') { dock.hidden = !dock.hidden; e.preventDefault(); } });
   linkGuard(() => GM_getValue('vts3.guardOn', true));
 }
-
 const PANEL_CSS = String.raw`/* =====================================================================
    VolTrak Steroids · panel CSS (production)
    - Paste inside the <style> at the top of root.innerHTML.
@@ -1954,7 +1986,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root[data-tone=sell]{--tone:var(--sell);--tone-ink:var(--sell-ink);--tone-bg:var(--sell-bg);--tone-line:var(--sell-line)}
 #vts-root[data-tone=caution]{--tone:var(--warn);--tone-ink:var(--warn-ink);--tone-bg:var(--warn-bg);--tone-line:var(--warn-line)}
 #vts-root[data-tone=wait]{--tone:var(--wait);--tone-ink:var(--wait-ink);--tone-bg:var(--wait-bg);--tone-line:var(--wait-line)}
-
 /* ---------- base + host-CSS resets (GMGN Tailwind preflight, Discord) ---------- */
 #vts-root *,#vts-root *::before,#vts-root *::after{box-sizing:border-box}
 #vts-root [hidden]{display:none!important}
@@ -1987,7 +2018,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root input[type=checkbox]{flex:none;display:inline-block;width:30px;height:18px;padding:0;border-radius:9px;border:1px solid var(--line3);cursor:pointer;
   background:radial-gradient(circle at 8px 50%,var(--muted) 0 5px,transparent 5.5px) no-repeat,var(--well)}
 #vts-root input[type=checkbox]:checked{border-color:var(--accent);background:radial-gradient(circle at calc(100% - 8px) 50%,var(--accent-ink) 0 5px,transparent 5.5px) no-repeat,var(--accent)}
-
 /* ---------- header: drag bar; collapsed it becomes the scoreboard ---------- */
 #vts-root header{position:relative;flex:none;display:flex;align-items:center;gap:8px;height:40px;margin:0;padding:0 6px 0 8px;background:var(--bg2);border-bottom:1px solid var(--line);cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
 #vts-root header::before{content:"";position:absolute;left:0;right:0;top:0;height:2px;background:var(--tone)}
@@ -2036,14 +2066,12 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root.vts-collapsed .m-bar{display:block;position:absolute;left:0;right:0;bottom:0;height:3px;background:linear-gradient(90deg,var(--buy) 0 var(--p,50%),var(--sell) var(--p,50%) 100%)}
 #vts-root.vts-collapsed .m-bar.empty{background:var(--line2)}
 #vts-root.vts-collapsed .vts-body,#vts-root.vts-collapsed .tabs,#vts-root.vts-collapsed .foot{display:none}
-
 /* ---------- tabs ---------- */
 #vts-root .tabs{flex:none;display:flex;margin:0;padding:0 4px;background:var(--bg2);border-bottom:1px solid var(--line)}
 #vts-root .tabs button{flex:1;position:relative;background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:var(--muted);font:750 11px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;padding:11px 4px 10px}
 #vts-root .tabs button:hover{background:none;color:var(--text)}
 #vts-root .tabs button.on{color:var(--text);border-bottom-color:var(--accent)}
 #vts-root .tabs .badge{display:inline-block;margin-left:5px;min-width:16px;padding:2px 4px;border-radius:8px;background:var(--buy-bg);color:var(--buy);box-shadow:inset 0 0 0 1px var(--buy-line);font:800 9.5px/1 var(--sans);letter-spacing:0}
-
 /* ---------- body (scrolls) + footer (fixed) ---------- */
 #vts-root .vts-body{flex:1 1 auto;min-height:0;padding:10px 12px 12px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
 #vts-root .foot{flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-height:36px;padding:6px 8px 6px 12px;background:var(--bg2);border-top:1px solid var(--line);font-size:11.5px;color:var(--muted)}
@@ -2055,7 +2083,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .sw input[type=checkbox]:checked{background:radial-gradient(circle at calc(100% - 7px) 50%,var(--accent-ink) 0 4px,transparent 4.5px) no-repeat,var(--accent)}
 #vts-root .dot{flex:none;display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dim)}
 #vts-root .dot.ok{background:var(--buy)}#vts-root .dot.warn{background:var(--warn)}#vts-root .dot.bad{background:var(--sell)}
-
 /* ---------- LIVE · identity ---------- */
 #vts-root .ident{margin-bottom:8px}
 #vts-root .nm{display:flex;align-items:baseline;gap:7px;min-width:0}
@@ -2070,7 +2097,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .tag.warn{color:var(--warn);border-color:var(--warn-line)}
 #vts-root .tag.bad{color:var(--sell-ink);background:var(--sell);border-color:var(--sell)}
 #vts-root .tag.dash{border-style:dashed;border-color:var(--line3)}
-
 /* ---------- LIVE · hero: state band, two decision numbers, meter ---------- */
 #vts-root .hero{container:hero/inline-size;border:1px solid var(--line2);border-radius:10px;overflow:hidden;background:var(--card);background:linear-gradient(180deg,var(--tone-bg) 0,var(--card) 62%)}
 #vts-root .band{display:flex;align-items:center;gap:9px;min-height:58px;padding:7px 8px 7px 12px;background:var(--tone-bg);color:var(--tone);border-bottom:1px solid var(--tone-line);box-shadow:inset 4px 0 0 var(--tone)}
@@ -2133,7 +2159,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .scale .b{color:var(--buy);white-space:nowrap}
 #vts-root .scale .s{color:var(--sell);white-space:nowrap;text-align:right}
 #vts-root .scale [data-vts=basis]{flex:1 1 0;min-width:0;text-align:center;font:500 11px/1.25 var(--sans);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
 /* ---------- LIVE · grade + bots pair, KPIs, late checks ---------- */
 #vts-root .pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;margin-top:6px}
 #vts-root .cell,#vts-root .kpi{min-width:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 10px 8px}
@@ -2251,7 +2276,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .lc.g-wait .v::before{content:"\2016  "}
 #vts-root .lc.g-fade .v::before{content:"\25BC  "}
 #vts-root .lc.g-dead .v::before{content:"\2715  "}
-
 /* ---------- LIVE · flags ---------- */
 #vts-root .flags{list-style:none;display:grid;gap:4px;margin:8px 0 0;padding:0}
 #vts-root .flags li{display:flex;gap:8px;align-items:flex-start;margin:0;padding:6px 8px;border-radius:7px;background:var(--warn-bg);border:1px solid #3a3013;font-size:12.5px;line-height:1.35;color:var(--text)}
@@ -2259,7 +2283,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .flags li.risk{background:var(--sell-bg);border-color:#4d1c24}
 #vts-root .flags li.risk::before{content:"RISK";background:var(--sell);color:var(--sell-ink)}
 #vts-root .flags:empty,#vts-root .strip:empty,#vts-root .feed:empty,#vts-root .late-chips:empty,#vts-root .kpis:empty,#vts-root .mtop:empty,#vts-root .mkt:empty,#vts-root .btp:empty{display:none}
-
 /* ---------- LIVE · below the fold ---------- */
 #vts-root .sect{display:flex;align-items:center;gap:8px;margin:14px 0 6px}
 #vts-root .sect::after{content:"";order:1;flex:1;height:1px;background:var(--line)}
@@ -2296,7 +2319,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .note b{color:var(--text)}
 #vts-root .result{margin:6px 10px 10px;padding:8px 10px;border-radius:7px;background:var(--well);border:1px solid var(--line2);font-size:12.5px}
 #vts-root .result:empty{display:none}
-
 /* ---------- forms (Recover initials, Calls) ---------- */
 #vts-root .field{display:block;margin:10px 0 0}
 #vts-root .field>.lbl,#vts-root .grid2 .lbl,#vts-root .grid3 .lbl{display:block;margin-bottom:5px}
@@ -2308,7 +2330,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .pct{position:relative;display:block}
 #vts-root .pct input{padding-right:24px}
 #vts-root .pct::after{content:"%";position:absolute;right:9px;top:50%;transform:translateY(-50%);color:var(--muted);font-weight:700;pointer-events:none}
-
 /* ---------- MARKET ---------- */
 #vts-root .mhead{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:6px 8px;margin-bottom:8px}
 #vts-root .pill{display:inline-flex;align-items:center;gap:6px;flex:none;min-width:0;max-width:100%;padding:5px 9px;border-radius:999px;border:1px solid var(--line2);font:650 11.5px/1 var(--sans);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -2323,7 +2344,6 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .mkt .l{text-align:left;font:600 12.5px/1.1 var(--sans);color:var(--muted)}
 #vts-root .mkt .hl{background:#122030}
 #vts-root .mkt .h.hl{color:var(--text);box-shadow:inset 0 -2px 0 var(--accent)}
-
 /* ---------- CALLS ---------- */
 #vts-root .recv{display:flex;align-items:center;gap:8px;margin:0 0 4px;padding:8px 10px;border-radius:8px;font-size:12.5px;line-height:1.35;color:var(--text);background:var(--card);border:1px solid var(--line2)}
 #vts-root .recv::before{content:"!";flex:none;display:grid;place-items:center;width:18px;height:18px;border-radius:50%;font:900 11px/1 var(--sans);background:var(--warn);color:var(--warn-ink)}
@@ -2361,14 +2381,12 @@ const PANEL_CSS = String.raw`/* ================================================
 #vts-root .btp .k b{color:var(--text)}
 #vts-root .bt-status{margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--card);border:1px solid var(--line);font-size:11.5px;color:var(--muted);line-height:1.45}
 #vts-root .bt-status:empty{display:none}
-
 /* ---------- SETTINGS ---------- */
 #vts-root .set{display:grid}
 #vts-root label.check{display:flex;align-items:center;gap:12px;margin:0;padding:9px 0;border-bottom:1px solid var(--line);cursor:pointer;color:var(--text)}
 #vts-root label.check>span{flex:1;min-width:0}
 #vts-root label.check b{display:block;font:700 13px/1.25 var(--sans)}
 #vts-root label.check small{display:block;margin-top:2px;font-size:11.5px;line-height:1.35;color:var(--muted)}
-
 /* ---------- narrow panels (340-372px) ---------- */
 @container vts (max-width:372px){
   #vts-root .vts-body{padding:10px 10px 12px}
@@ -2398,7 +2416,6 @@ const PANEL_CSS = String.raw`/* ================================================
   #vts-root .m-share small{display:none}
   #vts-root.vts-collapsed .m-since{font-size:15px}
 }
-
 /* ---------- one-shot flash on a new call or a state change (never loops) ----------
    JS: el.classList.add('flash'); setTimeout(()=>el.classList.remove('flash'),1200)
    on .band and .m-state. Use the timeout, not animationend: with reduced motion
@@ -2604,9 +2621,9 @@ const PANEL_CSS = String.raw`/* ================================================
   #vts-root .dial .side{font-size:7.5px;letter-spacing:0;padding:2px 4px}
 }
 /* ===================== 4.9: verdict bar, Scan tab, small additions ===================== */
-#vts-root .brand::after{content:"4.9"}
+#vts-root .brand::after{content:"4.9.3"}
 #vts-root .tabs button{letter-spacing:.09em;padding-left:2px;padding-right:2px}
-#vts-root .regime{flex:none;padding:3px 5px;border-radius:5px;border:1px solid var(--line2);font:800 9px/1 var(--mono);letter-spacing:.06em;color:var(--muted);white-space:nowrap}
+#vts-root .regime{flex:none;padding:2px 6px;border-radius:5px;border:1px solid var(--line2);font:800 9px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
 #vts-root .regime.hot{border-color:var(--buy-line);background:var(--buy-bg);color:var(--buy)}
 #vts-root .regime.cold{border-color:var(--sell-line);background:var(--sell-bg);color:var(--sell)}
 #vts-root.vts-collapsed .regime,#vts-root[data-tone]:not([data-tab=live]) .regime{display:none}
@@ -2796,7 +2813,6 @@ const PANEL_HTML = String.raw`<svg class="vts-sprite" aria-hidden="true" focusab
 </section>
 </div>
 <footer class="foot"><span class="dot" data-vts="dot"></span><span class="st" data-vts="status"></span><span class="fg" data-vts="foot-gmgn"><label class="sw" title="Open new calls in this tab automatically"><input type="checkbox" data-vts="autoload" checked><span>Auto-open</span></label><button class="primary" data-vts="claim" title="Make this GMGN tab the one that receives calls">Use this tab for calls</button></span></footer>`;
-
 function start() {
   'use strict';
   if (window.top !== window.self) return;
@@ -3338,7 +3354,6 @@ function start() {
     const strip=[['Grad',W[5].migrations+plus(5)],['Launch',W[5].creates+plus(5)],['Grad 30m',W[30].migrations+plus(30)]];
     $('market-strip').replaceChildren(...strip.map(([k,v])=>{const e=document.createElement('span'),b=document.createElement('b');e.append(k+' ');b.textContent=v;e.append(b);return e;}));
   }
-
   // Backtest: score saved calls against GeckoTerminal 1m candles. Candles are cached per call, so changing the
   // target, stop or costs re-scores instantly without refetching.
   // FORWARD_FROM: calls after the 95-call analysis (Oct 11 2026 03:30 UTC) are a clean forward test of its leads.
@@ -4090,7 +4105,6 @@ function start() {
   // panel's own text), draws the bar, and saves the result with the call so the backtest can grade it.
   const vxOn=()=>get('vxOn',true);
   let vx={mint:null,key:'',scan:null,traps:null,trapsAt:0,dexAt:0,dex:null,said:null,shieldOff:null}, boosts={at:0,rows:null}, regime={at:0};
-  // Holder-list scan (stealth bundles, smart-money flow, cost floor) and the coin's GMGN profile; redone only when GMGN's data changes.
   function vxScan(now){
     if(vx.mint!==current)vx={mint:current,key:'',scan:null,traps:null,trapsAt:0,dexAt:0,dex:null,said:vx.said,shieldOff:vx.shieldOff};
     if(gmS.mint!==current)return null;
@@ -4098,7 +4112,8 @@ function start() {
     if(vx.key!==key){
       vx.key=key;
       const G=gmS.G, list=hp&&now-hp.at<=GM_MAX?hp.data?.data?.list:null, info=(Array.isArray(ip?.data?.data)?ip.data.data:[])[0]||{}, dev=info.dev||{}, st=sp?.data?.data||{}, links=info.social_links||info.links||info.link||{};
-      vx.scan={st:Array.isArray(list)?VTCore.stealthScan(list,G?.price,G?.supply):null,rugRatio:VTCore.number(dev.rug_ratio??st.rug_ratio),cto:VTCore.number(dev.cto_flag)===1,symbol:typeof info.symbol==='string'?info.symbol:null,
+      const padStr=[info.launchpad,info.launchpad_platform,info.pool_type_str,info.pool?.exchange,st.launchpad].filter(Boolean).join(' ');
+      vx.scan={st:Array.isArray(list)?VTCore.stealthScan(list,G?.price,G?.supply):null,rugRatio:VTCore.number(dev.rug_ratio??st.rug_ratio),cto:VTCore.number(dev.cto_flag)===1,symbol:typeof info.symbol==='string'?info.symbol:null,padStr,quoteMint:info.pool?.quote_address||null,
         socials:ip?[links.twitter_username||links.twitter||info.twitter,links.telegram||info.telegram,links.website||info.website].filter(Boolean).length:null};
     }
     return vx.scan;
@@ -4125,32 +4140,41 @@ function start() {
     const migrated=G?.migrated??c?.migrated??(snapshot?.dex?!/^pump\.?fun$/i.test(snapshot.dex):null);
     // pump.fun graduates at about 418 SOL of market cap ("$69K" at SOL $165).
     const curvePct=migrated?100:mc>0?Math.min(99,Math.max(1,Math.round(100*mc/(418*(solUsd>0?solUsd:165))))):null;
-    const raw=VTCore.verdict({grade:s.known?s.grade:null,share:a.share,weakShare:/^DEX/.test(a.basis||''),caution:a.state==='CAUTION'?a.risks[0]||true:false,move:Number.isFinite(move)?move:null,coordinated:!!ls.ex.coordinated,smart:st?.smart,top1:tr?.top1,clone:tr?.clone,zeroSell:!!tr?.zeroSell,buys:tr?.buys,sells:tr?.sells,
-      rugRatio:ls.scan?.rugRatio,curvePct,migrated:!!migrated,floor:st?.floor,holding:!!s.holding,total:s.total});
+    const det=VTCore.detectPad({launchpad:ls.scan?.padStr,dexId:snapshot?.dex,quote_address:ls.scan?.quoteMint},current,location.href);
+    const pad=VTCore.ALLOWED_PADS.has(det)?det:null;
+    const badPad=det==='other'||(!pad&&(ls.scan?.padStr||snapshot?.dex))?(ls.scan?.padStr||snapshot?.dex||'other launchpad'):null;
+    const vin={badPad,grade:s.known?s.grade:null,share:a.share,weakShare:/^DEX/.test(a.basis||''),caution:a.state==='CAUTION'?a.risks[0]||true:false,move:Number.isFinite(move)?move:null,coordinated:!!ls.ex.coordinated,smart:st?.smart,top1:tr?.top1,clone:tr?.clone,zeroSell:!!tr?.zeroSell,buys:tr?.buys,sells:tr?.sells,
+      rugRatio:ls.scan?.rugRatio,curvePct,migrated:!!migrated,floor:st?.floor,holding:!!s.holding,total:s.total};
+    // What is shown (with the launchpad skip) and what the trading rules alone say (saved for the backtest).
+    const raw=VTCore.verdict(vin), rule=badPad?VTCore.verdict({...vin,badPad:null}):raw;
     // A change of verdict has to last 1.5s before it shows (alarms show at once), so the bar does not flicker when a
     // number sits on a threshold.
-    let v=raw;const urgent=raw.mode==='dump'||raw.mode==='avoid';
+    let v=raw;const urgent=raw.mode==='dump'||raw.mode==='avoid'||raw.mode==='skip';
     if(vx.shown&&vx.shown.mint===current&&vx.shown.v.mode!==raw.mode&&!urgent&&vx.shown.v.mode!=='scan'){if(vx.pending?.mode!==raw.mode)vx.pending={mode:raw.mode,since:now};if(now-vx.pending.since<1500)v=vx.shown.v;}
     if(v===raw){vx.shown={mint:current,v:raw};vx.pending=null;}
-    return {...v,curvePct,migrated:!!migrated,badge:curvePct==null?'':migrated?'MIGRATED':'CURVE ≈'+curvePct+'%'};
+    return {...v,ruleMode:rule.mode,pad,badPad,curvePct,migrated:!!migrated,badge:(pad==='pump'?'PUMPFUN · ':pad==='bonk'?'BONK · ':pad==='stonk'?'STONK.FUN · ':'')+(curvePct==null?'':migrated?'MIGRATED':'CURVE ≈'+curvePct+'%')};
   }
   function renderVx(ls,c,now,mc,share,venueTags){
     const box=$('vx'), on=vxOn()&&!!current;
     box.hidden=!on;
     if(!on){for(const d of root.querySelectorAll('details.vxd'))d.open=true;document.getElementById('vts-shield')?.remove();return;}
     const v=ls.vx, st=ls.scan?.st, tr=ls.traps, liq=snapshot?.liquidity??gmFresh(now)?.liquidity??null, safe=liq>0&&solUsd>0?Math.max(0.05,Math.min(2.5,+(liq*0.018/solUsd).toFixed(2))):null;
-    box.className='vx '+v.mode;
-    $('vx-title').textContent=({buy:'🟢 ',wait:'🟡 ',avoid:'🔴 ',dump:'🚨 '}[v.mode]||'')+v.title;$('vx-badge').textContent=v.badge;
+    box.className='vx '+(v.mode==='skip'?'avoid':v.mode);
+    $('vx-title').textContent=({buy:'🟢 ',wait:'🟡 ',avoid:'🔴 ',dump:'🚨 ',skip:'⛔ '}[v.mode]||'')+v.title;$('vx-badge').textContent=v.badge;
     $('vx-why').textContent=v.why.join(' · ')+(v.mode==='wait'&&st?.floor?.mc?' · holders’ floor '+usd(st.floor.mc):'');
     const tele=(k,val)=>{const e=node('span','',k+' ');e.append(node('b','',val));return e;};
     $('vx-tele').replaceChildren(tele('Floor',st?.floor?.mc?usd(st.floor.mc)+(st.floor.mult?' ('+st.floor.mult.toFixed(1)+'×)':''):'—'),tele('Top 1m buyer',tr?.top1?Math.round(tr.top1.share)+'%':'—'),
       tele('Smart',st&&st.smart.holding+st.smart.dumping?st.smart.holding+'H · '+st.smart.dumping+'D':'—'),tele('Socials',ls.scan?.socials==null?'—':ls.scan.socials+'/3'),tele('Size cap',safe?safe+' SOL':'—'));
     // How this verdict did on your own past calls (filled in by the backtest report).
-    const rec=get('bt.vx',null)?.[v.mode];
-    $('vx-rec').textContent=v.mode==='scan'?'':rec?.n?'Your record for this verdict: '+rec.n+' call'+(rec.n===1?'':'s')+', '+Math.round(rec.winRate)+'% won, '+signed(rec.ev,1)+'% average per trade'+(rec.n<30?' (too few to trust)':'')
+    const rec=v.mode==='skip'?null:get('bt.vx',null)?.[v.mode];
+    $('vx-rec').textContent=v.mode==='scan'||v.mode==='skip'?'':rec?.n?'Your record for this verdict: '+rec.n+' call'+(rec.n===1?'':'s')+', '+Math.round(rec.winRate)+'% won, '+signed(rec.ev,1)+'% average per trade'+(rec.n<30?' (too few to trust)':'')
       :'Untested rule, no record yet: verdicts are saved with each call. Score calls and open the report to see how each did.';
     const tags=[...venueTags], d=vx.dex, tag=(t,cls,title,fn)=>{const e=node('span','tag'+(cls?' '+cls:''),t);if(title)e.title=title;if(fn){e.classList.add('click');e.onclick=fn;}tags.push(e);};
-    if(d?.paid)tag('DEX PAID ✓','ok','DEX Screener profile paid for');
+    if(v.pad==='pump')tag('PUMP.FUN ✓','ok','Verified Pumpfun launch');
+    else if(v.pad==='bonk')tag('BONK ✓','ok','Bonk launch (Bonkers / letsbonk)');
+    else if(v.pad==='stonk')tag('STONK.FUN ✓','ok','Verified Stonk.fun launch');
+    else if(v.badPad)tag('BLOCKED PAD ✕','bad','Not a Pumpfun, Bonk or Stonk.fun launch');
+    if(d?.paid)tag('DEX PAID ✓','ok','Approved DEX Screener token profile');
     if(d?.boosts>0)tag('BOOST '+d.boosts,'ok','Active DEX Screener boosts');
     if(d?.twin>0)tag('BIGGER TWIN '+usd(d.twin),'warn','Another Solana coin with the same ticker has far more liquidity. Check you are on the one you mean.');
     if(ls.scan?.cto)tag('CTO','ok','GMGN marks a community takeover');
@@ -4161,7 +4185,7 @@ function start() {
     if(safe)tag('SIZE ≤ '+safe+' SOL','','1.8% of the pool’s liquidity. Click to copy the amount (nothing is typed into GMGN).',()=>{GM_setClipboard(String(safe),'text');notice(safe+' SOL copied');render();});
     $('venue').replaceChildren(...tags);
     // Impulse shield: a banner while the verdict says stay away. It blocks nothing; it can be dismissed per coin.
-    const sh=document.getElementById('vts-shield'), want=get('shieldOn',true)&&(v.mode==='avoid'||v.mode==='dump')&&vx.shieldOff!==current&&!root.hidden;
+    const sh=document.getElementById('vts-shield'), want=get('shieldOn',true)&&(v.mode==='avoid'||v.mode==='dump'||v.mode==='skip')&&vx.shieldOff!==current&&!root.hidden;
     if(!want)sh?.remove();
     else{
       const b=sh||document.createElement('div');
@@ -4240,7 +4264,7 @@ function start() {
   function renderChecks(c,now,rv,ls){
     const box=$('rug');box.hidden=!current;
     if(!current)return;
-    const row=$('rug-row'), btn=$('rug-check'), say=t=>{$('rug-note').textContent=t;$('rug-note').hidden=!t;}, ins=$('ins');
+    const row=$('rug-row'),btn=$('rug-check'), say=t=>{$('rug-note').textContent=t;$('rug-note').hidden=!t;}, ins=$('ins');
     row.hidden=!(rv.manual||rv.retry)||!rpcUrl();btn.textContent=rv.retry?'Retry chain check':'Check this coin';
     const G=gmFresh(now), {score,grp,ex,x}=ls, age=gmS.mint===current&&gmS.at?Math.max(0,Math.round((now-gmS.at)/1000)):null;
     $('rug-src').textContent=[age!=null?'GMGN '+age+'s'+(age>30?(G?' old':' · expired'):''):gmS.busy?'GMGN loading':null,rv.src||null].filter(Boolean).join(' · ')||'untested';
@@ -4304,7 +4328,7 @@ function start() {
     // Wait (up to 30s after the alert) for the first exit quote too, so the saved score has it.
     if(get('jupOn',true)&&!(jupS.mint===c.mint&&jupS.res)&&now-c.messageAt<30000)return;
     const {base:s,x}=ls, r=v=>v==null?null:Math.round(v*100)/100, a9=ls.score, st9=ls.scan?.st;
-    const x49=vxOn()&&ls.vx&&a9.rules?{grade:a9.grade,code:a9.code,risk:a9.risk,demand:a9.demand,entry:a9.entry,verdict:ls.vx.mode==='scan'?null:ls.vx.mode,holding:!!a9.holding,stealth:st9?r(st9.stealthPct):null,total:r(a9.total),
+    const x49=vxOn()&&ls.vx&&a9.rules?{grade:a9.grade,code:a9.code,risk:a9.risk,demand:a9.demand,entry:a9.entry,verdict:ls.vx.ruleMode==='scan'?null:ls.vx.ruleMode,pad:ls.vx.pad||(ls.vx.badPad?'other':null),holding:!!a9.holding,stealth:st9?r(st9.stealthPct):null,total:r(a9.total),
       smartNet:st9&&st9.smart.holding+st9.smart.dumping?st9.smart.holding-st9.smart.dumping:null,clone:!!ls.traps?.clone,zeroSell:!!ls.traps?.zeroSell,top1:r(ls.traps?.top1?.share),rugRatio:r(ls.scan?.rugRatio)}:null;
     set('gm.'+c.id,{x49,t:c.messageAt,at:now,delay:Math.round((now-c.messageAt)/1000),grade:s.grade,code:s.code,score:s.score,known:s.known,hard:s.hard,
       insiderHold:r(x.insiderHold),bundlerPct:r(x.bundlerPct),sniperPct:r(x.sniperPct),platformRate:r(x.platformRate),freshRate:r(x.freshRate),launches:x.launches??null,
@@ -4360,8 +4384,8 @@ function start() {
     if(r.ok)set('tg.'+c.id,{...m,last:text});
   }
   function openReport(){
-    const tp=Math.max(1,+$('bt-tp').value||100), sl=-Math.min(99,Math.abs(+$('bt-sl').value||50)), cost=Math.max(0,+$('bt-cost').value||0);
-    const delay=BT_DELAYS.includes(+$('bt-delay').value)?+$('bt-delay').value:0, exit=+$('bt-exit').value===5?5:0, fill=$('bt-fill').value==='cautious'?'cautious':'touch';
+    const tp=Math.max(1,+$('bt-tp').value||100),sl=-Math.min(99,Math.abs(+$('bt-sl').value||50)), cost=Math.max(0,+$('bt-cost').value||0);
+    const delay=BT_DELAYS.includes(+$('bt-delay').value)?+$('bt-delay').value:0, exit=+$('bt-exit').value===5?5:0,fill=$('bt-fill').value==='cautious'?'cautious':'touch';
     set('bt.opt',{tp,sl,cost,delay,exit,fill});
     const base={tp,sl,horizon:BT_H,fill,earlyExit:exit||null};
     // Every call is scored at each entry delay from the same cached candles (no extra requests).
@@ -4464,7 +4488,7 @@ function start() {
         'entry_move','run_up_15','migrated','trail_outcome','trail_return','bots_2m_organic_share','bots_2m_organic_trades','live_organic_120s',
         'rug_top10','rug_dev_pct','rug_dev_buy_pct','rug_dev_sold','rug_launch_buyers','rug_launch_pct','rug_seen_dev','rug_seen_funder','rug_complete','rug_creator','rug_funder','rug_grade',
         'live_grade','live_score','live_checks','live_delay_s','live_insider_bag','live_bundlers','live_snipers','live_real_traders','live_fresh','live_dev_launches','live_vol_mc','live_smart','live_top10','live_dev_pct','live_cluster_wallets','live_cluster_pct','live_holders','live_first70_hold','live_dev_status',
-        'live_rules','live_risk','live_demand','live_entry','live_confidence','live_exit_cost','live_trade_sol','live_retention','live_profit_share','live_move','live_all_in',...VTCore.SPEED_AT.flatMap(s=>['buy_'+s+'s_fill','buy_'+s+'s_return']),'my_entry_s','my_entry_premium','my_return','my_open','x49_verdict','x49_grade','x49_holding','x49_stealth','x49_smart_net','x49_same_size_buys','x49_almost_no_sells','x49_top_buyer'];
+        'live_rules','live_risk','live_demand','live_entry','live_confidence','live_exit_cost','live_trade_sol','live_retention','live_profit_share','live_move','live_all_in',...VTCore.SPEED_AT.flatMap(s=>['buy_'+s+'s_fill','buy_'+s+'s_return']),'my_entry_s','my_entry_premium','my_return','my_open','x49_verdict','x49_grade','x49_holding','x49_stealth','x49_smart_net','x49_same_size_buys','x49_almost_no_sells','x49_top_buyer','x49_launchpad'];
       const q=v=>v==null?'':/[",\n]/.test(String(v))?'"'+String(v).replace(/"/g,'""')+'"':String(v);
       const lines=o.rows.map(r=>{const {call:c,by,ex,late,hb,ft}=r, s=by[0];return [c.name,c.symbol,c.mint,new Date(c.messageAt).toISOString(),c.callMc,c.ageSeconds==null?null:(c.ageSeconds/60).toFixed(1),c.clusters?.length?Math.max(...c.clusters):null,
         c.holders>0&&c.bots!=null?(100*c.bots/c.holders).toFixed(1):null,c.holders>0&&c.fresh!=null?(100*c.fresh/c.holders).toFixed(1):null,c.topHolder,c.holders,s.outcome,f(s.ret),f(s.peakPct),f(s.peakMin),f(s.troughPct),f(s.r5),f(s.r10),f(s.r15),f(s.r30),f(s.r60),
@@ -4474,7 +4498,7 @@ function start() {
         f(o.moveInto(r,0)),f(r.pre.runUp15),c.migrated,ex.trail.outcome,f(ex.trail.ret),hb?.post?.org,hb?.post?.orgN,ft?.vb120?.org,
         ...(r.rf?[r.rf.top10,r.rf.devPct,r.rug.devBuyPct,r.rf.devSold,r.rf.launchBuyers,r.rf.launchPct,r.rf.seenDev,r.rf.seenFund,r.rug.complete,r.rug.creator,r.rug.funder,['clean','risky','avoid'][r.rf.grade]??null]:Array(12).fill(null)),
         ...(r.gm?[r.gm.grade,r.gm.score,r.gm.known,r.gm.delay,r.gm.insiderHold,r.gm.bundlerPct,r.gm.sniperPct,r.gm.platformRate,r.gm.freshRate,r.gm.launches,r.gm.volMc,r.gm.smart,r.gm.top10,r.gm.devPct,r.gm.clusterN,r.gm.clusterPct,r.gm.holders,r.gm.first70Hold,r.gm.devStatus,
-          r.gm.v>=2?(VTCore.gmBase(r.gm)?'4.3':'4.5-4.8 add-ons'):'old',r.gm.risk,r.gm.demand,r.gm.entry,r.gm.conf,r.gm.exitCost,r.gm.tradeSol,r.gm.retention,r.gm.profitShare,r.gm.move]:Array(29).fill(null)),r.gm?.allIn,...VTCore.SPEED_AT.flatMap(s=>[r.hb?.px?.pct?.[s],r.sp[s]?.status==='scored'?f(r.sp[s].ret):null]),r.mine?Math.round(r.mine.delay):null,f(r.mine?.prem),f(r.mine?.pnl),r.mine?r.mine.open:null,...(r.gm?.x49?[r.gm.x49.verdict,r.gm.x49.grade,r.gm.x49.holding,r.gm.x49.stealth,r.gm.x49.smartNet,r.gm.x49.clone,r.gm.x49.zeroSell,r.gm.x49.top1]:Array(8).fill(null))].map(q).join(',');});
+          r.gm.v>=2?(VTCore.gmBase(r.gm)?'4.3':'4.5-4.8 add-ons'):'old',r.gm.risk,r.gm.demand,r.gm.entry,r.gm.conf,r.gm.exitCost,r.gm.tradeSol,r.gm.retention,r.gm.profitShare,r.gm.move]:Array(29).fill(null)),r.gm?.allIn,...VTCore.SPEED_AT.flatMap(s=>[r.hb?.px?.pct?.[s],r.sp[s]?.status==='scored'?f(r.sp[s].ret):null]),r.mine?Math.round(r.mine.delay):null,f(r.mine?.prem),f(r.mine?.pnl),r.mine?r.mine.open:null,...(r.gm?.x49?[r.gm.x49.verdict,r.gm.x49.grade,r.gm.x49.holding,r.gm.x49.stealth,r.gm.x49.smartNet,r.gm.x49.clone,r.gm.x49.zeroSell,r.gm.x49.top1,r.gm.x49.pad]:Array(9).fill(null))].map(q).join(',');});
       const url=URL.createObjectURL(new Blob([[cols.join(','),...lines].join('\n')],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='voltrak-backtest-'+Date.now()+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     };
     const a=rep.all, t=rep.timing;

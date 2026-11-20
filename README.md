@@ -44,6 +44,17 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.test.mjs`
 
+### 4.9.3
+
+Built on the 4.9.2 file in use (4.9.0 plus a launchpad filter).
+
+- **Three launchpads only: Pumpfun, Bonk and Stonk.fun.** Bonk covers GMGN's "bonkers" label, letsbonk / bonk.fun and mints ending in "bonk". Coins from any other launchpad, or whose launchpad is not known, are not listed in the monitor; the verdict bar says SKIP.
+- **A dump warning comes before SKIP**, so a coin you already hold still warns you.
+- **The launchpad skip is saved on its own.** The saved verdict is what the trading rules said, so the verdict table in the backtest stays a test of the rules. The report has a table per launchpad and the CSV a launchpad column.
+- **DEX Screener lookups follow the settings again** (verdict bar on, tab visible or receiving calls).
+- **Removed a stray word at the end of the file** that threw an error on every page.
+- **The script name now carries the version** and changes with every release.
+
 ### 4.9.0
 
 The 4.5–4.8 add-ons (wake-up monitor, Scanner tab, Photon dock, verdict bar, tape and bundle rules) rebuilt on top of the verified 4.4.2. The 4.8.3 file was a fork of 4.4.0: it had none of the 4.4.1/4.4.2 fixes and most of the backtest report had been cut out of it.
