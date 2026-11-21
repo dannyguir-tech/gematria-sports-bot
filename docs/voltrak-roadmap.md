@@ -343,6 +343,53 @@ Each layer works even if everything above it fails:
 - Honestly, sub-10 ms matters little here: network delay to the leader is tens of ms. If the hot path ever needs better,
   port it to Rust.
 
+## 15d. Forks, fee forecasting, integer math
+
+**Forks and commitment levels**
+- Premise check (from memory, verify): short forks drop *processed* blocks. "Confirmed" means 2/3 of stake voted for the
+  block, and no confirmed block is known to have been rolled back on mainnet since optimistic confirmation. Still designed
+  for it.
+- Three levels per order: processed = seen, nothing changes. Confirmed = act on it (free the slot, next decision, start
+  exit timers). Finalized (~32 slots, ~13 s) = accounting truth: position closed, PnL booked.
+- States: `SENT → CONFIRMED → FINALIZED`, plus `ORPHANED`. A confirmed signature whose status disappears before finalized
+  (batch status checks every few seconds) → ORPHANED. The position goes back to open, the exit rules run again.
+- Orphaned but blockhash still valid → resend the same signed bytes (usually lands in the next block). Expired → new
+  sell, sized from the balance read at confirmed commitment.
+- Sells are safe to repeat: sized from the balance, so if the old sell lands too, the second fails for lack of tokens
+  (cost: a fee). Buys never: no new buy while the old one can still land (section 15b).
+- Balances for sizing are read at confirmed, never processed (processed balances can come back after a fork).
+- Harness: fake chain drops a confirmed block now and then; checks: no lost inventory, no double sell, exit retried in
+  time.
+
+**Priority fees**
+- Fees are local: the price depends on the accounts the swap writes to (the pool), not the whole chain. Forecast per pool:
+  Helius `getPriorityFeeEstimate` with the transaction's account keys, plus `getRecentPrioritizationFees` for those
+  accounts, plus our own landing log.
+- Biggest overpay is the compute limit: fee = price × limit. Limit = simulated units + 10%, never the 200k default.
+- Percentile by urgency: entries ~50th–75th, exits ~75th–95th. Smoothed over recent slots, jumps on a detected spike.
+- Our own calibration: from every send, P(lands within k slots | fee percentile, route). Pick the lowest fee that reaches
+  the target landing rate.
+- Caps in the signer: lamports per transaction and share of trade value; nothing pays 100× by mistake.
+- Starvation: entries not landed in ~3–5 slots → cancel. Exits escalate ×1.5 per retry up to the cap.
+- On the Jito route the tip decides ordering; priority fee stays near the floor there. The forecast matters for the
+  staked-connection route.
+
+**Integer math**
+- All amounts are BigInt, read straight from account bytes (u64 little-endian). Never JS numbers (exact only to 2^53) or
+  "UI amounts". Decimals come from the mint. Floats only for display and analytics.
+- BigInt can't overflow, so the guard is range checks: every input and result must fit u64 (and intermediates u128, as
+  in the program); otherwise reject the quote.
+- "Zero precision loss" isn't possible with integer division; the goal is a bit-exact match with each program's own
+  formula and rounding: outputs round down, inputs up, fees in the program's order (Pump curve, PumpSwap LP + protocol +
+  creator fees, Raydium CPMM).
+- Slippage in basis points with integers: `minOut = quote × (10000 − bps) / 10000`, rounded down.
+- Safety: the program enforces the minimum on chain, so a math error causes a failed transaction (a fee), not a bad fill.
+  The real risks are elsewhere: Token-2022 transfer fees and hooks (received < output), fake pools (check the pool
+  account's owner program and mints), absurd supplies or reserves (range checks).
+- Tests: golden tests comparing our quote with `simulateTransaction` on recorded pool states (must match exactly); fuzz
+  against the program's own Rust code with random values up to u64 max; property tests (output never above reserves,
+  round trip never profitable).
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
