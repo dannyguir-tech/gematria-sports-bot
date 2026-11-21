@@ -520,3 +520,29 @@ test('verdict: a dump warning comes before the launchpad skip; the skip is its o
   assert.equal(V.verdict({...v, coordinated: true}).mode, 'dump');
   assert.equal(V.verdict({...v, badPad: null}).mode, 'buy', 'without the skip the trading rules decide');
 });
+
+// ---- 4.9.4: Copy for AI and the AI pick log ----
+const mintN = i => '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJo' + 'ABCDEFGHJK'[i] + 'pump'; // 44 characters
+const aiRows = [0, 1, 2].map(i => ({mint: mintN(i), symbol: 'C' + i, pad: 'pump', mc: 40000 + i, liq: 9000, vol5m: 12000, holders: 150, top10: 18, bundler: 3, dev: 0.4, smart: i,
+  ev: {buyShare: 61, velPct: 2.4, gain: 35, wake: i === 1, score: 5, absorbed: 'clean'}}));
+test('aiPrompt: fixed instructions plus one line per coin with its mint', () => {
+  const p = V.aiPrompt(aiRows, Date.UTC(2026, 10, 21, 9, 5));
+  assert.ok(p.startsWith(V.AI_RULES));
+  assert.match(p, /Coins at 2026-11-21 09:05 UTC \(3\)/);
+  for (const w of aiRows) assert.ok(p.includes('mint=' + w.mint));
+  assert.match(p, /2\. \$C1 .* waking=yes score=5\/10/);
+  assert.equal(p.split('\n').length - 3, 3);
+});
+test('parsePicks: only mints from the copied list, at most 3, with the reason', () => {
+  const made = '9xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosZZZZ';
+  const r = V.parsePicks(`Here you go:\nPICK ${mintN(1)} | steady buying, low top 10\nPICK ${made} | invented\n- ${mintN(0)}`, aiRows);
+  assert.deepEqual(r.map(x => x.mint), [mintN(1), mintN(0)]);
+  assert.equal(r[0].why, 'steady buying, low top 10');
+  assert.deepEqual(V.parsePicks('NONE', aiRows), []);
+  assert.equal(V.parsePicks(`PICK ${mintN(0)}\nPICK ${mintN(0)}`, aiRows).length, 1);
+});
+test('pickStats: 1 h and 4 h results for picks and the same-list comparison', () => {
+  const s = V.pickStats([{kind: 'pick', r60: 20, r240: -90}, {kind: 'pick', r60: -10}, {kind: 'ctl', r60: 5, r240: null}]);
+  assert.equal(s.pick.seen, 2); assert.equal(s.pick[60].n, 2); assert.equal(s.pick[60].median, 5); assert.equal(s.pick[60].up, 50);
+  assert.equal(s.pick[240].rug, 100); assert.equal(s.ctl[240].n, 0); assert.equal(s.ctl[60].up, 100);
+});

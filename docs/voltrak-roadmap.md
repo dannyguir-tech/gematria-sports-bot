@@ -5,14 +5,16 @@ The worker, database, harness, paper trading, optimization loop and live engine 
 
 ## 1. Where things stand
 
-- **Userscript 4.9.3** (`voltrak-steroids.user.js`), copy page: https://claude.ai/artifact/Do2dTMB3GAhTZSxyqMT2sD
+- **Userscript 4.9.4** (`voltrak-steroids.user.js`), copy page: https://claude.ai/artifact/Do2dTMB3GAhTZSxyqMT2sD
   - Discord → GMGN handoff, live panel, chain checks (Helius key), GMGN data, verdict bar, monitor (GMGN Scan tab,
     Photon dock), backtest report with a table per rule, CSV export.
   - 4.9.3 was built on the user's own 4.9.2 (4.9.0 + a launchpad filter added outside this repo).
+  - 4.9.4 adds "Copy for AI" (list + fixed instructions for Grok etc.) and an AI pick log checked 1 h / 4 h later
+    against same-list coins not picked.
 - **Backtest engine** (`engine/`, see `engine/README.md`): point-in-time features, rules with safety vetoes, exit
   simulation (runner / steady), day-by-day portfolio, random-coin baseline, filter ablation, Markdown report.
   Runs on fake coins now; waiting for real data from the backfill. 13 tests (`node --test engine/test/engine.test.mjs`).
-- **Tests:** `node --test test/voltrak-core.test.mjs` (37 tests). Browser checks were run on simulated pages only: the real
+- **Tests:** `node --test test/voltrak-core.test.mjs` (40 tests). Browser checks were run on simulated pages only: the real
   data sites are blocked from the build environment.
 
 ## 2. Standing decisions

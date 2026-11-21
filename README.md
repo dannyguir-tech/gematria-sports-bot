@@ -44,6 +44,17 @@ This is for entertainment only. Gematria is not a proven betting or trading stra
 
 Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.test.mjs`
 
+### 4.9.4
+
+- **Copy for AI** (monitor, on GMGN and Photon): copies the current list with fixed instructions for a chat agent such as Grok. The agent answers `PICK <mint> | reason` (at most 2) or `NONE`.
+- **Log AI picks**: paste the agent's answer. Only coins from the copied list count (made-up addresses are ignored). Each pick is saved with its market cap, next to a coin from the same list it did not pick.
+- **AI picks scoreboard**: what the picks did 1 hour and 4 hours later (median change, share higher, share down 80%+), against the not-picked coins. Checks run while a GMGN or Photon tab is open; a check more than 2 hours late is skipped. About 50 picks are needed before it means anything.
+- The agent never trades and nothing is sent anywhere: you copy and paste by hand.
+
+### Backtest engine (`engine/`)
+
+Separate from the userscript: tests whether rules that scan new Pumpfun / Bonk / Stonk.fun coins make money after costs, day by day, against random coins. Runs on fake coins now; `engine/bin/backfill.mjs` pulls real past Pumpfun coins with a Helius key. See `engine/README.md`.
+
 ### 4.9.3
 
 Built on the 4.9.2 file in use (4.9.0 plus a launchpad filter).

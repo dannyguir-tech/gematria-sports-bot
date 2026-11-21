@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         VolTrak Steroids 4.9.3
+// @name         VolTrak Steroids 4.9.4
 // @namespace    voltrak-alert
-// @version      4.9.3
+// @version      4.9.4
 // @description  VolTrak context + GMGN handoff + GMGN live trade feed (read-only), live rug checks (dev, top 10, launch block, funder), GMGN holder data, insider-exit alerts, a live coin score, Telegram pings, market-wide pump.fun activity, a call backtest, a coin monitor for GMGN and Photon lists, and a verdict bar. Analysis only: it submits no trades (the quick-trade hotkeys press GMGN's own buttons and are off unless you turn them on).
 // @match        https://discord.com/*
 // @match        https://gmgn.ai/*
@@ -1437,7 +1437,42 @@ const VTCore = (() => {
       out[kind].seen = rows.length; }
     return out;
   }
-  return {detectPad,ALLOWED_PADS,gmBase,roundSol,tapeTraps,stealthScan,adjustScore,verdict,monNorm,MON,monPass,monEval,monStats,MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
+  // AI picks (4.9.4): the monitor list as a fixed prompt for a chat agent (Grok etc.), its answer read back, and what
+  // its picks did 1 h and 4 h later next to coins from the same list it did not pick. The agent never trades.
+  const AI_RULES = 'You screen Solana meme coins (Pumpfun, Bonk, Stonk.fun) for one buy decision. Goal: steady profit, strong coins, no rugs. ' +
+    'Avoid: top 10 holders above 30%, dev above 5%, bundles not absorbed, a single vertical candle, falling buy share. Prefer: steady buying from many wallets, ' +
+    'rising holders, smart-wallet buys, coins waking up from a base rather than already up a lot. Pick at most 2 coins, or none. ' +
+    'Reply ONLY in this format, one line per pick: PICK <mint> | <one short reason>. If nothing is good, reply: NONE';
+  function aiPrompt(rows, now) {
+    const pct = v => v == null || !Number.isFinite(+v) ? '?' : Math.round(+v) + '%', usd = n => !(n > 0) ? '?' : n >= 1e6 ? '$' + (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? '$' + (n / 1e3).toFixed(1) + 'K' : '$' + Math.round(n);
+    const lines = rows.map((w, i) => { const ev = w.ev || {};
+      return `${i + 1}. $${w.symbol || '?'} mint=${w.mint} pad=${w.pad || '?'} mc=${usd(w.mc)} liq=${usd(w.liq)} vol5m=${usd(w.vol5m)} buys5m=${pct(ev.buyShare)} ` +
+        `speed=${ev.velPct == null ? '?' : ev.velPct.toFixed(1) + '%/min'} off_low=${ev.gain == null ? '?' : '+' + Math.round(ev.gain) + '%'} holders=${w.holders ?? '?'} ` +
+        `top10=${pct(w.top10)} bundles=${pct(w.bundler)}${ev.absorbed ? ' (' + ev.absorbed + ')' : ''} dev=${w.dev == null ? '?' : (+w.dev).toFixed(1) + '%'} smart_buys=${w.smart ?? 0} waking=${ev.wake ? 'yes' : 'no'} score=${ev.score ?? '?'}/10`; });
+    return `${AI_RULES}\n\nCoins at ${new Date(now).toISOString().slice(0, 16).replace('T', ' ')} UTC (${rows.length}):\n${lines.join('\n')}`;
+  }
+  // Mints the agent picked, limited to coins in the list it was given (anything else is ignored as made up).
+  function parsePicks(text, rows) {
+    const known = new Map(rows.filter(w => w.mint).map(w => [w.mint, w])), out = [], seen = new Set();
+    for (const line of String(text || '').split(/\r?\n/)) {
+      const m = line.match(/(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])/g) || [];
+      for (const mint of m) if (known.has(mint) && !seen.has(mint) && out.length < 3) {
+        seen.add(mint); const why = (line.split('|')[1] || '').trim().slice(0, 160);
+        out.push({mint, symbol: known.get(mint).symbol || null, why}); }
+    }
+    return out;
+  }
+  // log = [{kind: 'pick'|'ctl', mc0, r60, r240}] with r = % change in market cap after 1 h / 4 h.
+  function pickStats(log) {
+    const out = {};
+    for (const kind of ['pick', 'ctl']) { const rows = (log || []).filter(x => x.kind === kind);
+      out[kind] = Object.fromEntries([60, 240].map(m => { const v = rows.map(x => x['r' + m]).filter(Number.isFinite);
+        return [m, {n: v.length, median: median(v), up: v.length ? 100 * v.filter(x => x > 0).length / v.length : null, big: v.length ? 100 * v.filter(x => x >= 50).length / v.length : null,
+          rug: v.length ? 100 * v.filter(x => x <= -80).length / v.length : null}]; }));
+      out[kind].seen = rows.length; }
+    return out;
+  }
+  return {AI_RULES,aiPrompt,parsePicks,pickStats,detectPad,ALLOWED_PADS,gmBase,roundSol,tapeTraps,stealthScan,adjustScore,verdict,monNorm,MON,monPass,monEval,monStats,MINT,number,money,parseAlert,mintFromURL,gmgnURL,selectPair,normalize,gtPool,gtPools,tradeFlow,gmgnFrame,addrOf,gmgnTrade,gmgnStat,liveView,assess,
     candles,mergeCandles,scoreCall,preAlert,SPEED_AT,pricePath,position,breakeven,wilson,summarize,zFor,tFor,backtestReport,VB,botFlow,gmgnMaker,gmgnApiTrade,APP_TAG,BOT_RULES,BOT_SURE,txTrades,LATE,LATE_LEGACY,lateGrade,ppEvent,marketTape,initials,handoff,
     RUG,SYSTEM_PROGRAM,txMint,rugState,rugHolding,rugTx,tradeTokens,rugTrade,rugPrune,rugCatch,rugVerify,HOLDER_GAP_MAX,holderTrust,devNowVerified,creatorCheck,creatorUsable,senderTrust,rugRanked,rugTop,rugLaunch,rugSnap,rugScan,funderOf,rugGrade,rugGradeAt,rugLine,FEATURES,gmgnParse,roleOfTags,insiderGroup,EXIT,exitStats,scoreCoin,b58decode,b58encode,pumpCreator,devFlow,WSOL_MINT};
 })();
@@ -1747,6 +1782,35 @@ const VTMon = (() => {
       set('log', cur);
     } finally { busy = false; }
   }
+  // ---- AI picks: the list the agent saw, its picks and a same-list comparison, checked 1 h and 4 h later ----
+  let aiSnap = null;
+  function aiCopy() { const now = Date.now(), rows = shown.filter(w => w.mint).slice(0, 25); aiSnap = {t: now, rows}; return VTCore.aiPrompt(rows, now); }
+  function aiLog(text) {
+    const now = Date.now(), rows = aiSnap ? aiSnap.rows : shown.filter(w => w.mint), picks = VTCore.parsePicks(text, rows);
+    if (!picks.length) return {picks: [], ctl: 0, none: /\bNONE\b/i.test(text || '')};
+    const mcOf = m => { const w = map.get(m) || rows.find(x => x.mint === m); return w && w.mc > 0 ? w.mc : null; };
+    const picked = new Set(picks.map(p => p.mint)), others = rows.filter(w => !picked.has(w.mint) && mcOf(w.mint)), add = [];
+    for (const p of picks) { const mc0 = mcOf(p.mint); if (!mc0) continue;
+      add.push({kind: 'pick', m: p.mint, s: p.symbol, t: now, mc0, why: p.why});
+      if (others.length) { const o = others.splice((hash(p.mint) + now) % others.length, 1)[0]; add.push({kind: 'ctl', m: o.mint, s: o.symbol || null, t: now, mc0: mcOf(o.mint)}); } }
+    set('picks', [...get('picks', []), ...add].slice(-600));
+    return {picks: add.filter(x => x.kind === 'pick'), ctl: add.filter(x => x.kind === 'ctl').length};
+  }
+  let pbusy = false;
+  async function settlePicks() {
+    if (pbusy) return;
+    const now = Date.now(), log = get('picks', []), LATE = 7200000, due = []; let changed = false;
+    for (const x of log) for (const m of [60, 240]) { const k = 'r' + m; if (k in x) continue; const at = x.t + m * 60000; if (now > at + LATE) { x[k] = null; changed = true; } else if (now >= at) due.push(x); }
+    if (!due.length) { if (changed) set('picks', log); return; }
+    pbusy = true;
+    try {
+      const by = dexByMint(await dexPairs([...new Set(due.map(x => x.m))].slice(0, 30), [])), cur = get('picks', []), now2 = Date.now();
+      for (const y of cur) for (const m of [60, 240]) { const k = 'r' + m, at = y.t + m * 60000; if (k in y || now2 < at) continue;
+        const o = by.get(y.m), mc = o && (VTCore.number(o.best.marketCap) ?? VTCore.number(o.best.fdv));
+        if (mc > 0 && y.mc0 > 0) { y[k] = Math.round((mc / y.mc0 - 1) * 1000) / 10; y['late' + m] = Math.round((now2 - at) / 60000); } else if (now2 > at + LATE) y[k] = null; }
+      set('picks', cur);
+    } finally { pbusy = false; }
+  }
   function evaluate(now) {
     const out = [];
     for (const [k, w] of map) {
@@ -1779,6 +1843,7 @@ const VTMon = (() => {
   let n = 0;
   setInterval(() => {
     n++;
+    if (n % 20 === 0) settlePicks().catch(() => {});
     if (document.hidden) { if (n % 10 === 0) settle().catch(() => {}); return; }
     scanDom(false);
     if (dirty) { dirty = false; const now = Date.now(); evaluate(now); record(now); emit(false); }
@@ -1786,11 +1851,15 @@ const VTMon = (() => {
     if (n % 10 === 0) settle().catch(() => {});
   }, 3000);
   return {list: () => shown, size: () => map.size, stats: () => { let priced = 0; for (const w of map.values()) if (w.mc > 0) priced++; return {...stats, coins: map.size, priced, lastRefresh}; }, refresh, on(fn) { subs.add(fn); return () => subs.delete(fn); },
-    board: () => VTCore.monStats(get('log', [])), log: () => get('log', []), feed, ingest: (t, now = Date.now()) => ingest(t, now), evaluate: () => evaluate(Date.now()), isList, site: PHOTON ? 'photon' : 'gmgn'};
+    board: () => VTCore.monStats(get('log', [])), log: () => get('log', []), aiCopy, aiLog, aiBoard: () => VTCore.pickStats(get('picks', [])), picks: () => get('picks', []), feed, ingest: (t, now = Date.now()) => ingest(t, now), evaluate: () => evaluate(Date.now()), isList, site: PHOTON ? 'photon' : 'gmgn'};
 })();
 // The monitor's list, used by the Scan tab on GMGN and by the dock on Photon. R = the CSS root ("#vts-root" / "#vts-dock").
 const MON_CSS = R => `
-${R} .mon-head{display:flex;align-items:center;gap:6px;margin:0 0 8px}
+${R} .mon-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0 0 8px}
+${R} .mon-ai{display:grid;gap:6px;margin:0 0 8px;padding:8px;border-radius:8px;border:1px solid var(--line2);background:var(--card)}
+${R} .mon-ai textarea{width:100%;min-height:70px;resize:vertical;box-sizing:border-box;padding:6px;border-radius:6px;border:1px solid var(--line2);background:var(--well);color:var(--text);font:500 11px/1.4 var(--mono)}
+${R} .mon-ai div{display:flex;gap:6px;align-items:center}
+${R} .mon-ai button{padding:5px 8px;font-size:11px;border-radius:6px}
 ${R} .mon-head .lbl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
 ${R} .mon-head button{padding:5px 8px;font-size:11px;border-radius:6px}
 ${R} .mon-chips{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 8px}
@@ -1825,8 +1894,11 @@ function monUI(box, opts) {
   const M = VTMon, el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
   const usd = n => !(n > 0) ? '—' : n >= 1e6 ? '$' + (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? '$' + (n / 1e3).toFixed(1) + 'K' : '$' + Math.round(n), sg = v => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(Math.abs(v) < 10 ? 1 : 0) + '%';
   const head = el('div', 'mon-head'), title = el('span', 'lbl', 'Monitor'), bRef = el('button', '', '⟳ Refresh'), bCopy = el('button', '', 'Copy JSON'), chips = el('div', 'mon-chips'), note = el('p', 'mon-note'), list = el('div', 'mon-list'), board = el('div', 'mon-board');
-  bRef.type = bCopy.type = 'button'; bRef.title = 'Read the page again, drop coins not seen for 5 min and pull fresh numbers from DEX Screener';
-  head.append(title, bRef, bCopy); box.replaceChildren(head, chips, note, list, board);
+  const bAi = el('button', '', 'Copy for AI'), bPick = el('button', '', 'Log AI picks'), aiBox = el('div', 'mon-ai'), aiTa = el('textarea'), aiRow = el('div'), aiSave = el('button', '', 'Save picks'), aiCancel = el('button', '', 'Cancel'), aiMsg = el('span', 'mon-note');
+  bRef.type = bCopy.type = bAi.type = bPick.type = aiSave.type = aiCancel.type = 'button'; bRef.title = 'Read the page again, drop coins not seen for 5 min and pull fresh numbers from DEX Screener';
+  bAi.title = 'Copy the list with fixed instructions for a chat agent (Grok etc.): it answers PICK <mint> | reason, at most 2'; bPick.title = 'Paste the agent\'s answer: its picks are checked 1 h and 4 h later against coins from the same list it did not pick';
+  aiTa.placeholder = 'Paste the agent\'s answer here (lines like: PICK <mint> | reason)'; aiRow.append(aiSave, aiCancel, aiMsg); aiBox.append(aiTa, aiRow); aiBox.hidden = true;
+  head.append(title, bRef, bCopy, bAi, bPick); box.replaceChildren(head, aiBox, chips, note, list, board);
   if (!M) { note.textContent = 'The monitor runs on GMGN and Photon pages.'; return {render() {}}; }
   const FILTERS = [['all', 'All (3 Pads)'], ['pump', 'Pumpfun'], ['bonk', 'Bonk'], ['stonk', 'Stonk.fun'], ['wake', 'Waking'], ['prime', 'Score 4+'], ['smart', 'Smart buys']];
   let filter = GM_getValue('vts3.mon.filter', 'all'), inside = false, said = '';
@@ -1837,6 +1909,15 @@ function monUI(box, opts) {
   list.addEventListener('pointerleave', () => { inside = false; render(false); });
   bRef.onclick = async () => { bRef.disabled = true; bRef.textContent = 'Refreshing…'; try { const r = await M.refresh(); said = 'Refreshed ' + new Date().toLocaleTimeString() + ' · ' + r.shown + ' coins, ' + r.waking + ' waking'; } catch (_) { said = 'Refresh failed'; } bRef.disabled = false; bRef.textContent = '⟳ Refresh'; render(true); };
   bCopy.onclick = () => { opts.copy(JSON.stringify((typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).__MY_TRENCH_ALPHA__ || [], null, 2)); bCopy.textContent = 'Copied'; setTimeout(() => { bCopy.textContent = 'Copy JSON'; }, 1500); };
+  if (M) {
+    bAi.onclick = () => { const txt = M.aiCopy(); opts.copy(txt); bAi.textContent = 'Copied ' + (txt.split('\n').length - 3) + ' coins'; setTimeout(() => { bAi.textContent = 'Copy for AI'; }, 1800); };
+    let aiHide = 0;
+    bPick.onclick = () => { clearTimeout(aiHide); aiBox.hidden = !aiBox.hidden; aiMsg.textContent = ''; if (!aiBox.hidden) aiTa.focus(); };
+    aiCancel.onclick = () => { aiBox.hidden = true; aiTa.value = ''; };
+    aiSave.onclick = () => { const r = M.aiLog(aiTa.value);
+      if (!r.picks.length) { aiMsg.textContent = r.none ? 'The agent picked nothing. Nothing saved.' : 'No coin from the copied list found in that answer (copy the list first, then paste the answer).'; return; }
+      aiMsg.textContent = 'Saved ' + r.picks.map(p => '$' + (p.s || p.m.slice(0, 4))).join(', ') + ' (+' + r.ctl + ' comparison). Checked in 1 h and 4 h.'; aiTa.value = ''; render(true); clearTimeout(aiHide); aiHide = setTimeout(() => { aiBox.hidden = true; }, 2500); };
+  }
   const cards = new Map(), keep = w => (filter === 'pump' || filter === 'bonk' || filter === 'stonk') ? w.pad === filter : filter === 'wake' ? w.ev.wake : filter === 'prime' ? w.ev.score >= 4 : filter === 'smart' ? w.smart >= 1 : true;
   // Where a card leads. Photon: the row's own link (always the coin), else the pool page. GMGN: the token page.
   const linkOf = w => opts.site === 'photon' ? (w.href || (w.pool || w.dexPair ? 'https://photon-sol.tinyastro.io/en/lp/' + (w.pool || w.dexPair) : w.mint ? 'https://gmgn.ai/sol/token/' + w.mint : '#')) : (w.mint ? 'https://gmgn.ai/sol/token/' + w.mint : '#');
@@ -1890,6 +1971,11 @@ function monUI(box, opts) {
     const few = b.wake[10].n < 100 || b.ctl[10].n < 100;
     board.replaceChildren(el('span', 'lbl', 'Scoreboard · what flagged coins did next'), line('Flagged waking:', b.wake), line('Seen, not flagged:', b.ctl),
       el('div', '', (few ? 'Too few to judge yet (about 100 of each needed). ' : '') + 'If the two lines look the same, the flag adds nothing. Change in market cap, from DEX Screener; coins it does not list are left out.'));
+    const a = M.aiBoard();
+    if (a.pick.seen) { const f = (m, r) => r.n ? (m === 60 ? '1 h' : '4 h') + ': median ' + sg(r.median) + ', ' + Math.round(r.up) + '% higher' + (r.rug >= 1 ? ', ' + Math.round(r.rug) + '% down 80%+' : '') + ' (' + r.n + ')' : (m === 60 ? '1 h' : '4 h') + ': none checked yet';
+      const ln = (label, x) => { const d = el('div'); d.append(el('b', '', label + ' '), f(60, x[60]) + ' · ' + f(240, x[240])); return d; };
+      board.append(el('span', 'lbl', 'AI picks · ' + a.pick.seen + ' logged'), ln('AI picked:', a.pick), ln('Same list, not picked:', a.ctl),
+        el('div', '', (a.pick[60].n < 50 ? 'Too few to judge yet (50+ picks). ' : '') + 'Checks run while a GMGN or Photon tab is open; a check more than 2 h late is skipped.')); }
   }
   M.on(force => render(force));
   render(true);
@@ -2621,7 +2707,7 @@ const PANEL_CSS = String.raw`/* ================================================
   #vts-root .dial .side{font-size:7.5px;letter-spacing:0;padding:2px 4px}
 }
 /* ===================== 4.9: verdict bar, Scan tab, small additions ===================== */
-#vts-root .brand::after{content:"4.9.3"}
+#vts-root .brand::after{content:"4.9.4"}
 #vts-root .tabs button{letter-spacing:.09em;padding-left:2px;padding-right:2px}
 #vts-root .regime{flex:none;padding:2px 6px;border-radius:5px;border:1px solid var(--line2);font:800 9px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted);white-space:nowrap}
 #vts-root .regime.hot{border-color:var(--buy-line);background:var(--buy-bg);color:var(--buy)}
