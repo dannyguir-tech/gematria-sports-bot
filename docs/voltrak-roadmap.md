@@ -1,7 +1,7 @@
 # VolTrak: decisions, design notes and roadmap
 
-Everything agreed in the planning conversation, in one place. **Status:** only the userscript exists. The worker, database,
-harness, paper trading, optimization loop and live engine below are designs; nothing of them is built yet.
+Everything agreed in the planning conversation, in one place. **Status:** the userscript and the backtest engine exist.
+The worker, database, harness, paper trading, optimization loop and live engine below are designs; not built yet.
 
 ## 1. Where things stand
 
@@ -9,6 +9,9 @@ harness, paper trading, optimization loop and live engine below are designs; not
   - Discord → GMGN handoff, live panel, chain checks (Helius key), GMGN data, verdict bar, monitor (GMGN Scan tab,
     Photon dock), backtest report with a table per rule, CSV export.
   - 4.9.3 was built on the user's own 4.9.2 (4.9.0 + a launchpad filter added outside this repo).
+- **Backtest engine** (`engine/`, see `engine/README.md`): point-in-time features, rules with safety vetoes, exit
+  simulation (runner / steady), day-by-day portfolio, random-coin baseline, filter ablation, Markdown report.
+  Runs on fake coins now; waiting for real data from the backfill. 13 tests (`node --test engine/test/engine.test.mjs`).
 - **Tests:** `node --test test/voltrak-core.test.mjs` (37 tests). Browser checks were run on simulated pages only: the real
   data sites are blocked from the build environment.
 
@@ -54,6 +57,11 @@ The worker below closes 1 and 2 (timed `veto_events`).
 
 ## 5. Build order
 
+Revised after "is this overkill": build only what proves or disproves an edge first.
+
+0. **Backtest on past coins** (done: engine; next: backfill 2–4 weeks of Pumpfun / Bonk / Stonk.fun launches from
+   Dune or Helius into the engine's JSONL format). Goals agreed with the user: no rugs (rug rate < 5%), strong coins,
+   ≥ 70% green days after costs, worst day ≥ −10%, 2–5% of bankroll per trade, daily loss stop.
 1. **Collector worker** (no trading): every Pumpfun / Bonk / Stonk.fun launch through cheap filters, snapshots at fixed
    ages, 1-in-20 sample of rejects, per-stage counts.
 2. **Fake Helius harness** to break the worker before mainnet.
