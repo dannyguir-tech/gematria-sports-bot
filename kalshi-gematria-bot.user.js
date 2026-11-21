@@ -240,7 +240,7 @@
     ];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
-      const text = el ? ownText(el) || el.textContent.trim() : '';
+      const text = el ? headingText(el) : '';
       if (text) {
         return text;
       }
@@ -248,13 +248,12 @@
     return '';
   }
 
-  // Text directly inside the element, skipping nested elements such as
-  // Kalshi's event breadcrumb link inside the market <h1>.
-  function ownText(el) {
-    return Array.from(el.childNodes)
-      .filter((node) => node.nodeType === Node.TEXT_NODE)
-      .map((node) => node.textContent)
-      .join(' ')
+  // Heading text without nested links, e.g. Kalshi's event breadcrumb
+  // ("W50 Funchal · Quarterfinal") inside the market <h1>.
+  function headingText(el) {
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('a').forEach((link) => link.remove());
+    return (clone.textContent.trim() ? clone.textContent : el.textContent)
       .replace(/\s+/g, ' ')
       .trim();
   }
