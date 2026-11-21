@@ -202,6 +202,30 @@ nightly: freeze dataset → sweep → walk-forward → gates → shadow (3–7 d
   previous signature on two providers.
 - Pause entries if < ~70% of the last 20 orders landed, or the tip floor stays above the cap for a minute.
 
+**Leader schedule and routing** (aim: land reliably within a slot or two, not beat searchers)
+- In memory: leader schedule per epoch (cached; 4 slots per leader), validator network addresses (refreshed every few
+  minutes), which leaders run Jito, and the current slot from slot subscriptions on two providers, with the worker's
+  measured lag behind the chain corrected for.
+- Next leaders run Jito → bundle to the Jito block engine region nearest that leader (leader IP → region). Otherwise →
+  staked connection (e.g. Helius Sender) with the same tight limit; no raw unstaked sends.
+- Send to the current and next leader; skip a leader whose window ends before arrival (measured delay); fresh blockhash
+  and short validity on every send. Server near Frankfurt, Amsterdam or New York. Log aimed slot vs landed slot per route.
+
+**Slippage against toxic flow (PumpSwap)**
+- limit = own price impact (exact, from reserves and fee) + drift buffer (recent volatility × √expected landing time)
+  + fee; capped by a share of expected edge and the 3–5% hard cap.
+- Pool toxicity: observed sandwiches on the pool (same wallet before and after a trade in one slot), share of MEV-tagged
+  wallets, volatility. Higher → smaller size, tighter limit; above a threshold → skip. Private routing only.
+- Every fill logs expected vs actual; a route or pool that keeps filling at the minimum out is flagged and avoided.
+
+**Rent reclamation**
+- Full sell: close-account instruction inside the sell transaction (atomic, rent back at once).
+- Dust: background sweeper in the lowest-priority queue, only when no trade is in flight, minimal fee, ~10–20 accounts
+  per transaction (burn dust + close); skip open positions, coins traded in the last hour, and Token-2022 accounts with
+  withheld fees until cleared.
+- Signer allows close-account only with rent returned to the trading wallet. Rent paid and returned count in net profit.
+  (0.00203928 SOL is a standard token account; Token-2022 accounts with extensions cost more.)
+
 **Keys**
 - Separate trading wallet with a small float; profits auto-swept to one cold address; top-ups manual or capped per day.
 - Separate signing service: the worker sends structured orders; the signer builds the transaction and enforces allowed
