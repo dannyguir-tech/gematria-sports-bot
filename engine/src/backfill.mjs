@@ -61,6 +61,20 @@ const TX_OPTS = { encoding: 'json', maxSupportedTransactionVersion: 0, commitmen
 const EXT_MAP = { transferHook: 'transferHook', permanentDelegate: 'permanentDelegate', nonTransferable: 'nonTransferable',
   defaultAccountState: 'defaultAccountState', pausableConfig: 'pausable', pausable: 'pausable' };
 
+// Mint settings from the mint account (current state: a revoked authority can't come back, so "null" is final).
+export async function fetchMintInfo(rpc, mint) {
+  const acc = await rpc('getAccountInfo', [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+  const info = acc?.value?.data?.parsed?.info;
+  if (!info) return null;
+  const ext = info.extensions || [];
+  return {
+    mintAuthority: info.mintAuthority || null, freezeAuthority: info.freezeAuthority || null,
+    program: acc.value.owner === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' ? 'token2022' : 'spl',
+    extensions: ext.map(x => EXT_MAP[x.extension]).filter(Boolean),
+    transferFeeBps: ext.find(x => x.extension === 'transferFeeConfig')?.state?.newerTransferFee?.transferFeeBasisPoints || 0,
+  };
+}
+
 export async function fetchCoin(rpc, launch, { windowMin = 360, concurrency = 4 } = {}) {
   const ctx = await rpc('getTransaction', [launch.signature, TX_OPTS]);
   const create = eventsFromTx(ctx).find(e => e.kind === 'create');
@@ -91,16 +105,7 @@ export async function fetchCoin(rpc, launch, { windowMin = 360, concurrency = 4 
   });
 
   let mintInfo = null;
-  try {
-    const acc = await rpc('getAccountInfo', [create.mint, { encoding: 'jsonParsed' }]);
-    const info = acc?.value?.data?.parsed?.info;
-    if (info) mintInfo = {
-      mintAuthority: info.mintAuthority || null, freezeAuthority: info.freezeAuthority || null,
-      program: acc.value.owner === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb' ? 'token2022' : 'spl',
-      extensions: (info.extensions || []).map(x => EXT_MAP[x.extension]).filter(Boolean),
-      transferFeeBps: (info.extensions || []).find(x => x.extension === 'transferFeeConfig')?.state?.newerTransferFee?.transferFeeBasisPoints || 0,
-    };
-  } catch { /* leave null: the report counts coins without mint checks */ }
+  try { mintInfo = await fetchMintInfo(rpc, create.mint); } catch { /* leave null: the report counts coins without mint checks */ }
 
   return {
     mint: create.mint, pad: 'pump', name: create.name, symbol: create.symbol, creator: create.user,

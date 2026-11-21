@@ -1,0 +1,23 @@
+# systemd unit for a plain Linux server. Install: see bot/DEPLOY.md (option A).
+[Unit]
+Description=VolTrak paper bot (no real money)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=voltrak
+WorkingDirectory=/opt/voltrak
+EnvironmentFile=/etc/voltrak-bot.env
+ExecStart=/usr/bin/node bot/bin/run.mjs
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/voltrak
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

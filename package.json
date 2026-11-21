@@ -1,0 +1,12 @@
+{
+  "name": "voltrak",
+  "private": true,
+  "description": "VolTrak userscript, backtest engine and paper bot. No dependencies.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/voltrak-core.test.mjs engine/test/*.test.mjs bot/test/*.test.mjs",
+    "bot": "node bot/bin/run.mjs",
+    "backtest": "node engine/bin/backtest.mjs",
+    "backfill": "node engine/bin/backfill.mjs"
+  }
+}

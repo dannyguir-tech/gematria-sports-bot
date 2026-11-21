@@ -51,6 +51,10 @@ Regression tests for its pure core (`VTCore`): `node --test test/voltrak-core.te
 - **AI picks scoreboard**: what the picks did 1 hour and 4 hours later (median change, share higher, share down 80%+), against the not-picked coins. Checks run while a GMGN or Photon tab is open; a check more than 2 hours late is skipped. About 50 picks are needed before it means anything.
 - The agent never trades and nothing is sent anywhere: you copy and paste by hand.
 
+### Paper bot (`bot/`)
+
+Runs 24/7 on a server: watches every new Pumpfun launch, applies the engine's rules, paper trades with the engine's exits (no wallet, no real money), sends Telegram alerts and a daily report, and saves every finished coin for the backtest. `npm test` runs everything. Deploy guide: `bot/DEPLOY.md`.
+
 ### Backtest engine (`engine/`)
 
 Separate from the userscript: tests whether rules that scan new Pumpfun / Bonk / Stonk.fun coins make money after costs, day by day, against random coins. Runs on fake coins now; `engine/bin/backfill.mjs` pulls real past Pumpfun coins with a Helius key. See `engine/README.md`.

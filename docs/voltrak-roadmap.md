@@ -14,7 +14,12 @@ The worker, database, harness, paper trading, optimization loop and live engine 
 - **Backtest engine** (`engine/`, see `engine/README.md`): point-in-time features, rules with safety vetoes, exit
   simulation (runner / steady), day-by-day portfolio, random-coin baseline, filter ablation, Markdown report.
   Runs on fake coins now; waiting for real data from the backfill. 13 tests (`node --test engine/test/engine.test.mjs`).
-- **Tests:** `node --test test/voltrak-core.test.mjs` (40 tests). Browser checks were run on simulated pages only: the real
+- **Paper bot** (`bot/`, deploy guide `bot/DEPLOY.md`): live Pumpfun feed (logs or Helius transactions mode,
+  reconnects, stale watchdog), coin book, the engine's rules every 30 s, paper desk with the agreed limits and the
+  engine's exit code (shared `makePosition`), Telegram alerts + daily report, JSONL events / daily / collected coins,
+  state save + restore, `/health` and `/status`. Dockerfile and systemd unit. No wallet. 6 tests with a fake websocket.
+  Hosting: Devin sets it up on an always-on server (Devin itself is not a host); the owner types the keys.
+- **Tests:** `npm test` (62: 40 userscript, 16 engine, 6 bot). Browser checks were run on simulated pages only: the real
   data sites are blocked from the build environment.
 
 ## 2. Standing decisions

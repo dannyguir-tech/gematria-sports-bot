@@ -1,5 +1,6 @@
-// Exit simulation for one position on the real trade path after entry.
-// Our own order is not fed back into the path (fine for small sizes; noted in the report).
+// Exits for one position. makePosition() is driven trade by trade (and by the clock): the backtest replays past
+// trades through it, the live paper bot feeds it trades as they arrive. One piece of code, so both always agree.
+// Our own order is not fed back into the price path (fine for small sizes; noted in the report).
 import { buyOut, sellOut, spot, padConfig } from './curve.mjs';
 
 const MIN = 60_000;
@@ -21,7 +22,7 @@ export const DEFAULT_COSTS = {
 
 // Rug detector: price down rugDrop or more from its high over the last window (the price just before the
 // window counts, so a single dump trade after a quiet minute is still caught).
-function rugWatch(costs, t0, s0) {
+export function rugWatch(costs, t0, s0) {
   const win = [[t0, s0]];
   return (t, s) => {
     let hi = s;
@@ -32,56 +33,68 @@ function rugWatch(costs, t0, s0) {
   };
 }
 
-export function simulateTrade(coin, entryT, size, policy = POLICIES.runner, costs = DEFAULT_COSTS) {
-  const fee = padConfig(coin.pad).fee, trades = coin.trades;
-  let j = 0; while (j < trades.length && trades[j].t <= entryT) j++;
-  const cfg = padConfig(coin.pad);
-  let vSol = j > 0 ? trades[j - 1].vSol : cfg.vSol0, vTok = j > 0 ? trades[j - 1].vTok : cfg.vTok0;
-  const entrySpot = spot(vSol, vTok);
-  let tokens = buyOut(vSol, vTok, size, fee) * (1 - costs.entrySlip);
-  let proceeds = -costs.txSol, peakM = 1, tpDone = false, rugSeen = false, reason = null, exitT = null, txs = 1;
-  const isRug = rugWatch(costs, entryT, entrySpot);
+// A position opened at entryT on reserves {vSol, vTok}. Returns events as they happen:
+// {type: 'partial', t, sol} after the take-profit sale, {type: 'exit', t, reason} when closed.
+export function makePosition({ pad, entryT, vSol, vTok, size, policy = POLICIES.runner, costs = DEFAULT_COSTS }) {
+  const fee = padConfig(pad).fee, entrySpot = spot(vSol, vTok), isRug = rugWatch(costs, entryT, entrySpot);
   const earlyMs = policy.earlyMin * MIN, maxMs = policy.maxHoldMin * MIN;
-
-  const sellAll = (t, why, value) => {
-    proceeds += (value ?? sellOut(vSol, vTok, tokens, fee) * (1 - costs.exitSlip)) - costs.txSol;
-    txs++; tokens = 0; exitT = t; reason = why;
+  const p = { entryT, size, entrySpot, tokens: buyOut(vSol, vTok, size, fee) * (1 - costs.entrySlip), proceeds: -costs.txSol,
+    peakM: 1, tpDone: false, rugSeen: false, reason: null, exitT: null, txs: 1, vSol, vTok, open: true };
+  const sellValue = tok => sellOut(p.vSol, p.vTok, tok, fee) * (1 - costs.exitSlip);
+  const close = (t, reason, value) => {
+    p.proceeds += (value ?? sellValue(p.tokens)) - costs.txSol; p.txs++; p.tokens = 0; p.exitT = t; p.reason = reason; p.open = false;
+    return { type: 'exit', t, reason };
   };
+  // Time rules: fire at their deadline, on the last known price.
+  function onClock(now) {
+    if (!p.open) return null;
+    if (!p.tpDone && p.peakM < 1 + policy.earlyNeed && now > entryT + earlyMs) return close(entryT + earlyMs, 'noMove');
+    if (now > entryT + maxMs) return close(entryT + maxMs, 'maxHold');
+    return null;
+  }
+  function onTrade(tr) {
+    if (!p.open) return [];
+    const timed = onClock(tr.t); if (timed) return [timed];
+    p.vSol = tr.vSol; p.vTok = tr.vTok;
+    const s = spot(p.vSol, p.vTok), m = s / entrySpot;
+    if (m > p.peakM) p.peakM = m;
+    if (isRug(tr.t, s)) { p.rugSeen = true; return [close(tr.t, 'rug', costs.rugLossFull ? 0 : undefined)]; }
+    if (m <= 1 + policy.stop) return [close(tr.t, 'stop')];
+    const out = [];
+    if (!p.tpDone && m >= 1 + policy.tp) {
+      const part = p.tokens * policy.tpFrac, sol = sellValue(part);
+      p.proceeds += sol - costs.txSol; p.txs++; p.tokens -= part; p.tpDone = true;
+      out.push({ type: 'partial', t: tr.t, sol });
+    }
+    if (p.tpDone && m <= p.peakM * (1 - policy.trail)) out.push(close(tr.t, 'trail'));
+    return out;
+  }
+  // No more trades (backtest data ended / coin went quiet): close when the time rule would have fired.
+  function finish(reason = 'quiet') {
+    if (!p.open) return null;
+    return close(!p.tpDone && p.peakM < 1 + policy.earlyNeed ? entryT + earlyMs : entryT + maxMs, reason);
+  }
+  const markValue = () => p.open ? p.proceeds + sellValue(p.tokens) : p.proceeds;
+  const result = () => { const pnl = p.proceeds - size;
+    return { entryT, exitT: p.exitT, size, pnl, ret: pnl / size, reason: p.reason, rug: p.reason === 'rug', rugSeen: p.rugSeen, peakM: p.peakM, txs: p.txs, open: p.open }; };
+  const exitNow = (t, reason) => (p.open ? close(t, reason) : null); // sell everything at the last known price
+  return { onTrade, onClock, finish, exitNow, markValue, result, state: p };
+}
 
-  for (let k = j; k < trades.length && tokens > 0; k++) {
-    const tr = trades[k];
-    // Time rules fire on the clock, before the next trade moves the price.
-    if (!tpDone && peakM < 1 + policy.earlyNeed && tr.t > entryT + earlyMs) { sellAll(entryT + earlyMs, 'noMove'); break; }
-    if (tr.t > entryT + maxMs) { sellAll(entryT + maxMs, 'maxHold'); break; }
-    vSol = tr.vSol; vTok = tr.vTok;
-    const s = spot(vSol, vTok), m = s / entrySpot;
-    if (m > peakM) peakM = m;
-    if (isRug(tr.t, s)) {
-      rugSeen = true;
-      if (costs.rugLossFull) { sellAll(tr.t, 'rug', 0); break; }
-      sellAll(tr.t, 'rug'); break;
-    }
-    if (m <= 1 + policy.stop) { sellAll(tr.t, 'stop'); break; }
-    if (!tpDone && m >= 1 + policy.tp) {
-      const part = tokens * policy.tpFrac;
-      proceeds += sellOut(vSol, vTok, part, fee) * (1 - costs.exitSlip) - costs.txSol; txs++;
-      tokens -= part; tpDone = true;
-    }
-    if (tpDone && m <= peakM * (1 - policy.trail)) { sellAll(tr.t, 'trail'); break; }
-  }
-  if (tokens > 0) {
-    // No more trades: the coin went quiet. Exit at the last known price when the time rule would have fired.
-    const t = !tpDone && peakM < 1 + policy.earlyNeed ? entryT + earlyMs : entryT + maxMs;
-    sellAll(t, 'quiet');
-  }
+export function simulateTrade(coin, entryT, size, policy = POLICIES.runner, costs = DEFAULT_COSTS) {
+  const trades = coin.trades, cfg = padConfig(coin.pad);
+  let j = 0; while (j < trades.length && trades[j].t <= entryT) j++;
+  const vSol = j > 0 ? trades[j - 1].vSol : cfg.vSol0, vTok = j > 0 ? trades[j - 1].vTok : cfg.vTok0;
+  const pos = makePosition({ pad: coin.pad, entryT, vSol, vTok, size, policy, costs });
+  for (let k = j; k < trades.length && pos.state.open; k++) pos.onTrade(trades[k]);
+  pos.finish('quiet');
+  const r = pos.result();
   // Rug rate counts any rug within the holding window, even after we already left.
-  if (!rugSeen) {
-    const watch = rugWatch(costs, entryT, entrySpot);
+  if (!r.rugSeen) {
+    const watch = rugWatch(costs, entryT, pos.state.entrySpot), maxMs = policy.maxHoldMin * MIN;
     for (let k = j; k < trades.length && trades[k].t <= entryT + maxMs; k++) {
-      const tr = trades[k];
-      if (watch(tr.t, spot(tr.vSol, tr.vTok))) { rugSeen = true; break; }
+      if (watch(trades[k].t, spot(trades[k].vSol, trades[k].vTok))) { r.rugSeen = true; break; }
     }
   }
-  const pnl = proceeds - size;
-  return { mint: coin.mint, entryT, exitT, size, pnl, ret: pnl / size, reason, rug: reason === 'rug', rugSeen, peakM, txs };
+  return { mint: coin.mint, ...r };
 }
