@@ -237,6 +237,65 @@ nightly: freeze dataset → sweep → walk-forward → gates → shadow (3–7 d
   non-trade transfer. Devin never gets the production key.
 - Test with a fake Jito (rejects, throttling, tip spikes, expiry, late landing), then mainnet with a tiny float.
 
+## 15b. Disaster recovery
+
+**Crash recovery (worker dies after sending a bundle)**
+- Write-ahead order log in Postgres: `INTENT → SIGNED → SENT → LANDED | FAILED | EXPIRED`. Each step is committed before the
+  next action. SIGNED stores the signature, the raw signed transaction, the blockhash and its `lastValidBlockHeight`.
+  A Solana signature is the transaction's ID, so it is known before sending.
+- One open order per (wallet, coin, side): a unique partial index makes a second buy impossible even if two code paths race.
+- Single writer: the worker holds a Postgres advisory lock (lease); a restarted process waits until the old one's lock is
+  gone, so a zombie and a new process never trade at the same time. The signer refuses orders without the current lease.
+- On boot, state = RECOVERING (a circuit-breaker state): no new entries until reconciliation finishes; exits allowed.
+- Reconcile in ~3–4 RPC calls, not one per order:
+  1. All unfinished signatures in one `getSignatureStatuses` call (up to 256, with transaction history search).
+     Found and successful → LANDED; found with an error → FAILED.
+  2. Not found and the chain's block height is past `lastValidBlockHeight` → EXPIRED: it can never land, safe to retry
+     with a new transaction. Not found and still valid → resend the **same** signed bytes (idempotent) and wait until it
+     lands or expires. Never sign a new transaction for an order whose old one can still land. Recent blockhashes only,
+     no durable nonces (they never expire, so recovery could not prove a drop).
+  3. Truth check: wallet token balances (`getTokenAccountsByOwner`, classic and Token-2022) against the positions table.
+     Tokens with no position → "adopted" position, entry from the wallet's transaction history, normal exit rules.
+     Position with zero balance → closed, matched to the sell found in `getSignaturesForAddress` since the last checkpoint.
+- Sell size always comes from the on-chain balance at signing time, never from the database: no ghost sells, no
+  oversized sells.
+- Jito bundle status is only a hint (its in-flight status covers ~5 minutes); the signature status is the truth.
+- Harness: kill -9 the worker at every state boundary; checks: no double buy, no lost or invented position, no sell larger
+  than the balance, recovery finishes within ~10 s.
+
+**Copy-traders and wallet tracking**
+- Honest view: copy bots buy after we buy (that pushes the price up, which does not hurt the entry). The harm is on exits
+  (they sell alongside us) and in the signal getting crowded. Solana has no public mempool to front-run from, and orders go
+  privately through Jito / staked connections.
+- Detect it: "followers" = wallets buying the same coin within a few slots after us. The same follower on ≥ 3 of the last
+  10 trades → the wallet is tracked.
+- Wallet pool in the signer: table `wallets (id, pubkey, key_ref, status active | cooling | retired, opened_at)`. Each
+  position stays in one wallet from buy to sell. Rotation changes only which wallet new positions use; a retired wallet
+  can still exit, then is swept and closed. Limits apply per wallet **and** across all wallets (rotation must not
+  multiply them). Fee and rent float split across active wallets.
+- Funding without an obvious link: fund new wallets by withdrawal from an exchange account, and sweep profits back through
+  the exchange instead of straight to the cold wallet (a shared cold address links every hot wallet). No mixers (legal and
+  sanction risk; mixer-funded wallets also get flagged).
+- No fingerprints: no round sizes, no fixed tip, no fixed take-profit levels (split exits), small timing jitter on slow
+  "waking up" entries (never on exits).
+- Rotate on detection or every ~N trades, not on a fixed clock.
+
+**Load spikes (message rate × 10)**
+- Two lanes, two processes (or worker threads), two websocket connections:
+  - Exit lane: only coins we hold (pool accounts, holder / insider moves). Small by design; never shares a queue, CPU loop
+    or rate budget with discovery. Fallback: one `getMultipleAccounts` for all held pools every ~2 s if its socket lags.
+  - Discovery lane: new pairs and candidates.
+- Rate budget: token bucket with a reserved share (~40%) for exits and reconciliation; on 429s discovery backs off first.
+- Filter at the source (subscribe only to the launchpad programs / accounts needed); the socket reader only parses,
+  filters and stores the latest state per coin (updates for the same coin merge; nothing waits in an unbounded queue).
+- Shedding ladder by queue fill, slot lag and event-loop delay, with hysteresis:
+  - L1: merge updates, skip extra lookups for coins clearly failing stage 1.
+  - L2: raise stage-1 thresholds, drop events older than a few slots (stale signals are worthless).
+  - L3: disconnect discovery, Degraded breaker, no new entries; the exit lane is untouched.
+- Telemetry sheds too: raw-frame archive is dropped first, decisions and orders never.
+- Harness scenario: 10× message storm with a socket drop; checks: exit reaction time p99 unchanged, memory bounded,
+  no lost exit signal.
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
