@@ -296,6 +296,53 @@ nightly: freeze dataset → sweep → walk-forward → gates → shadow (3–7 d
 - Harness scenario: 10× message storm with a socket drop; checks: exit reaction time p99 unchanged, memory bounded,
   no lost exit signal.
 
+## 15c. Searcher competition, blast radius, telemetry without jitter
+
+**Tip auction (many bots on the same graduation tick or whale fill)**
+- Jito works like a sealed first-price auction among bundles that touch the same accounts. A bundle that loses costs
+  nothing: the tip sits in the same transaction as the swap, so it is paid only when the swap lands. The only way to lose
+  money on tips is to win and overpay (winner's curse).
+- Bid against the value *given that we win*, not the average value: in a contested race we tend to win when the others
+  valued it less. value_if_win = expected profit after fees and slippage at the position we would land in (first in block
+  vs later), measured from our own logs of contested trades.
+- Shade the bid: tip ≤ value_if_win × (N−1)/N (first-price rule of thumb), with N = competing bots seen recently on that
+  pool / event type; and never more than ~30–50% of value_if_win or the absolute cap.
+- Concede: if the expected winning tip (landed tips on the same kind of event, recent percentiles) is above that limit →
+  skip and log "conceded". Entries are one shot, no tip escalation. Only exits escalate, worth up to the loss avoided.
+- Feedback: each contested trade logs tip, landed or not, predicted and realized profit. If realized profit on won races
+  falls below predicted, shading increases automatically. If tips plus losses on contested trades are negative over the
+  last ~50 → stop contesting that event type.
+- Strategy: a co-located searcher wins the graduation tick. Our edge is in what they don't bid on (filters, slower
+  "waking up" coins, syndicate and migration analysis), where tips stay near the floor.
+
+**Blast radius (runaway loop from an optimizer bug or an agent)**
+Each layer works even if everything above it fails:
+1. Float: the hot wallet only holds what you accept losing in a day. Top-ups are manual. Nothing more can drain.
+2. Signer policy, outside the worker: per trade max, orders per minute / hour, open positions max, buys in a row without a
+   sell, net SOL out over a rolling 10 minutes. Breaking any → LOCKED, latched: only a human unlock (Telegram + passphrase).
+   With a hosted policy signer (e.g. Turnkey) the policy is enforced at the provider, so even root on the server can't
+   exceed it.
+3. Parameters from the optimizer are checked against hard bounds the signer owns; out of bounds → rejected. Devin never
+   gets production access.
+4. OS: signer is its own user, key file unreadable by the worker, policy file read-only to the worker, systemd limits,
+   firewall so only the signer path can send transactions.
+5. Watchdog on a second cheap machine: reads the wallet balance every few seconds; an unexplained drop of X% in 5 minutes
+   → revoke / stop the signer through its API and alert. A dead-man switch, independent of the main server.
+6. Kill switch: Telegram command and, as a last resort, revoking the key at the signer provider.
+- Worst case in 30 s with limits like 1 order / 2 s and 0.2 SOL per trade: a few trades, then latched.
+
+**Telemetry without slowing the event loop**
+- The hot path never does I/O, JSON or per-tick object creation: it writes fixed-size records into a preallocated ring
+  buffer (shared memory). If the buffer is full, it drops and counts, never waits.
+- A separate low-priority process (nice / ionice idle, other CPU cores) drains the buffer, batches it and writes Parquet
+  every ~60 s or ~100k rows. DuckDB only reads finished files, never inside the hot process.
+- Volume control: decisions and orders kept 100%; ticks become 1-second bars per coin; latencies go into histograms, with
+  full traces only sampled or around orders.
+- Main risk in Node is garbage collection, not disk: typed arrays, no allocation per tick, larger young generation.
+- Measured: event-loop delay p99 alert above ~5 ms; harness storm test with the writer running.
+- Honestly, sub-10 ms matters little here: network delay to the leader is tens of ms. If the hot path ever needs better,
+  port it to Rust.
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
