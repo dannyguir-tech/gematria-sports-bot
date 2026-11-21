@@ -238,6 +238,33 @@ nightly: freeze dataset → sweep → walk-forward → gates → shadow (3–7 d
   2 min. Below that: a risk penalty.
 - Blind spots: many-hop or mixer funding; old exchange withdrawals of random sizes. The live exit veto is the backstop.
 
+## 16b. Migration (graduation)
+
+Facts to verify against each program's published layout before coding: pump.fun graduates to **PumpSwap** (not Raydium)
+almost instantly; Bonk (Raydium LaunchLab) graduates to **Raydium CPMM**; Stonk.fun's mechanics are unknown.
+
+**States:** CURVE → NEAR_FILL (90%+) → COMPLETE (curve closed, trading frozen) → MIGRATING → POOL_VERIFIED → TRADING;
+STUCK (no verified pool within a timeout) → alert, no entries.
+
+- **Fill instant:** websocket subscription to the bonding-curve account; decode reserves and the `complete` flag on every
+  change. Fill % = 1 − real token reserves left ÷ starting real token reserves.
+- **Freeze:** cancel pending curve orders; send nothing and enter nothing in COMPLETE / MIGRATING.
+- **New pool before indexers:** PumpSwap and Raydium CPMM pool addresses are derived from known inputs (coin, SOL, pool
+  settings, program), so compute the address while on the curve and subscribe to it in advance. Backups: the migration
+  transaction in the coin's stream, PumpPortal's migration feed.
+
+**Pool verification (all must pass):** created by the official migration (allowed program, launchpad's migration account
+signed); at the precomputed address; created right after the curve completed with reserves matching the curve's final
+reserves minus the fee; LP burned or held by the lock program (LP mint supply and largest holders); no mint authority and
+no freeze authority; reject Token-2022 coins with transfer hooks, transfer fees or a permanent delegate. Trade only on the
+verified pool (pass it explicitly or restrict Jupiter to it). Four or five account reads, high-priority queue.
+
+**Hold / scalp / exit:** paper trade all three on every graduating coin and let the optimization loop decide:
+A) sell on the curve at 90–95% filled, B) hold through, C) buy the new pool's open (usually loses to snipers).
+Until then: never enter in the last ~10% of the curve; sell 50–75% at 90%+ filled, keep the rest on a tight stop restarted
+on the verified pool; no new entries until the pool is verified and the first post-migration sell-off has played out.
+Log per graduation: fill time, freeze length, verification time, first 30 min on the new pool, results of A, B and C.
+
 ## 17. Costs (from memory; check current prices)
 
 | Item | Start | Comfortable |
