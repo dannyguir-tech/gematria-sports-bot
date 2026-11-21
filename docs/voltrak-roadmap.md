@@ -485,6 +485,58 @@ Each layer works even if everything above it fails:
   strategy statistics and the optimization dataset; used only for execution metrics, measured in basis points with
   medians and percentiles (fixed costs reported separately, since they dominate tiny trades).
 
+## 15g. Launchpad adapters, location, the slippage formula
+
+**One parser, one adapter per launchpad**
+- The three launchpads are Pumpfun (graduates to PumpSwap), Bonk (built on Raydium LaunchLab, graduates to a Raydium
+  pool) and Stonk.fun (program and graduation path still to be confirmed from recorded transactions). Verify each
+  graduation and LP handling on recorded transactions before trusting it.
+- One worker. Each instruction is routed by its program ID to an adapter; accounts are recognised by their 8-byte
+  discriminator and decoded from layouts generated from the program's IDL (declarative, not hand-written parsers).
+- Adapter interface: program IDs; decode create / trade; curve state → {virtual and real reserves, fee, complete};
+  graduation detection → {new pool, pool program, LP mint, LP action: burned / locked / fee-key}; pool math for the
+  destination pool; expected LP handling and timings.
+- Adapters emit one shared event model: Launch, Trade, CurveProgress, GraduationStarted, PoolCreated, LpBurned / LpLocked,
+  Migrated. The migration state machine (section 16b), the rules and the database only see these events.
+- Unknown discriminator, layout mismatch or a program upgrade → that launchpad is marked unverified and its entries pause
+  (section 15f). Adding a launchpad = one adapter file + recorded fixtures; golden tests per adapter.
+
+**Location against co-located searchers**
+- We won't win speed races against co-located Rust searchers and don't try (section 15c). Being beaten in a race isn't
+  being front-run: min-out caps the damage and a bundle that misses its price fails at no cost. Sandwiches are prevented
+  by private routing and tight limits.
+- Server in Amsterdam or Frankfurt (Jito block engines there, a large share of stake in Europe), ~1–5 ms to the block
+  engine. Jito forwards bundles to the leader over its own network.
+- Optional small relays (~$5 each) in New York and Tokyo: hold signed transactions sent from the main worker and submit to
+  the local block engine / staked endpoint when the leader is nearer to them. Worth it only if the landing log shows
+  misses on far leaders.
+- Data latency matters more than send latency: same-region data provider first; a gRPC stream (Yellowstone / LaserStream)
+  instead of websockets if the funnel measures it as a bottleneck (costs more).
+
+**Slippage formula (constant product: PumpSwap, Raydium, and bonding curves on virtual reserves)**
+```
+x, y   reserves in / out (bonding curve: virtual reserves; out capped by real reserves)
+f      total fee share, a = Δx·(1−f) effective input
+quote  Δy = y·a / (x + a)                     (integer, rounded down; section 15d)
+impact I = 1 − (1−f)·x / (x + a)              (vs mid price; decides size, not tolerance)
+
+tolerance covers what changes between quote and landing:
+  drift   s_d = z·σ·√τ                         σ: EWMA volatility per √second of the pool, τ: expected landing time
+                                               for the route (from the landing log), z ≈ 1.65
+  crowd   s_c = 1 − x(x+a) / ((x+q')(x+q'+a))  q' = q·(1−f), q = same-direction volume expected ahead of us
+                                               (p75 per slot × landing slots, raised for toxic pools)
+  round   ε   = a few bps
+  s = s_d + s_c + ε
+  cap = min(hard cap 3–5%, κ · expected edge), κ ≈ 0.5
+  s > cap → skip the trade (don't widen)
+minOut = Δy · (10000 − ceil(s·10000)) / 10000   (integers)
+```
+- Sells use the same formula with token in, SOL out.
+- Example: x = 60 SOL, buy 0.5 SOL, f = 1%: I = 1.81%. σ = 0.8% / √s, τ = 0.8 s → s_d = 1.18%.
+  Calm (q = 0.3 SOL) → s_c = 0.98%, s ≈ 2.2% → trade. Crowded launch (q = 2 SOL) → s_c = 6.26%, above the cap → skip.
+  Making the order smaller barely changes the crowd term, so crowded moments are skipped, not traded smaller.
+- Every fill logs predicted vs actual; σ, τ and q are recalibrated from those logs.
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
