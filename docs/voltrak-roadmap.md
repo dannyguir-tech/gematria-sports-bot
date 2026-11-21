@@ -583,6 +583,61 @@ still land in the first ~150 blocks after restart (~1 min), at a price assumptio
 clock jump). Checks: no stale buy fills, no double spend, no timer fires on restart, no quote on pre-halt reserves, every
 rent account accounted for.
 
+## 15i. Zero-copy decoding, compute units, wash rings, off-box exits, migration buys
+
+Tier per item: [now] before any money, [live] before live money, [later] only if logs show it costs money (section on
+scope in the conversation: build the first tier first).
+
+**Zero-copy decoding [later]**
+- The plan is Node; Rust only if the hot path measures too slow (section 15c). Same ideas apply in both.
+- Websocket frames are JSON with base64 account data: JSON parsing allocates, so zero-copy only pays off on binary feeds
+  (gRPC / protobuf). Rust: pooled frame buffers, in-place parser (simd-json / sonic-rs) with borrowed strings, base64 into
+  a reused scratch buffer, per-frame arena reset after each frame, mimalloc / jemalloc, no logging allocations.
+- Fixed-layout accounts (8-byte discriminator + fixed fields, e.g. a bonding curve's reserves) are read in place:
+  `zerocopy` / `bytemuck` on `#[repr(C)]` structs with unaligned field types, or direct little-endian reads at known
+  offsets (`Buffer.readBigUInt64LE` in Node). Layouts and offsets come from the IDL and are checked by golden tests.
+  Variable-length Borsh fields (strings, vectors) can't be cast; only the fixed prefix that's needed is read.
+
+**Compute units [live]**
+- "Exact" isn't possible: state can change between estimate and execution (e.g. token account exists or not).
+- Profile table per (program, instruction path, token account exists?) built from landed transactions
+  (`computeUnitsConsumed`): limit = p99 + small margin. No simulation on the hot path; simulate (limit 1.4M, read
+  `unitsConsumed`) only for paths not in the table yet.
+- The fee is price × *requested* limit, so a tight limit is the main saving; smaller requests also schedule more easily.
+- An out-of-compute failure still pays the fee: alert if more than ~0.5% fail that way, then raise the margin.
+
+**Wash trading and circular funding [now, simple version]**
+- Only for coins that pass stage 1, and only their top ~30 buyers (bounded cost, cached).
+- Funding lookup up to 2–3 hops back; exchange hot wallets and big shared services are stop nodes (everyone is funded by
+  them, so they link nothing). Union-find clusters (section 16).
+- Wash signals: the same cluster on both buy and sell sides; round trips (a cluster buys and sells back within minutes,
+  net position ~0); SOL cycles A→B→C→A in a short window (bounded depth-first search, depth ≤ 4); fresh wallets funded
+  minutes before whose first trade is this coin; same sizes / same timing (the script's existing tape checks).
+- Output: organic volume = volume minus intra-cluster round trips. The demand pillar uses organic volume; organic share
+  below X% → reject.
+
+**Off-box dead man switch [live]**
+- Watchdog on a $5 server in another region (not a cron service with minute granularity).
+- Main worker sends a signed heartbeat every ~2 s. No heartbeat for ~20 s and the main box unreachable from two vantage
+  points → takeover in exit-only mode, Telegram alert.
+- Signing: the watchdog has its own credential at the hosted policy signer, whose policy allows only selling tokens the
+  wallet already holds for SOL into the same wallet: no buys, no transfers. A compromised watchdog can at worst sell.
+- Lease outside the main box (signer lock or a small hosted store) so the main worker, when it comes back, sees the
+  takeover and stays in RECOVERING until handed back. Sells are sized from the balance, so overlap can't oversell.
+- Exit policy: no instant dump. Fresh quotes, tightened stops, exit everything within N minutes with the normal
+  slippage cap; immediate exit on rug signals. Telegram "sell all" also goes through the watchdog.
+
+**Migration buys as a free oracle [live]**
+- Solana has no public mempool (Jito's was shut down in 2024): a bundle sent directly to Jito or a trusted staked sender
+  isn't visible before it lands. Never use RPCs or relays that sell order flow.
+- Swap and tip in one transaction (an unbundled tip can't be paid without the swap).
+- Jito's "don't front" marker account (verify current support), so nobody can be placed ahead of our transaction inside a
+  bundle.
+- Leader-aware sends: skip slots of leaders flagged for sandwiching (public MEV data), wait for the next leader.
+- Tight minimum out from the destination pool's exact starting price (known from the migration parameters).
+- Mostly moot: the plan doesn't buy in the migration block; it waits for LP verification (section 16b), so there's no
+  first-in-block race to leak.
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
