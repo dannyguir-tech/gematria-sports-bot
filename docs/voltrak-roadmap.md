@@ -390,6 +390,47 @@ Each layer works even if everything above it fails:
   against the program's own Rust code with random values up to u64 max; property tests (output never above reserves,
   round trip never profitable).
 
+## 15e. Split-brain providers, fragmented pools, profit sweeping
+
+**Providers disagree on the slot (A says N, B says N+12)**
+- 12 slots ≈ 5 s. Almost always one provider is lagging, not lying.
+- Each provider has its own cursor: latest confirmed slot, time since last update, rate of advance (~2.5 slots / s).
+  Engine slot = highest confirmed slot from a healthy provider. It never goes backwards.
+- A provider more than ~4 slots behind the engine slot is Degraded: its live events are tagged stale and used only for
+  gap fill. Execution keeps running on the healthy one; no halt.
+- Ahead or suspicious? A provider that jumps forward far faster than the chain can move, or that a third witness (a free
+  endpoint's `getSlot` every few seconds) does not back up, is quarantined instead.
+- No ghost slots: decisions use confirmed data only. An entry signal seen on one provider only is checked on the other
+  (`getSignatureStatuses`) before buying. Exit signals act on one provider (a false exit costs little, a missed one a lot).
+- Events from both providers are merged by signature (idempotent), ordered by slot then position in the block.
+- Entries need at least one provider fresh within ~2 slots of the engine slot; exits are always allowed. Both stale or
+  in disagreement → Degraded / Blind (section 11).
+
+**Fragmented pools after graduation**
+- Pool registry per coin. Canonical pool = the one the migration created (known address, section 16b). Other pools
+  (Meteora, Raydium, …) are untrusted until: liquidity above X SOL, LP burned or locked, some minimum age, real volume
+  from many wallets, pool owned by the expected program, correct mints.
+- Fair price comes from the canonical pool (or volume-weighted across trusted pools), never from an untrusted pool.
+- Minimum out is computed from the fair price minus our own price impact, not from the pool's own quote. A thin or
+  pushed pool then fails the minimum and the transaction just doesn't fill.
+- Routing: direct pool math (section 15d) or Jupiter restricted to trusted pools. Split across trusted pools only when it
+  beats a single pool after fees, all legs in one transaction (no leg can be picked off between transactions).
+- A pool trading more than ~X% away from the fair price is being arbitraged: don't trade into it.
+- Volume on untrusted pools is excluded from the demand pillar (likely wash).
+
+**Profit sweeping without linking wallets**
+- Everything on Solana is public. This hides wallets from copy bots, not from the exchange or tax authorities: every
+  sweep is logged in the database for taxes. No mixers or privacy pools (legal and sanction risk).
+- Route: hot wallet → exchange deposit address → (you) → cold wallet. Never hot → hot or hot → cold directly.
+- One exchange sub-account per hot wallet where the exchange offers it: a shared deposit address would link the wallets.
+- Funding: withdrawals from the exchange (its hot wallet funds millions of users, so it links nothing).
+- Sweeper lives in the signer. The only allowed destinations are the deposit addresses on an allowlist that only you can
+  change (approval + passphrase).
+- Not on a fixed schedule: sweep when the balance is above the float target by a margin, at a random time in a window of
+  hours, with non-round amounts, and preferably when a wallet is retired.
+- Exchange → cold: manual, or an exchange API key whose only withdraw address is the cold wallet (exchange whitelist),
+  kept on a different machine from the trading server.
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
