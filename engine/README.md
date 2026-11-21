@@ -11,6 +11,25 @@ node --test engine/test/engine.test.mjs                        # tests
 
 Writes `engine/out/report.md` (plain-language report) and `engine/out/result.json`.
 
+## Getting real coins (backfill)
+
+```
+HELIUS_API_KEY=your-key node engine/bin/backfill.mjs --check <a Pumpfun launch signature>   # verify decoding first
+HELIUS_API_KEY=your-key node engine/bin/backfill.mjs --days 14 --perDay 150 --out coins.jsonl
+node engine/bin/backtest.mjs --data coins.jsonl
+```
+
+- Lists Pumpfun launches from the history of Pumpfun's mint-authority account (touched only by launches), samples
+  `--perDay` per UTC day, then pulls each coin's bonding-curve transactions for its first 6 hours and decodes the
+  trade events (logs and self-CPI events). Mint settings come from the mint account.
+- Resumable (skips coins already in the output), rate-limited (`--rps`, default 8), retries 429 / 5xx.
+- Rough cost: 1 call per transaction plus paging; ~150 coins/day × 14 days is a few hundred thousand calls.
+- **Verify first:** the event layouts and the mint-authority address are from memory. Run `--check` on a known
+  launch and compare the printed trades with a block explorer before trusting a full run.
+- Pumpfun only for now. Bonk and Stonk.fun need their own decoders once their layouts are confirmed. Trades after
+  graduation (PumpSwap) are not pulled yet, so positions held through graduation exit at the last curve price.
+- No wallet-funding lookup yet, so the organic-volume filter is skipped on backfilled data.
+
 ## What it does
 
 1. **Scan.** Every coin is checked every 30 s from 2 to 120 minutes old, using only trades up to that moment

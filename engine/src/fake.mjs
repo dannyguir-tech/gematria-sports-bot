@@ -72,7 +72,7 @@ export function fakeCoin(rand, id, createdAt, type) {
     }
     if (rand() < pBuy) {
       if (type === 'pumpDump' && m < dumpAt && rand() < 0.5) buy(t, pumpers[Math.floor(rand() * pumpers.length)], size * 2);
-      else buy(t, rand() < 0.7 || !holders().length ? newWallet() : randomHolder(insiders), size);
+      else buy(t, (rand() < 0.7 ? null : randomHolder(insiders)) || newWallet(), size);
     } else {
       const x = type === 'pumpDump' && m >= dumpAt && rand() < 0.5 ? pumpers[Math.floor(rand() * pumpers.length)] : randomHolder(type === 'rug' ? insiders : null);
       if (x && x !== creator) sell(t, x, 0.3 + rand() * 0.7);
