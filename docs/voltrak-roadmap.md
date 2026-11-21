@@ -537,6 +537,52 @@ minOut = Δy · (10000 − ceil(s·10000)) / 10000   (integers)
   Making the order smaller barely changes the crowd term, so crowded moments are skipped, not traded smaller.
 - Every fill logs predicted vs actual; σ, τ and q are recalibrated from those logs.
 
+## 15h. Cluster halt and restart
+
+Context (from memory, verify): in the Feb 2024 outage (~5 h) validators restarted from an agreed slot with patched
+software (a hard fork from the last optimistically confirmed slot). What happened before that slot survived; anything
+seen only as processed after it was gone. No leverage here, so nothing can be liquidated; the real risks are stale signed
+buys landing after restart, timers firing at once, and quotes on pre-halt reserves.
+
+**Key fact:** a transaction's validity counts blocks, not time. No blocks during a halt → a buy signed before the halt can
+still land in the first ~150 blocks after restart (~1 min), at a price assumption hours old.
+
+**Detection: HALTED state (circuit breaker)**
+- Engine slot not advancing for ~10 s on both providers and the third witness, while they still answer (if they time out,
+  it's our network, not the cluster). Confirmed by the watchdog in another region.
+- On HALTED: freeze all sends (no resend spam: queued transactions could land later), pause every exit timer (rules run
+  on slot time, not wall-clock time, so a 5-minute rule doesn't fire the instant blocks resume), snapshot state, alert.
+
+**Stale buys can't land late**
+- Every buy carries a time bound: an on-chain assertion instruction (e.g. Lighthouse; verify current support) that fails
+  the transaction if the cluster clock is more than ~30 s past signing time. Clock time jumps forward after a halt, so a
+  pre-halt buy fails at no cost instead of filling. Slot-based bounds don't work here (slots don't move during a halt).
+- Without that instruction: entries stay frozen until the block height passes every in-flight buy's last valid height;
+  any that landed are adopted by reconciliation and exit normally.
+- Sells need no bound: sized from the balance, a late one can't oversell (section 15b).
+
+**Restart**
+1. Restart detected: slots advancing again at a normal rate, both providers agree, software / shred version changed.
+   Allow a rebase: the engine slot may go *back* to the restart slot. Everything seen after it that wasn't finalized is
+   re-verified.
+2. Reconcile (section 15b): one batch status call for all in-flight signatures, wallet balances against positions
+   (adopt / close), Jito bundle status ignored (expired anyway).
+3. Market state reset: every cached reserve, price, volatility and crowd estimate is dropped; all curve and pool accounts
+   re-read at confirmed (`getMultipleAccounts`, ~100 per call). Price = unknown until a few slots of real trades.
+4. Restart window (~5 min or N slots): no entries. Exits only on rug signals (dev selling, coordinated insider exit) or
+   rules evaluated on fresh state; tolerance uses post-restart volatility, so most trades get skipped rather than
+   dumped into a thin book. Emergency exits may raise the cap up to the position's value.
+5. Back to Healthy only after the window and the normal 2-clean-minutes rule (section 11).
+
+**Rent**
+- Token accounts are created inside the buy transaction (idempotent create); a failed buy creates nothing. Tips sit
+  inside the swap transaction, so a dead bundle pays nothing.
+- Orphan or empty token accounts from any path appear in the balance scan and are closed by the dust sweeper.
+
+**Harness:** halt scenario (blocks stop for 5 fake hours with orders in flight, restart from an earlier slot,
+clock jump). Checks: no stale buy fills, no double spend, no timer fires on restart, no quote on pre-halt reserves, every
+rent account accounted for.
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
