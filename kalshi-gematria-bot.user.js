@@ -21,12 +21,23 @@
       .reduce((sum, ch) => sum + (ch.charCodeAt(0) - 64), 0);
   }
 
-  function reducedValue(text) {
-    let n = ordinalValue(text);
+  function reduceNumber(n) {
     while (n > 9) {
       n = String(n).split('').reduce((sum, d) => sum + parseInt(d, 10), 0);
     }
     return n;
+  }
+
+  function reducedValue(text) {
+    return reduceNumber(ordinalValue(text));
+  }
+
+  function dateReducedValue(dateText) {
+    const digitSum = dateText
+      .split('')
+      .filter((ch) => ch >= '0' && ch <= '9')
+      .reduce((sum, d) => sum + parseInt(d, 10), 0);
+    return reduceNumber(digitSum);
   }
 
   function makePick(home, away, dateText) {
@@ -38,7 +49,7 @@
     let reason = '';
     let pick = '';
 
-    const dateRed = dateText ? reducedValue(dateText.replace(/-/g, '')) : null;
+    const dateRed = dateText ? dateReducedValue(dateText) : null;
 
     if (dateRed !== null) {
       if (homeRed === dateRed && awayRed !== dateRed) {
@@ -229,11 +240,22 @@
     ];
     for (const sel of selectors) {
       const el = document.querySelector(sel);
-      if (el && el.textContent.trim()) {
-        return el.textContent.trim();
+      const text = el ? headingText(el) : '';
+      if (text) {
+        return text;
       }
     }
     return '';
+  }
+
+  // Heading text without nested links, e.g. Kalshi's event breadcrumb
+  // ("W50 Funchal · Quarterfinal") inside the market <h1>.
+  function headingText(el) {
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll('a').forEach((link) => link.remove());
+    return (clone.textContent.trim() ? clone.textContent : el.textContent)
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   function init() {
