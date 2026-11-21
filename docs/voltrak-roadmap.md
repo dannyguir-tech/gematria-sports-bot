@@ -431,6 +431,60 @@ Each layer works even if everything above it fails:
 - Exchange → cold: manual, or an exchange API key whose only withdraw address is the cold wallet (exchange whitelist),
   kept on a different machine from the trading server.
 
+## 15f. Hardware-backed signing, malicious tokens, live canary
+
+**Signing with KMS / Nitro Enclaves / YubiHSM**
+- Threat model: an attacker with root on the VPS can't *copy* a key held in an HSM or enclave, but can still *ask it to
+  sign*. A key store that signs any bytes it's given stops theft, not a drain. The policy has to sit inside the same
+  protected boundary as the key.
+- Options, best fit first:
+  1. Hosted policy signer (e.g. Turnkey: keys in secure enclaves, policy engine checks each transaction). No hardware to
+     run; cost per their pricing.
+  2. AWS Nitro Enclave: an isolated VM with no network or disk; the parent instance (even root) can't read its memory.
+     The key is encrypted with KMS; the KMS key policy only decrypts for an enclave whose attested image hash (PCRs)
+     matches ours. The enclave decodes each Solana transaction, applies the policy (programs, destinations, amounts,
+     rate limits, latched lock) and only then signs. Needs an enclave-capable EC2 instance (roughly $70–150 / month,
+     check), not a $5 VPS.
+  3. AWS KMS alone: verify current Ed25519 support. Even if supported, KMS can't read Solana transactions, so it gives no
+     policy: an attacker signs a drain. Only useful inside option 2.
+  4. YubiHSM 2: supports Ed25519, but it's a USB device (needs our own hardware, not a VPS) and can't apply a
+     transaction policy either. Fine for the cold wallet, not for the hot path.
+- No "ephemeral session keys" are needed: the hot key is long-lived and stays in the enclave; the session between worker
+  and enclave is authenticated (vsock + attestation). Zero-knowledge proofs don't apply to this problem.
+- The small float (section 15c) stays the final limit whatever the signer is.
+
+**Malicious tokens and honeypots**
+- Premise check: Solana tokens don't carry their own bytecode. Pumpfun, Bonk and Stonk.fun mints use the shared SPL Token
+  / Token-2022 programs. The traps are in mint settings and fake launches, not custom contract code.
+- Static checks, one `getAccountInfo` on the mint (usually already in hand from the create transaction), reject if:
+  mint authority not revoked; freeze authority set; Token-2022 transfer hook, permanent delegate, non-transferable,
+  default-frozen accounts, pausable, or transfer fee above a small cap.
+- Launch provenance: the mint must be created by the launchpad program itself, with its curve account at the expected
+  address owned by that program. A mint that merely ends in "pump" or "bonk" but was made elsewhere → reject. After
+  graduation, pool owner program and mints are checked (sections 16b, 15e).
+- Sell simulation, only for coins about to be bought: simulate buy then sell of the received amount in sequence (Jito
+  `simulateBundle`, or local curve math for bonding curves). Sell fails or returns below X% → skip. Catches honeypots
+  whatever the mechanism; adds ~50–150 ms.
+- Upgradeable launchpad programs: watch the upgrade events of every program on our allowlist; an upgrade pauses entries
+  on that program until re-verified (the honeypot risk at the platform level).
+- Dev / funder history from the syndicate graph (section 16).
+
+**Live canary and shadow execution**
+- Shadow: every live decision also builds and simulates its transaction without sending it; logs expected fill and
+  compute units, compared later with the actual price at the target slot.
+- Canary: real sends with tiny amounts, on a random subset of the shadow decisions (random, so canary fills are
+  comparable to the shadow predictions on the same decisions), from a separate wallet never reused.
+- What tiny trades measure: landing rate, latency, fees and tips, quote math matching the program exactly, failure modes.
+  What they don't: price impact at real size. That comes from the curve math (exact-match tests, section 15d) and a ramp:
+  1% → 10% → 25% → 100% of target size, each step with its own gate.
+- Cost per trade: base fee, priority fee, tip floor, 1% launchpad fee, and token-account rent (~0.002 SOL), which is
+  returned by closing the account in the sell.
+- Market makers: bonding curves have none, and a tiny order is invisible among bots. The real watcher is copy bots, hence
+  the separate, single-use canary wallet.
+- Telemetry: every order tagged `mode` (paper / shadow / canary / live) and size class. Canary rows are kept out of
+  strategy statistics and the optimization dataset; used only for execution metrics, measured in basis points with
+  medians and percentiles (fixed costs reported separately, since they dominate tiny trades).
+
 ## 16. Syndicate / sybil detection
 
 **Speed and cost**
